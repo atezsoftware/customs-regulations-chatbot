@@ -448,6 +448,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: ARG001
 
     yield
 
+    from onyx.chat.stream_lifecycle import wait_for_chat_stream_writers
+
+    # A disconnected reader can leave a writer persisting its answer independently.
+    # Keep its tracing and DB resources available throughout the API drain.
+    if not wait_for_chat_stream_writers():
+        logger.warning("Chat stream writers did not finish within the shutdown drain")
+
     # Flush buffered per-user usage before disposing the DB engines its drain
     # thread writes through.
     from onyx.tracing.setup import shutdown_tracing

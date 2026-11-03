@@ -2351,12 +2351,9 @@ def _run_models(
         ctx = contextvars.copy_context()
         executor.submit(ctx.run, _run_model, i)
 
-    writer_thread = threading.Thread(
-        target=contextvars.copy_context().run,
-        args=(_drain_to_completion,),
-        name="chat-stream-writer",
-    )
-    writer_thread.start()
+    from onyx.chat.stream_lifecycle import start_chat_stream_writer
+
+    start_chat_stream_writer(_drain_to_completion)
 
     def _read_stream() -> AnswerStream:
         # ── Reader: tail the tee while the client is attached ────────────────

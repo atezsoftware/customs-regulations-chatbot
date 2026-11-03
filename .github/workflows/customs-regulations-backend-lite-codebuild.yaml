@@ -263,6 +263,26 @@ jobs:
         with:
           version: v4.2.3
 
+      - name: Prepare DEV API graceful drain postrenderer
+        if: env.env_x == 'dev'
+        run: |
+          set -euo pipefail
+          plugin_dir=/tmp/regulatory-runtime-values/helm-plugins/dev-api-drain
+          mkdir -p "$plugin_dir"
+          cp backend/scripts/render_api_drain.py "$plugin_dir/render_api_drain.py"
+          cat > "$plugin_dir/plugin.yaml" <<'PLUGIN'
+          apiVersion: v1
+          type: postrenderer/v1
+          name: dev-api-drain
+          version: 1.0.0
+          runtime: subprocess
+          runtimeConfig:
+            platformCommand:
+              - command: /tmp/regulatory-runtime-values/bin/python
+                args:
+                  - ${HELM_PLUGIN_DIR}/render_api_drain.py
+          PLUGIN
+
       - name: Deploy api and background with Helm
         id: helm_deploy
         run: |
@@ -275,12 +295,23 @@ jobs:
             local deployment="${env_x}-${app_name}-deployment"
             local selector="app=${env_x}-${app_name}"
             local -a memory_override=()
+            local -a postrenderer=()
+            local rollout_timeout=600s
+
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              local HELM_PLUGINS=/tmp/regulatory-runtime-values/helm-plugins
+              export HELM_PLUGINS
+              postrenderer=(--post-renderer dev-api-drain)
+              rollout_timeout=1920s
+            fi
 
             if [[ -n "$memory_limit" ]]; then
               memory_override+=(--set "app.mem_limits=$memory_limit")
             fi
 
-            if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              echo "Preserving terminating DEV API pods until their response drain completes."
+            elif ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
               echo "Namespace ${namespace} does not exist yet; skipping terminating pod cleanup for ${app_name}."
             else
               terminating_pods=$(kubectl get pods --namespace "${namespace}" -l "$selector" -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')
@@ -303,7 +334,7 @@ jobs:
                     --namespace "${namespace}" \
                     --server-side=false \
                     --wait=watcher \
-                    --timeout 600s
+                    --timeout "$rollout_timeout"
                 else
                   helm uninstall "$release" --namespace "${namespace}" || true
                 fi
@@ -317,11 +348,12 @@ jobs:
               --server-side=false \
               --set image.tag="${IMAGE_TAG}" \
               "${memory_override[@]}" \
+              "${postrenderer[@]}" \
               ./devops \
-              --timeout 600s
+              --timeout "$rollout_timeout"
 
             kubectl rollout status deployment "$deployment" \
-              --namespace "${namespace}" --timeout=600s
+              --namespace "${namespace}" --timeout="$rollout_timeout"
 
             echo "Waiting for deployment $deployment to use image tag ${IMAGE_TAG}"
             for attempt in {1..60}; do
@@ -567,6 +599,10 @@ jobs:
         run: |
           for app_name in customs-regulations-api customs-regulations-background; do
             release="${app_name}-${{ env.env_x }}"
+            rollback_timeout=600s
+            if [[ "$env_x" == "dev" && "$app_name" == "customs-regulations-api" ]]; then
+              rollback_timeout=1920s
+            fi
             if history_json=$(helm history "$release" --namespace ${{ env.namespace }} -o json 2>/dev/null); then
               rollback_revision=$(jq -r '[.[] | select(.status == "deployed" or .status == "superseded")] | sort_by(.revision | tonumber) | last | .revision // empty' <<<"$history_json")
               if [[ -n "$rollback_revision" ]]; then
@@ -575,7 +611,7 @@ jobs:
                   --namespace ${{ env.namespace }} \
                   --server-side=false \
                   --wait=watcher \
-                  --timeout 600s || true
+                  --timeout "$rollback_timeout" || true
                 echo "ROLLBACK_PERFORMED=true" >> $GITHUB_ENV
               else
                 helm uninstall "$release" --namespace ${{ env.namespace }} || true
