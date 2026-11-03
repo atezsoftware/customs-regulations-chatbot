@@ -1166,7 +1166,7 @@ def _read_and_apply_results(
                         and cast(dict[str, object], metadata).get(
                             "intake_chunking_version"
                         )
-                        == "4"
+                        in ("4", "5")
                     ):
                         try:
                             outcomes[request_hash] = _repair_intake_abstention(

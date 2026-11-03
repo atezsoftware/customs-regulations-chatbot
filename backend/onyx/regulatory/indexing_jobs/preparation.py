@@ -295,7 +295,7 @@ def prepare_regulatory_indexing_job_from_chunks(
         raise ValueError("CHUNKED user file has no chunk-generation identity")
     if user_file.regulatory_chunk_generation_hash != snapshot.chunk_generation_hash:
         for version in sorted(SUPPORTED_INTAKE_CHUNKING_VERSIONS):
-            if version == "4":
+            if version in {"4", "5"}:
                 continue  # The normal writer owns the scoped Google whole-table policy.
             intake_hash = compute_regulatory_chunk_generation_hash(
                 embedding_provider=snapshot.embedding_provider,

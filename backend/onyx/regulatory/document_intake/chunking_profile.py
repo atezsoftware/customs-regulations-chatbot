@@ -11,7 +11,7 @@ from onyx.regulatory.document_intake.models import (
 )
 
 INTAKE_CHUNKING_CODE_VERSION: IntakeChunkingVersion = "3"
-SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3", "4"})
+SUPPORTED_INTAKE_CHUNKING_VERSIONS = frozenset({"1", "2", "3", "4", "5"})
 
 
 def is_multi_cell_table_row(text: str) -> bool:
@@ -61,7 +61,7 @@ def intake_preparation_policy(document: Document) -> IntakePreparationPolicy | N
     if not isinstance(context, dict):
         raise ValueError("Intake preparation requires a verified source context")
     if (
-        context.get("chunking_version") != "4"
+        context.get("chunking_version") not in ("4", "5")
         and context.get("preparation_policy") is None
     ):
         return None

@@ -113,10 +113,12 @@ def compute_regulatory_chunk_generation_hash(
         payload["intake_chunking_version"] = supported_intake_chunking_version(
             intake_chunking_version
         )
-    if intake_chunking_version == "4":
+    if intake_chunking_version in {"4", "5"}:
         if not enable_contextual_rag:
             raise ValueError("Whole-table preparation requires contextual retrieval")
         policy = IntakePreparationPolicy.model_validate(intake_preparation_policy)
+        if policy.chunking_version != intake_chunking_version:
+            raise ValueError("The generation version differs from its frozen policy")
         if (
             embedding_provider is None
             or embedding_provider.value != policy.provider

@@ -29,8 +29,8 @@ def require_owned_v4_intake_source(
     chunk_type: str | None,
     document_set_id: int | None = None,
 ) -> RegulatorySourceAsset:
-    if metadata.get("intake_chunking_version") != "4":
-        raise ValueError("Only frozen v4 intake sources support this reader")
+    if metadata.get("intake_chunking_version") not in ("4", "5"):
+        raise ValueError("Only frozen whole-table intake sources support this reader")
     embedding_token_limit_for_metadata(metadata, chunk_type)
     member = session.scalar(
         select(RegulatoryDocumentIntakeFile)

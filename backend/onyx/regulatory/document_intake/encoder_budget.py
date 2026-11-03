@@ -23,7 +23,7 @@ class EncoderBudgetOptions(TypedDict, total=False):
 def row_encoder_options(
     row: "RegulatoryChunk", model: "EmbeddingModel"
 ) -> EncoderBudgetOptions:
-    if row.chunk_metadata.get("intake_chunking_version") != "4":
+    if row.chunk_metadata.get("intake_chunking_version") not in ("4", "5"):
         return {}
     if model.provider_type is None or model.model_name is None:
         raise ValueError("The frozen whole-table encoder is unavailable")

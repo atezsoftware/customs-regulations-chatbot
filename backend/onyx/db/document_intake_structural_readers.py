@@ -41,9 +41,14 @@ def validate_current_structural_reader_proof(
     selected = [row for row in rows if row.id in governed]
     if len(selected) != len(governed):
         raise ValueError("The native reader v4 scope is incomplete")
+    version = selected[0].metadata.get("intake_chunking_version")
+    if version not in ("4", "5") or any(
+        row.metadata.get("intake_chunking_version") != version for row in selected
+    ):
+        raise ValueError(
+            "Native chapter readers require one frozen whole-table profile"
+        )
     for row in selected:
-        if row.metadata.get("intake_chunking_version") != "4":
-            raise ValueError("Native chapter readers require frozen v4 sources")
         embedding_token_limit_for_metadata(row.metadata, row.chunk_type)
     asset = require_owned_v4_intake_source(
         session,
@@ -85,7 +90,7 @@ def load_intake_structural_reader_proofs(
             row
             for row in rows
             if native_chapter_reader_candidate(row)
-            and row.metadata.get("intake_chunking_version") == "4"
+            and row.metadata.get("intake_chunking_version") in ("4", "5")
         ]
         if not candidates:
             continue

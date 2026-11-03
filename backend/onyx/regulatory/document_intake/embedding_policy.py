@@ -25,11 +25,13 @@ def embedding_token_limit_for_metadata(
     provider: str | None = None,
     model_name: str | None = None,
 ) -> int:
-    if metadata.get("intake_chunking_version") != "4":
+    if metadata.get("intake_chunking_version") not in ("4", "5"):
         return BODY_EMBEDDING_TOKEN_LIMIT
     policy = IntakePreparationPolicy.model_validate(
         metadata.get("intake_preparation_policy")
     )
+    if policy.chunking_version != metadata["intake_chunking_version"]:
+        raise ValueError("The frozen intake policy differs from its chunking version")
     if (provider is not None or model_name is not None) and (
         provider != policy.provider or model_name != policy.model_name
     ):

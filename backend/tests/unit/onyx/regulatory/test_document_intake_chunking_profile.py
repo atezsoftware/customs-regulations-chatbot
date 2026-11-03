@@ -324,7 +324,7 @@ def test_new_source_context_uses_current_version_and_unknown_hash_fails() -> Non
         configuration.compute_regulatory_chunk_generation_hash(
             embedding_provider=None,
             embedding_model_name="embedding",
-            intake_chunking_version="5",
+            intake_chunking_version="6",
         )
 
 

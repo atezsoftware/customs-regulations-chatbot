@@ -178,12 +178,14 @@ class RegulatoryIndexingConfigSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def validate_derived_values(self) -> "RegulatoryIndexingConfigSnapshot":
-        if (self.intake_chunking_version == "4") != (
+        if (self.intake_chunking_version in {"4", "5"}) != (
             self.intake_preparation_policy is not None
         ):
             raise ValueError("Whole-table snapshots require their frozen intake policy")
         if self.intake_preparation_policy is not None and (
-            self.embedding_provider.value != self.intake_preparation_policy.provider
+            self.intake_chunking_version
+            != self.intake_preparation_policy.chunking_version
+            or self.embedding_provider.value != self.intake_preparation_policy.provider
             or self.embedding_model_name != self.intake_preparation_policy.model_name
         ):
             raise ValueError(
