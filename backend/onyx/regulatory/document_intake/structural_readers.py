@@ -26,6 +26,10 @@ _SELECTOR = re.compile(r"^(?:[a-zA-Z][\w-]*|\*)?(?:[.#][\w-]+)*$")
 _PROPERTIES = {"font-weight", "text-align", "display", "visibility"}
 
 
+def is_ordinal_chapter_heading(text: str) -> bool:
+    return _CHAPTER.fullmatch(text) is not None
+
+
 class NativeChapterReaderProof(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

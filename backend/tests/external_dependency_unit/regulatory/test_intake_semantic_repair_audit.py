@@ -21,7 +21,7 @@ from onyx.db.models import (
 )
 from onyx.db.regulatory_labeling_semantic_repair import (
     SEMANTIC_REPAIR_KEY,
-    require_current_v4_intake_repair_item,
+    require_current_intake_repair_item,
     validate_item_semantic_repair_audit,
 )
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
@@ -320,8 +320,8 @@ def test_no_audit_preserves_legacy_path_but_repair_eligibility_rejects_unowned_f
             "chunk_metadata": row.chunk_metadata,
         }
         session.flush()
-        with pytest.raises(ValueError, match="v4"):
-            require_current_v4_intake_repair_item(session, item=item, run=run)
+        with pytest.raises(ValueError, match="structural"):
+            require_current_intake_repair_item(session, item=item, run=run)
 
 
 def test_formatting_only_accepted_empty_result_has_exact_audit(

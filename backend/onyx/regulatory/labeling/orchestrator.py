@@ -52,6 +52,9 @@ from onyx.regulatory.labeling.intake_quote_repair import (
     quote_repair_audits,
     validate_quote_repair,
 )
+from onyx.regulatory.labeling.intake_structural_repair import (
+    legacy_structural_repair_candidate,
+)
 from onyx.regulatory.labeling.provider import (
     LabelingOutcome,
     TaxonomyDefinition,
@@ -841,7 +844,7 @@ def _repair_intake_abstention(
     heartbeat: Callable[[], None],
 ) -> AcceptedIntakeRepair:
     from onyx.db.regulatory_labeling_semantic_repair import (
-        require_current_v4_intake_repair_item,
+        require_current_intake_repair_item,
     )
 
     with get_session_with_current_tenant() as session:
@@ -853,7 +856,7 @@ def _repair_intake_abstention(
         )
         run = repository.load_claimed_run(session, lease)
         try:
-            require_current_v4_intake_repair_item(session, item=current_item, run=run)
+            require_current_intake_repair_item(session, item=current_item, run=run)
         except ValueError as error:
             raise IntakeLabelRepairSourceChangedError(str(error)) from error
         binding = dict(run.provider_binding)
@@ -914,7 +917,7 @@ def _repair_intake_abstention(
         )
         run = repository.load_claimed_run(session, lease)
         try:
-            require_current_v4_intake_repair_item(session, item=current_item, run=run)
+            require_current_intake_repair_item(session, item=current_item, run=run)
         except ValueError as error:
             raise IntakeLabelRepairSourceChangedError(str(error)) from error
         if (
@@ -1163,10 +1166,17 @@ def _read_and_apply_results(
                     if (
                         intake_quotes
                         and isinstance(metadata, dict)
-                        and cast(dict[str, object], metadata).get(
-                            "intake_chunking_version"
+                        and (
+                            cast(dict[str, object], metadata).get(
+                                "intake_chunking_version"
+                            )
+                            in ("4", "5")
+                            or legacy_structural_repair_candidate(
+                                chunk_id=item.regulatory_chunk_id,
+                                text=item.text_snapshot,
+                                source_snapshot=item.source_snapshot,
+                            )
                         )
-                        in ("4", "5")
                     ):
                         try:
                             outcomes[request_hash] = _repair_intake_abstention(
