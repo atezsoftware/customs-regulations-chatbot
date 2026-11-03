@@ -59,8 +59,8 @@ def attach_retained_pdf(
 ) -> RetainedPdfReceipt:
     raw_file_id, commit_attempted = None, False
     try:
-        _target, digest = repository.retained_pdf_scope(
-            db_session, user, user_file_id, document_set_id
+        repository.retained_pdf_scope(
+            db_session, user, user_file_id, document_set_id, require_active=False
         )
         descriptor = RetainedPdfDescriptor(
             document_set_id=document_set_id,
@@ -83,6 +83,9 @@ def attach_retained_pdf(
         )
         if existing is not None:
             return RetainedPdfReceipt.model_validate(existing)
+        _target, digest = repository.retained_pdf_scope(
+            db_session, user, user_file_id, document_set_id
+        )
         if digest != expected_canonical_sha256:
             raise repository.RetainedPdfConflictError(
                 "The canonical document changed; reload before attaching an original"

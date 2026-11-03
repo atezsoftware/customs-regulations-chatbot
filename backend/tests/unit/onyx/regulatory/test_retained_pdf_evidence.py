@@ -327,6 +327,25 @@ def test_native_pdf_and_descriptor_validation_never_converts() -> None:
         )
 
 
+def test_superseded_source_allows_keyed_retry_but_rejects_new_attachment(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = _attach(harness)
+
+    def historical_scope(
+        *_args: Any, require_active: bool = True, **_kwargs: Any
+    ) -> Any:
+        if require_active:
+            raise ValueError("The target has no active chunks")
+        return harness.file, harness.digest
+
+    monkeypatch.setattr(repository, "retained_pdf_scope", historical_scope)
+    assert _attach(harness) == receipt
+    with pytest.raises(OnyxError):
+        _attach(harness, _pdf(144), idempotency_key=uuid4())
+    assert harness.save_calls == 1
+
+
 def test_historical_read_scope_preserves_access_without_active_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
