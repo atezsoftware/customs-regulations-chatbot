@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from onyx.db import regulatory_labeling as repository
@@ -34,7 +34,17 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
     vertex_batch_submission_key,
     vertex_jsonl_line_size,
 )
+from onyx.regulatory.labeling.accepted_result import (
+    AcceptedIntakeRepair,
+    LabelingApplyOutcome,
+)
 from onyx.regulatory.labeling.domain import shard_by_count_and_bytes
+from onyx.regulatory.labeling.intake_abstention_repair import (
+    build_abstention_repair,
+    build_abstention_repair_audit,
+    parse_abstention_repair_output,
+    validate_abstention_repair,
+)
 from onyx.regulatory.labeling.intake_quote_repair import (
     QUOTE_ERRORS,
     build_quote_repair,
@@ -817,6 +827,131 @@ class _IntakeQuoteRepairRejected(ValueError):
     """A single repair was ineligible or did not satisfy its exact quote contract."""
 
 
+class _IntakeAbstentionRepairRejected(ValueError):
+    """The sole semantic reconsideration did not produce a validated outcome."""
+
+
+def _repair_intake_abstention(
+    lease: repository.RunLease,
+    shard_id: UUID,
+    item: RegulatoryLabelingItem,
+    gateway: VertexBatchGateway,
+    rejected_response: str,
+    taxonomy: TaxonomyDefinition,
+    heartbeat: Callable[[], None],
+) -> AcceptedIntakeRepair:
+    from onyx.db.regulatory_labeling_semantic_repair import (
+        require_current_v4_intake_repair_item,
+    )
+
+    with get_session_with_current_tenant() as session:
+        base = load_current_intake_label_repair_request(
+            session, lease, shard_id, item.id
+        )
+        current_item = session.get_one(
+            RegulatoryLabelingItem, item.id, populate_existing=True
+        )
+        run = repository.load_claimed_run(session, lease)
+        try:
+            require_current_v4_intake_repair_item(session, item=current_item, run=run)
+        except ValueError as error:
+            raise IntakeLabelRepairSourceChangedError(str(error)) from error
+        binding = dict(run.provider_binding)
+    try:
+        repair = build_abstention_repair(
+            base_request=base,
+            rejected_response=rejected_response,
+            text=item.text_snapshot,
+            chunk_id=item.regulatory_chunk_id,
+            source_hash=item.canonical_text_sha256 or "",
+            taxonomy=taxonomy,
+            provider_binding=binding,
+        )
+    except ValueError as error:
+        raise _IntakeAbstentionRepairRejected(str(error)) from error
+    submission_key = vertex_batch_submission_key(
+        [repair.request],
+        tenant_id=get_current_tenant_id(),
+        job_id=lease.run_id,
+        output_prefix=f"regulatory-labeling/{lease.run_id}/abstention-repair/{shard_id}/{item.id}",
+        submission_attempt=1,
+    ).replace("regulatory-context-", "regulatory-labeling-", 1)
+    with get_session_with_current_tenant() as session:
+        run = repository.load_claimed_run(session, lease)
+        if (
+            load_current_intake_label_repair_request(session, lease, shard_id, item.id)
+            != base
+            or run.provider_binding != binding
+        ):
+            raise IntakeLabelRepairSourceChangedError(
+                "The source changed before semantic reconsideration"
+            )
+    logger.info(
+        "Intake abstention repair run=%s chunk=%s original_request=%s rejected_response=%s repair_request=%s submission=%s",
+        lease.run_id,
+        item.regulatory_chunk_id,
+        base.request_hash,
+        repair.rejected_response_sha256,
+        repair.request.request_hash,
+        submission_key,
+    )
+    if isinstance(gateway, StreamingLabelingGateway):
+        state = gateway.submit_stream(
+            iter([repair.request]),
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+            on_progress=heartbeat,
+        )
+    else:
+        state = gateway.submit(
+            [repair.request],
+            submission_key=submission_key,
+            max_jsonl_bytes=LABELING_SHARD_BYTES,
+        )
+    with get_session_with_current_tenant() as session:
+        current_item = session.get_one(
+            RegulatoryLabelingItem, item.id, populate_existing=True
+        )
+        run = repository.load_claimed_run(session, lease)
+        try:
+            require_current_v4_intake_repair_item(session, item=current_item, run=run)
+        except ValueError as error:
+            raise IntakeLabelRepairSourceChangedError(str(error)) from error
+        if (
+            load_current_intake_label_repair_request(session, lease, shard_id, item.id)
+            != base
+            or run.provider_binding != binding
+        ):
+            raise IntakeLabelRepairSourceChangedError(
+                "The frozen source or model changed after semantic reconsideration"
+            )
+    if state.status is not VertexBatchJobStatus.SUCCEEDED or not state.output_uri:
+        raise _IntakeAbstentionRepairRejected(
+            "Semantic reconsideration did not return a completed provider response"
+        )
+    try:
+        output = parse_abstention_repair_output(
+            gateway.read_results(state.output_uri), repair=repair, on_progress=heartbeat
+        )
+        outcome = validate_abstention_repair(
+            output.response, repair=repair, text=item.text_snapshot, taxonomy=taxonomy
+        )
+        if outcome.abstained:
+            raise ValueError(
+                "Model abstained: insufficient evidence after bounded semantic reconsideration"
+            )
+        audit = build_abstention_repair_audit(
+            output=output,
+            repair=repair,
+            output_uri=state.output_uri,
+            text=item.text_snapshot,
+            taxonomy=taxonomy,
+        )
+    except ValueError as error:
+        raise _IntakeAbstentionRepairRejected(str(error)) from error
+    return AcceptedIntakeRepair(outcome=outcome, audit=audit)
+
+
 def _repair_intake_quotes(
     lease: repository.RunLease,
     shard_id: UUID,
@@ -959,7 +1094,7 @@ def _read_and_apply_results(
                 item.request_hash for item in items if item.request_hash is not None
             ]
             parsed = spool.get_many(hashes) if batch_error is None else {}
-            outcomes: dict[str, tuple[list[str], list[dict[str, object]]] | str] = {}
+            outcomes: dict[str, LabelingApplyOutcome] = {}
             for item in items:
                 request_hash = item.request_hash
                 if request_hash is None:
@@ -1024,6 +1159,31 @@ def _read_and_apply_results(
                         outcomes[request_hash] = str(repair_error)
                         continue
                 if outcome.abstained:
+                    metadata = item.source_snapshot.get("chunk_metadata")
+                    if (
+                        intake_quotes
+                        and isinstance(metadata, dict)
+                        and cast(dict[str, object], metadata).get(
+                            "intake_chunking_version"
+                        )
+                        == "4"
+                    ):
+                        try:
+                            outcomes[request_hash] = _repair_intake_abstention(
+                                lease,
+                                shard_id,
+                                item,
+                                gateway,
+                                result.context,
+                                taxonomy,
+                                heartbeat,
+                            )
+                        except (
+                            _IntakeAbstentionRepairRejected,
+                            IntakeLabelRepairSourceChangedError,
+                        ) as repair_error:
+                            outcomes[request_hash] = str(repair_error)
+                        continue
                     outcomes[request_hash] = "Model abstained: insufficient evidence"
                     continue
                 assignments = [assignment.model_dump() for assignment in outcome.labels]
