@@ -1,0 +1,192 @@
+{
+  "case": "5672 canonical law/decision identity collision",
+  "records": [
+    {
+      "citation": 6,
+      "item": {
+        "source_id": "240f4072-02b0-4f7d-a2f4-9295d8aa4279",
+        "text": "(3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmesine karşılık, dolu olarak yeniden ihraç edilmediği tespit edilen ambalajlar için Kanunun 184 üncü maddesi uyarınca gümrük yükümlülüğü doğar. Bu eşyaya, gümrük yükümlülüğünün doğmasından itibaren kısmi muafiyet suretiyle geçici ithalat rejimi uygulanır.",
+        "chunk_id": "rc_083ca2bfc08c07e0c102626f4ffb4b5cea69ab9c",
+        "search_doc": {
+          "document_id": "240f4072-02b0-4f7d-a2f4-9295d8aa4279",
+          "chunk_ind": 156,
+          "semantic_identifier": "Kararname ve Mahkeme Kararları/bkk_2009-15481_gumruk_kanununun_bazi_maddelerinin_uygulanmasi_hakkinda_karar.md",
+          "link": null,
+          "blurb": "(3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmesine karşılık, dolu olarak yeniden ihraç edilmediği tespit edilen ambalajlar için Kanunun 184 üncü maddesi uyarınca gümrük yükümlülüğü doğar. Bu eşyay",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_083ca2bfc08c07e0c102626f4ffb4b5cea69ab9c",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNUNUN BAZI MADDELERİNİN UYGULANMASI HAKKINDA KARAR",
+              "DÖRDÜNCÜ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "MADDE 33 - Ambalajlar",
+              "(3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmes..."
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "a1366c49-0b51-47b5-b279-9cc22076719b"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 156,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNUNUN BAZI MADDELERİNİN UYGULANMASI HAKKINDA KARAR",
+            "DÖRDÜNCÜ KISIM",
+            "BİRİNCİ BÖLÜM",
+            "MADDE 33 - Ambalajlar",
+            "(3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmes..."
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "240f4072-02b0-4f7d-a2f4-9295d8aa4279",
+            "chunk_index": 156,
+            "title": "Kararname ve Mahkeme Kararları/bkk_2009-15481_gumruk_kanununun_bazi_maddelerinin_uygulanmasi_hakkinda_karar.md",
+            "source_type": "user_file",
+            "semantic_identifier": "Kararname ve Mahkeme Kararları/bkk_2009-15481_gumruk_kanununun_bazi_maddelerinin_uygulanmasi_hakkinda_karar.md — 4458 SAYILI GÜMRÜK KANUNUNUN BAZI MADDELERİNİN UYGULANMASI HAKKINDA KARAR > DÖRDÜNCÜ KISIM > BİRİNCİ BÖLÜM > MADDE 33 - Ambalajlar > (3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmes...",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_083ca2bfc08c07e0c102626f4ffb4b5cea69ab9c",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNUNUN BAZI MADDELERİNİN UYGULANMASI HAKKINDA KARAR",
+              "DÖRDÜNCÜ KISIM",
+              "BİRİNCİ BÖLÜM",
+              "MADDE 33 - Ambalajlar",
+              "(3) Tam muafiyet suretiyle geçici ithalat rejimi kapsamında boş olarak geçici ithal edilmes..."
+            ],
+            "provision_identifiers": [
+              "madde 33"
+            ],
+            "decision_numbers": [
+              "2009/15481"
+            ],
+            "legal_dates": [
+              "2009-09-29",
+              "2009-10-07"
+            ],
+            "article_no": "33",
+            "clause_label": null,
+            "paragraph_no": "3",
+            "article_title": "Ambalajlar",
+            "chunk_variant": "atomic",
+            "document_date": null,
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-16"
+          },
+          "read_as_of_date": "2026-10-16",
+          "retrieval_method": "established_search_exact_original",
+          "article_closure_complete": false,
+          "section_context": "not_inferred",
+          "additional_context": "harness_controlled",
+          "follow_context_tool": "read_provision",
+          "retrieved_projection_ordinal": 156,
+          "retrieved_center": true
+        },
+        "text_hash": "b3b6a3fa3d632687ca409c4e868aad4e37b206e0f8dd5749f34d11b94cd596c5"
+      }
+    },
+    {
+      "citation": 25,
+      "item": {
+        "source_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+        "text": "**MADDE 131-** İthal vergilerinden tam muafiyet suretiyle geçici ithalat rejiminin uygulanabileceği durumlar ve özel şartlar Cumhurbaşkanınca tespit edilir.\n---------------------------------------------------------------------------------------------------------",
+        "chunk_id": "rc_97fbabfbdaa448a162b8fb20d4183dded9845a5f",
+        "search_doc": {
+          "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+          "chunk_ind": 613,
+          "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+          "link": null,
+          "blurb": "**MADDE 131-** İthal vergilerinden tam muafiyet suretiyle geçici ithalat rejiminin uygulanabileceği durumlar ve özel şartlar Cumhurbaşkanınca tespit edilir.\n-----------------------------------------------------------------------------------",
+          "source_type": "file",
+          "boost": 0,
+          "hidden": false,
+          "metadata": {
+            "regulatory_chunk_id": "rc_97fbabfbdaa448a162b8fb20d4183dded9845a5f",
+            "regulatory_heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrükçe Onaylanmış İşlem veya Kullanım",
+              "İKİNCİ BÖLÜM",
+              "MADDE 131"
+            ],
+            "regulatory_validity_start_date": "",
+            "regulatory_validity_end_date": ""
+          },
+          "score": null,
+          "is_relevant": null,
+          "relevance_explanation": null,
+          "match_highlights": [],
+          "updated_at": null,
+          "primary_owners": null,
+          "secondary_owners": null,
+          "is_internet": false,
+          "file_id": "f3bf6768-cbe0-4cd2-926d-8958578530e6"
+        },
+        "question_ids": [],
+        "metadata": {
+          "position": 613,
+          "heading_path": [
+            "4458 SAYILI GÜMRÜK KANUNU",
+            "Gümrükçe Onaylanmış İşlem veya Kullanım",
+            "İKİNCİ BÖLÜM",
+            "MADDE 131"
+          ],
+          "validity_start": null,
+          "validity_end": null,
+          "version_unknown": true,
+          "canonical_metadata": {
+            "document_id": "12328001-2f21-407e-b230-7d50a8dbf28f",
+            "chunk_index": 613,
+            "title": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md",
+            "source_type": "user_file",
+            "semantic_identifier": "İhracat Mevzuatı/Kanun, Kararname, Yönetmelik, Tebliğ, Genelge/gumruk_kanunu_.md — 4458 SAYILI GÜMRÜK KANUNU > Gümrükçe Onaylanmış İşlem veya Kullanım > İKİNCİ BÖLÜM > MADDE 131",
+            "source_links": "{\"0\": \"\"}",
+            "document_sets": [
+              "PC Külliyatı"
+            ],
+            "regulatory_chunk_id": "rc_97fbabfbdaa448a162b8fb20d4183dded9845a5f",
+            "heading_path": [
+              "4458 SAYILI GÜMRÜK KANUNU",
+              "Gümrükçe Onaylanmış İşlem veya Kullanım",
+              "İKİNCİ BÖLÜM",
+              "MADDE 131"
+            ],
+            "provision_identifiers": [
+              "madde 131"
+            ],
+            "legal_dates": [
+              "1999-10-27",
+              "1999-11-04"
+            ],
+            "article_no": "131",
+            "clause_label": null,
+            "paragraph_no": null,
+            "article_title": null,
+            "chunk_variant": "atomic",
+            "document_date": "1999-10-27",
+            "document_type": "kanun",
+            "source_regulatory_chunk_ids": [],
+            "read_as_of_date": "2026-10-16"
+          },
+          "read_as_of_date": "2026-10-16"
+        },
+        "text_hash": "0a7401e2711ae901bb4626b290c2f129ffdf323eae2d92fecb394066aab90e98"
+      }
+    }
+  ]
+}
