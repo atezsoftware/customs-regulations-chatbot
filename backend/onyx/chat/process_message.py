@@ -1351,6 +1351,9 @@ def build_chat_turn(
 # Sentinel placed on the merged queue when a model thread finishes.
 _MODEL_DONE = object()
 
+# Native research can observe the shared user stop before the writer polls it.
+_MODEL_CANCELLED = object()
+
 # Sentinel placed on the reader tee when the stream writer has fully finished.
 _STREAM_DONE = object()
 
@@ -1471,6 +1474,7 @@ def _run_models(
     # Set to True when a model raises an exception (distinct from "still running").
     # Used in the stop-button path to avoid calling completion for errored models.
     model_errored: list[bool] = [False] * n_models
+    model_cancelled: list[bool] = [False] * n_models
     # Per-model classification set in _run_model and reused by the streamed
     # packet and the persisted message.
     model_error_info: list[LLMErrorInfo | None] = [None] * n_models
@@ -2133,26 +2137,36 @@ def _run_models(
                 model_succeeded[model_idx] = True
 
             except Exception as e:
-                model_errored[model_idx] = True
-                if (
-                    getattr(setup.new_msg_req, "legal_composite", False) is True
-                    or getattr(setup.new_msg_req, "supersearch", False) is True
-                    or getattr(setup.new_msg_req, "legal_review", False) is True
-                ) and isinstance(e, OnyxError):
-                    model_error_info[model_idx] = LLMErrorInfo(
-                        message=e.detail,
-                        error_code=e.error_code.code,
-                        is_retryable=e.status_code >= 500 or e.status_code == 429,
-                    )
+                from onyx.asv3.models import RunStopped
+
+                if isinstance(e, RunStopped) and not setup.check_is_connected():
+                    model_cancelled[model_idx] = True
+                    merged_queue.put((model_idx, _MODEL_CANCELLED))
                 else:
-                    model_error_info[model_idx] = litellm_exception_to_safe_error(
-                        e, model_llm, fallback_to_error_msg=True
-                    )
-                merged_queue.put((model_idx, e))
+                    model_errored[model_idx] = True
+                    if (
+                        getattr(setup.new_msg_req, "legal_composite", False) is True
+                        or getattr(setup.new_msg_req, "supersearch", False) is True
+                        or getattr(setup.new_msg_req, "legal_review", False) is True
+                    ) and isinstance(e, OnyxError):
+                        model_error_info[model_idx] = LLMErrorInfo(
+                            message=e.detail,
+                            error_code=e.error_code.code,
+                            is_retryable=e.status_code >= 500 or e.status_code == 429,
+                        )
+                    else:
+                        model_error_info[model_idx] = litellm_exception_to_safe_error(
+                            e, model_llm, fallback_to_error_msg=True
+                        )
+                    merged_queue.put((model_idx, e))
 
             finally:
                 try:
-                    _persist_model_outcome(model_idx, _PersistContext.WORKER)
+                    _persist_model_outcome(
+                        model_idx,
+                        _PersistContext.WORKER,
+                        stop_button=model_cancelled[model_idx],
+                    )
                 finally:
                     merged_queue.put((model_idx, _MODEL_DONE))
 
@@ -2294,6 +2308,21 @@ def _run_models(
         stop_probe_failed = False
         user_cancelled = False
 
+        def cancel_user_turn() -> None:
+            nonlocal user_cancelled
+            user_cancelled = True
+            for i in range(n_models):
+                # Finished models save complete; in-flight models save stopped state.
+                _persist_model_outcome(i, _PersistContext.STOP_BUTTON, stop_button=True)
+                _publish_persistence_result(i)
+            _publish(
+                Packet(
+                    placement=Placement(turn_index=0),
+                    obj=OverallStop(type="stop", stop_reason="user_cancelled"),
+                )
+            )
+            drain_done.set()
+
         def refresh_processing_fence() -> None:
             nonlocal last_fence_refresh
             # Native work can outlive both the HTTP reader and a failed writer.
@@ -2338,28 +2367,13 @@ def _run_models(
                     stop_probe_failed = False
                     next_stop_probe = 0.0
                     if not connected:
-                        user_cancelled = True
-                        for i in range(n_models):
-                            # Snapshot every model now: finished loops save
-                            # complete, in-flight ones save partial + stopped.
-                            _persist_model_outcome(
-                                i, _PersistContext.STOP_BUTTON, stop_button=True
-                            )
-                            _publish_persistence_result(i)
-                        _publish(
-                            Packet(
-                                placement=Placement(turn_index=0),
-                                obj=OverallStop(
-                                    type="stop", stop_reason="user_cancelled"
-                                ),
-                            )
-                        )
-                        # Workers can't be interrupted; discard their remaining
-                        # output via the Emitter no-op.
-                        drain_done.set()
+                        cancel_user_turn()
                         return
                     continue
-                if item is _MODEL_DONE:
+                if item is _MODEL_CANCELLED:
+                    cancel_user_turn()
+                    return
+                elif item is _MODEL_DONE:
                     # A worker's finally can enqueue its marker while an outer
                     # context is still exiting; inspect the actual Future too.
                     _observe_worker_completion(model_idx)
