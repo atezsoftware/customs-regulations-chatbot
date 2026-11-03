@@ -491,3 +491,23 @@ def test_initial_and_durable_acceptance_reload_the_frozen_context(
             item=cast(RegulatoryLabelingItem, item),
             run=cast(RegulatoryLabelingRun, run),
         )
+
+
+@pytest.mark.parametrize("dimension", [False, True])
+def test_caption_reconsideration_cannot_accept_continued_model_abstention(
+    dimension: bool,
+) -> None:
+    text = next(
+        source.text for source in _sources(dimension) if source.chunk_id == "target"
+    )
+    repair = build(text=text)
+    continued = audit(repair, REJECTED, text=text)
+    with pytest.raises(ValueError, match="accepted assignments"):
+        validate_audit(
+            continued,
+            repair,
+            text=text,
+            source_hash=context_hash(text),
+            labels=[],
+            assignments=[],
+        )
