@@ -1,99 +1,189 @@
 name: DEV amendment approval diagnostics
+run-name: DEV owned Kompozit drain proof ${{ inputs.operation }}
 on:
   workflow_dispatch:
     inputs:
       operation:
+        description: Inspect only, or restart the exact fixed DEV API deployment after owned-stream verification
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect, restart_owned_streams]
         default: inspect
+        required: true
+      expected_backend_commit:
+        description: Exact deployed fixed backend SHA
+        type: string
+        required: true
+      owned_message_ids:
+        description: One or two owned smoke assistant message IDs, verified running by the operator before dispatch
+        type: string
+        required: true
 permissions:
   contents: read
+concurrency:
+  group: backend-lite-dev
+  cancel-in-progress: false
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read only batch inventory
+      - name: Inspect or restart only the exact fixed DEV API
+        env:
+          OPERATION: ${{ inputs.operation }}
+          EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
+          OWNED_MESSAGE_IDS: ${{ inputs.owned_message_ids }}
         shell: bash
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
+          mkdir -p drain-proof
+          python - <<'PYCODE'
           import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
+          import os
           import re
           import subprocess
+          import time
+          import urllib.request
+          from datetime import datetime, timezone
           from pathlib import Path
 
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
-        shell: bash
-        env:
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+          namespace = 'customs-regulations-dev'
+          deployment_name = 'dev-customs-regulations-api-deployment'
+          container_name = 'dev-customs-regulations-api-container'
+          selector = 'app=dev-customs-regulations-api'
+          origin = 'https://dev-customs-regulations.singlewindow.io/api/version'
+          operation = os.environ['OPERATION']
+          expected_sha = os.environ['EXPECTED_BACKEND_COMMIT']
+          owned_ids = os.environ['OWNED_MESSAGE_IDS'].split(',')
+          if operation not in ('inspect', 'restart_owned_streams'):
+              raise SystemExit('Unsupported operation')
+          if re.fullmatch(r'[0-9a-f]{40}', expected_sha) is None:
+              raise SystemExit('A full lowercase expected backend SHA is required')
+          if not 1 <= len(owned_ids) <= 2 or len(set(owned_ids)) != len(owned_ids) or any(re.fullmatch(r'[1-9][0-9]*', value) is None for value in owned_ids):
+              raise SystemExit('One or two distinct owned assistant message IDs are required')
+          owned_ids = [int(value) for value in owned_ids]
+          out = Path('drain-proof')
+          old_names = []
+          mutation_started = False
+
+          def stamp():
+              return datetime.now(timezone.utc).isoformat()
+
+          def command(arguments, timeout=60):
+              result = subprocess.run(arguments, capture_output=True, text=True, timeout=timeout)
+              if result.returncode:
+                  raise RuntimeError('Command failed with status ' + str(result.returncode))
+              return result.stdout
+
+          def kubernetes(resource, name=None):
+              args = ['kubectl', 'get', resource]
+              if name is not None:
+                  args.append(name)
+              args += ['-n', namespace, '-o', 'json']
+              if resource == 'pods':
+                  args += ['-l', selector]
+              return json.loads(command(args))
+
+          def public_version():
+              with urllib.request.urlopen(origin, timeout=20) as response:
+                  version = json.load(response).get('backend_version')
+              if version != expected_sha:
+                  raise RuntimeError('Public frontend API backend SHA differs')
+              return version
+
+          def backend_container(spec):
+              matches = [item for item in spec.get('containers', []) if item.get('name') == container_name]
+              if len(matches) != 1:
+                  raise RuntimeError('Expected exactly one DEV API backend container')
+              image = matches[0].get('image', '')
+              if image.rsplit('/', 1)[-1] != 'customs-regulations-backend-lite-dev:' + expected_sha:
+                  raise RuntimeError('DEV API container image differs from exact expected fixed SHA')
+              return matches[0]
+
+          def pod_summary(pod):
+              spec = pod['spec']
+              backend = backend_container(spec)
+              return {'name': pod['metadata']['name'], 'uid': pod['metadata']['uid'], 'created_at': pod['metadata']['creationTimestamp'], 'deletion_timestamp': pod['metadata'].get('deletionTimestamp'), 'phase': pod['status']['phase'], 'ready': any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in pod['status'].get('conditions', [])), 'image': backend['image'], 'termination_grace_seconds': spec.get('terminationGracePeriodSeconds'), 'backend_state': [{k: c.get(k) for k in ('name', 'ready', 'restartCount', 'state', 'lastState')} for c in pod['status'].get('containerStatuses', []) if c['name'] == container_name]}
+
+          def save(name, value):
+              (out / name).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+          def preflight():
+              deployment = kubernetes('deployment', deployment_name)
+              if deployment['metadata'].get('namespace') != namespace or deployment['spec'].get('replicas') != 1:
+                  raise RuntimeError('Unexpected DEV API deployment identity or replica count')
+              spec = deployment['spec']['template']['spec']
+              backend_container(spec)
+              grace = spec.get('terminationGracePeriodSeconds')
+              if type(grace) is not int or grace < 900:
+                  raise RuntimeError('Fixed DEV API deployment must have at least 900 seconds grace')
+              pods = kubernetes('pods')['items']
+              if len(pods) != 1:
+                  raise RuntimeError('Expected one current DEV API pod and no prior drain')
+              pod = pod_summary(pods[0])
+              if pod['deletion_timestamp'] is not None or pod['phase'] != 'Running' or not pod['ready'] or type(pod['termination_grace_seconds']) is not int or pod['termination_grace_seconds'] < 900:
+                  raise RuntimeError('Current Ready DEV API pod lacks the fixed drain configuration')
+              if any(c.get('restartCount', 0) for c in pod['backend_state']):
+                  raise RuntimeError('Current DEV API backend has unexpected prior restarts')
+              return {'observed_at': stamp(), 'operation': operation, 'expected_backend_sha': expected_sha, 'public_backend_sha': public_version(), 'owned_message_ids': owned_ids, 'ownership_and_running_state_verification_source': 'operator_frontend_API_checks_outside_workflow', 'ownership_and_running_state_independently_verified_by_workflow': False, 'deployment_generation': deployment['metadata']['generation'], 'deployment_termination_grace_seconds': grace, 'pods': [pod]}
+
+          try:
+              before = preflight()
+              old_names = [p['name'] for p in before['pods']]
+              save('preflight.json', before)
+              print('PREFLIGHT', json.dumps(before, sort_keys=True))
+              if operation == 'inspect':
+                  save('result.json', {'observed_at': stamp(), 'status': 'INSPECT_ONLY', 'mutation_started': False})
+              else:
+                  # Repeat every scope/image/grace guard immediately before the only mutation.
+                  before = preflight()
+                  old_names = [p['name'] for p in before['pods']]
+                  save('pre-restart.json', before)
+                  deadline = time.monotonic() + 1020
+                  mutation_started = True
+                  restarted_at = stamp()
+                  print('RESTARTING_EXACT_DEV_API', deployment_name, restarted_at, 'owned_message_ids', owned_ids)
+                  command(['kubectl', 'rollout', 'restart', 'deployment/' + deployment_name, '-n', namespace])
+                  rollout = command(['kubectl', 'rollout', 'status', 'deployment/' + deployment_name, '-n', namespace, '--timeout=1020s'], timeout=max(1, deadline - time.monotonic()))
+                  print('ROLLOUT_STATUS', rollout.strip())
+                  previous_names = None
+                  while True:
+                      current = kubernetes('pods')['items']
+                      remaining = [p['metadata']['name'] for p in current if p['metadata']['name'] in old_names]
+                      if remaining != previous_names:
+                          print('OLD_API_PODS_REMAINING', stamp(), remaining)
+                          previous_names = remaining
+                      if not remaining:
+                          break
+                      if time.monotonic() >= deadline:
+                          raise RuntimeError('Old API pod drain exceeded the 1020-second observation bound')
+                      time.sleep(min(5, max(0, deadline - time.monotonic())))
+                  after = preflight()
+                  if after['pods'][0]['name'] in old_names:
+                      raise RuntimeError('API pod identity did not change')
+                  save('postflight.json', after)
+                  save('result.json', {'observed_at': stamp(), 'status': 'RESTART_AND_DRAIN_OBSERVED', 'mutation_started': True, 'restart_requested_at': restarted_at, 'old_pod_names': old_names, 'new_pod_names': [p['name'] for p in after['pods']], 'owned_message_ids': owned_ids, 'owned_answers_and_graphs_require_separate_frontend_API_verification': True})
+          except Exception as error:
+              save('result.json', {'observed_at': stamp(), 'status': 'FAILED', 'error_type': type(error).__name__, 'error': str(error), 'mutation_started': mutation_started, 'old_pod_names': old_names})
+              raise
+          finally:
+              try:
+                  events = kubernetes('events')['items']
+                  selected = []
+                  for event in events:
+                      object_name = event.get('involvedObject', {}).get('name', '')
+                      if object_name == deployment_name or object_name.startswith(deployment_name + '-'):
+                          selected.append({k: event.get(k) for k in ('type', 'reason', 'message', 'firstTimestamp', 'lastTimestamp', 'count', 'involvedObject')})
+                  save('api-events.json', selected)
+                  current = kubernetes('pods')['items']
+                  save('final-pods.json', [pod_summary(p) for p in current])
+              except Exception as error:
+                  print('FINAL_READONLY_EVIDENCE_UNAVAILABLE', type(error).__name__)
+          PYCODE
+      - name: Preserve bounded drain proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kompozit-dev-api-drain-${{ github.run_id }}
+          path: drain-proof/
+          if-no-files-found: error
