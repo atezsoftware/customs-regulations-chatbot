@@ -21,10 +21,12 @@ from onyx.server.features.regulatory.catalog_models import CatalogSearchPage
 from onyx.server.manage.llm.models import LLMProviderView
 from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
+from onyx.utils.logger import setup_logger
 
 CATALOG_SUMMARY_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 CATALOG_SUMMARY_MAX_TOKENS = 1800
 CATALOG_SUMMARY_TIMEOUT_SECONDS = 90
+logger = setup_logger()
 
 
 class CatalogSummaryUnavailable(RuntimeError):
@@ -134,6 +136,14 @@ def generate_catalog_summary(
             reference < 1 or reference > len(search.items) for reference in references
         )
     ):
+        logger.warning(
+            "Catalog summary rejected finish_reason=%s has_content=%s references=%d "
+            "references_valid=%s",
+            response.choice.finish_reason,
+            bool(summary),
+            len(references),
+            all(1 <= reference <= len(search.items) for reference in references),
+        )
         raise CatalogSummaryUnavailable(
             "Nemotron kaynak referansları doğrulanabilen bir özet üretemedi. "
             "Arama sonuçlarını inceleyebilirsiniz."

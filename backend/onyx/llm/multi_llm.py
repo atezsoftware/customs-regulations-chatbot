@@ -1003,12 +1003,15 @@ class LitellmLLM(LLM):
                 else:
                     optional_kwargs["reasoning_effort"] = ReasoningEffort.MEDIUM.value
 
-        # Ultra enables high-effort reasoning by default unless explicitly disabled.
-        if (
+        disable_nemotron_ultra_reasoning = (
             reasoning_effort is ReasoningEffort.OFF
             and self.config.model_provider
             in {LlmProviderNames.OPENROUTER, "nvidia_nim"}
             and "nvidia/nemotron-3-ultra-550b-a55b" in model_identity_names
+        )
+        if (
+            disable_nemotron_ultra_reasoning
+            and self.config.model_provider == "nvidia_nim"
         ):
             optional_kwargs["reasoning_effort"] = "none"
 
@@ -1036,6 +1039,18 @@ class LitellmLLM(LLM):
             model_kwargs=self._model_kwargs,
             user_identity=user_identity,
         )
+        if (
+            disable_nemotron_ultra_reasoning
+            and self.config.model_provider == LlmProviderNames.OPENROUTER
+        ):
+            # LiteLLM drops effort for models absent from its capability registry.
+            # OpenRouter's explicit body control survives that mapping.
+            nemotron_extra_body: dict[str, Any] = {
+                **(passthrough_kwargs.get("extra_body") or {}),
+                "reasoning": {"enabled": False},
+            }
+            passthrough_kwargs = dict(passthrough_kwargs)
+            passthrough_kwargs["extra_body"] = nemotron_extra_body
         if self._seed is not None:
             if "seed" in (passthrough_kwargs.get("additional_drop_params") or []):
                 raise ValueError(
