@@ -4,8 +4,13 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, intake_index_logs, approve_462, approve_465, approve_470]
+        options: [inspect, intake_index_logs, intake_index_stack, approve_462, approve_465, approve_470]
         default: inspect
+      stack_remaining_files:
+        description: 'Fresh operator count immediately before this one stack probe;0 skips it'
+        type: choice
+        options: ['0', '1', '2']
+        default: '0'
 permissions:
   contents: read
 jobs:
@@ -17,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read only batch inventory
-        if: inputs.operation != 'intake_index_logs'
+        if: inputs.operation != 'intake_index_logs' && inputs.operation != 'intake_index_stack'
         shell: bash
         run: |
           set -euo pipefail
@@ -364,6 +369,20 @@ jobs:
                           print_safe(excerpt_line)
               print_safe(f'SCOPED_EXCERPTS {pod} count={excerpts}')
           PY
+      - name: One nonblocking ephemeral intake stack probe
+        if: inputs.operation == 'intake_index_stack'
+        shell: bash
+        env:
+          STACK_REMAINING_FILES: ${{ inputs.stack_remaining_files }}
+        run: |
+          set -euo pipefail
+          if [[ "$STACK_REMAINING_FILES" == "0" ]]; then
+            echo 'SKIPPED stack probe; no remaining-file confirmation'
+            exit 0
+          fi
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/intake-stack-pods.json
+          python backend/scripts/intake_index_stack_probe.py --pods /tmp/intake-stack-pods.json --run-id "$GITHUB_RUN_ID" --remaining-files "$STACK_REMAINING_FILES"
       - name: Resume one existing reviewed proposal
         if: contains(fromJSON('["approve_462","approve_465","approve_470"]'), inputs.operation)
         shell: bash
