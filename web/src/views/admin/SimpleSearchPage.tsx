@@ -39,7 +39,7 @@ export default function SimpleSearchPage() {
         description="Mevzuatta bulunan kaynakları ve ilgili chunkları inceleyin."
       >
         <form
-          className="flex flex-wrap items-center gap-2"
+          className="flex w-full flex-col items-stretch gap-2 sm:flex-row sm:items-center"
           onSubmit={(event) => {
             event.preventDefault();
             if (!draft.trim() || search.isLoading) return;
@@ -50,7 +50,7 @@ export default function SimpleSearchPage() {
             }));
           }}
         >
-          <div className="flex-1 min-w-48">
+          <div className="w-full min-w-0 sm:flex-1">
             <InputTypeIn
               aria-label="Basit mevzuat araması"
               searchIcon
@@ -140,7 +140,7 @@ export default function SimpleSearchPage() {
               <Text
                 font="secondary-body"
                 color="text-03"
-              >{`${search.data.summary_model.includes("nemotron-3-ultra") ? "Nemotron 3 Ultra" : search.data.summary_model} · Bulunan kaynakların tanıtımı.`}</Text>
+              >{`${search.data.summary_model.includes("nemotron-3-ultra") ? "Nemotron 3 Ultra" : search.data.summary_model} · Kaynak içeriklerinin kısa özeti.`}</Text>
             </section>
             <Text
               font="main-ui-action"
