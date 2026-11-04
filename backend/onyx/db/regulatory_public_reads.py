@@ -6,12 +6,15 @@ These reads never grant access: callers retain the existing file/document ACLs.
 import json
 from collections.abc import Callable, Generator, Mapping
 from datetime import date, timedelta
+from typing import cast as type_cast
 from uuid import UUID
 
 from sqlalchemy import and_, or_, select, tuple_
 from sqlalchemy.orm import Session
 
+from onyx.configs.constants import FileOrigin
 from onyx.db.models import (
+    FileRecord,
     RegulatoryCanonicalRevision,
     RegulatoryChunk,
     RegulatoryFilePublication,
@@ -285,6 +288,66 @@ def citation_chunk_as_of_date(
     return upper - timedelta(days=1) if upper is not None else date.today()
 
 
+def regulatory_source_image_owners(
+    session: Session, file_id: str
+) -> tuple[UUID, ...] | None:
+    """None means legacy; a claimed source image requires a real parent link."""
+    from sqlalchemy import case, cast
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    record = session.get(FileRecord, file_id)
+    raw_metadata = record.file_metadata if record is not None else None
+    if not isinstance(raw_metadata, dict):
+        return None
+    metadata = type_cast(dict[str, object], raw_metadata)
+    if metadata.get("purpose") != "regulatory_source_image":
+        return None
+    if (
+        record is None
+        or record.file_origin != FileOrigin.OTHER
+        or record.file_type not in {"image/png", "image/jpeg"}
+    ):
+        return ()
+    parent_value = metadata.get("regulatory_user_file_id")
+    if not isinstance(parent_value, str):
+        return ()
+    try:
+        parent = UUID(parent_value)
+    except ValueError:
+        return ()
+    canonical = session.scalar(
+        select(RegulatoryChunk.id)
+        .where(
+            RegulatoryChunk.user_file_id == parent,
+            RegulatoryChunk.chunk_metadata["image_file_id"].astext == file_id,
+        )
+        .limit(1)
+    )
+    if canonical is not None:
+        return (parent,)
+    source = cast(
+        RegulatoryTemporalProjection.payload["projection"]["source_json"].astext, JSONB
+    )
+    # CASE also prevents parsing unrelated payloads if PostgreSQL chooses a scan.
+    parent_source = case(
+        (
+            RegulatoryTemporalProjection.user_file_id == parent,
+            and_(
+                source["document_id"].astext == str(parent),
+                source["image_file_id"].astext == file_id,
+            ),
+        ),
+        else_=False,
+    )
+    temporal = session.scalar(
+        select(RegulatoryTemporalProjection.id)
+        .join(UserFile, UserFile.id == RegulatoryTemporalProjection.user_file_id)
+        .where(RegulatoryTemporalProjection.user_file_id == parent, parent_source)
+        .limit(1)
+    )
+    return (parent,) if temporal is not None else ()
+
+
 def public_file_source_owners(session: Session, file_id: str) -> tuple[UUID, ...]:
     """Map immutable raw/source/image identity to its protected parent files."""
     from sqlalchemy import cast, or_
@@ -296,6 +359,9 @@ def public_file_source_owners(session: Session, file_id: str) -> tuple[UUID, ...
         RegulatorySourceAsset,
     )
 
+    scoped_image = regulatory_source_image_owners(session, file_id)
+    if scoped_image is not None:
+        return scoped_image
     owners = set(
         session.scalars(select(UserFile.id).where(UserFile.file_id == file_id))
     )
