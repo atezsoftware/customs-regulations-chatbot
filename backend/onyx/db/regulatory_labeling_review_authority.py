@@ -36,6 +36,9 @@ from onyx.regulatory.labeling.chapter_caption import (
     CHAPTER_CAPTION_KEY,
     SourceOnlyChapterCaptionReceipt,
 )
+from onyx.regulatory.labeling.chapter_caption_cache import (
+    native_caption_proof_operation,
+)
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
 from onyx.regulatory.labeling.intake_duplicate_label_repair import DUPLICATE_REPAIR_KEY
 from onyx.regulatory.labeling.provider import (
@@ -112,6 +115,13 @@ def labeling_review_authority(
     session: Session, run_id: UUID
 ) -> dict[str, object] | None:
     """Legacy receipts keep their bytes; new evidence is always validated first."""
+    with native_caption_proof_operation():
+        return _labeling_review_authority(session, run_id)
+
+
+def _labeling_review_authority(
+    session: Session, run_id: UUID
+) -> dict[str, object] | None:
     repairs = list(
         session.scalars(
             select(RegulatoryLabelingItem)
