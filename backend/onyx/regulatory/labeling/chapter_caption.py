@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from typing import Any, Literal
 from uuid import UUID
@@ -144,6 +144,10 @@ def _profile(text: str) -> _CaptionProfile:
     if found is None:
         raise ValueError("The nominal chapter/article caption pair is unsupported")
     return found
+
+
+def chapter_caption_qualification_sha256(text: str) -> str:
+    return publication_digest(asdict(_profile(text)))
 
 
 def _metadata(source: CaptionRepairSource) -> Mapping[str, Any]:

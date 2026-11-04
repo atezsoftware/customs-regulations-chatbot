@@ -28,15 +28,19 @@ from onyx.regulatory.labeling.chapter_caption import (
     MAX_CAPTION_PDF_BYTES,
     ChapterCaptionSourceProof,
     SourceOnlyChapterCaptionReceipt,
-    build_chapter_caption_source_proof,
     chapter_caption_candidate,
     chapter_caption_sources,
+)
+from onyx.regulatory.labeling.chapter_caption_cache import (
+    NativeCaptionIdentity,
+    chapter_caption_native_proof,
 )
 from onyx.regulatory.labeling.intake_abstention_repair import (
     AbstentionRepairAudit,
     CaptionRepairSource,
 )
 from onyx.regulatory.labeling.provider import TaxonomyDefinition, build_labeling_request
+from shared_configs.contextvars import get_current_tenant_id
 
 
 def _current_inputs(
@@ -104,13 +108,6 @@ def _current_inputs(
         or not 0 < asset.byte_count <= MAX_CAPTION_PDF_BYTES
     ):
         raise ValueError("A paired legacy caption requires its retained bounded PDF")
-    try:
-        with get_default_file_store().read_file(asset.file_id) as stream:
-            raw = stream.read(MAX_CAPTION_PDF_BYTES + 1)
-    except (OSError, ClientError, GoogleAPICallError, NoResultFound) as error:
-        raise ValueError("The retained native caption PDF is unavailable") from error
-    if len(raw) != asset.byte_count or hashlib.sha256(raw).hexdigest() != asset.sha256:
-        raise ValueError("The retained native caption PDF bytes changed")
     taxonomy_row = session.get_one(
         RegulatoryLabelTaxonomy, run.taxonomy_id, populate_existing=True
     )
@@ -133,13 +130,34 @@ def _current_inputs(
     )
     if request != expected or request.request_hash != item.request_hash:
         raise ValueError("The paired-caption frozen request changed")
-    proof = build_chapter_caption_source_proof(
-        raw_pdf=raw,
-        source_sha256=asset.sha256,
-        source_asset_id=asset.id,
-        user_file_id=item.user_file_id,
+
+    def read_raw() -> bytes:
+        try:
+            with get_default_file_store().read_file(asset.file_id) as stream:
+                raw = stream.read(MAX_CAPTION_PDF_BYTES + 1)
+        except (OSError, ClientError, GoogleAPICallError, NoResultFound) as error:
+            raise ValueError(
+                "The retained native caption PDF is unavailable"
+            ) from error
+        if (
+            len(raw) != asset.byte_count
+            or hashlib.sha256(raw).hexdigest() != asset.sha256
+        ):
+            raise ValueError("The retained native caption PDF bytes changed")
+        return raw
+
+    proof = chapter_caption_native_proof(
+        identity=NativeCaptionIdentity(
+            source_asset_id=asset.id,
+            user_file_id=item.user_file_id,
+            file_id=asset.file_id,
+            source_sha256=asset.sha256,
+            byte_count=asset.byte_count,
+            tenant_id=get_current_tenant_id(),
+        ),
         chunk_id=item.regulatory_chunk_id,
         sources=sources,
+        read_raw=read_raw,
     )
     return taxonomy, request, proof
 
