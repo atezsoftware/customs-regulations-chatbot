@@ -4,7 +4,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect, intake_index_logs, approve_462, approve_465, approve_470]
         default: inspect
 permissions:
   contents: read
@@ -17,6 +17,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read only batch inventory
+        if: inputs.operation != 'intake_index_logs'
         shell: bash
         run: |
           set -euo pipefail
@@ -80,8 +81,138 @@ jobs:
                           for excerpt in lines[index:index + 45]:
                               print(excerpt[:500])
           PY
+      - name: Read only scoped intake indexing worker logs
+        if: inputs.operation == 'intake_index_logs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/intake-index-pods.json
+          python - <<'PY'
+          import json
+          import re
+          import subprocess
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          namespace = 'customs-regulations-dev'
+          repository = '255114580789.dkr.ecr.eu-central-1.amazonaws.com/customs-regulations-backend-lite-dev:'
+          images = {repository + revision for revision in (
+              '65e6b87b737961a45f72a6e55a787c0a55aaa9d8',
+              '758bfd31e91e1ab49538aa54ffcb31b790abbc44',
+          )}
+          targets = []
+          pods = json.loads(Path('/tmp/intake-index-pods.json').read_text())['items']
+          for pod in pods:
+              if (pod['status']['phase'] != 'Running'
+                      or pod['metadata'].get('deletionTimestamp')
+                      or pod['metadata'].get('labels', {}).get('app') != 'dev-customs-regulations-background'):
+                  continue
+              statuses = {item['name']: item for item in pod['status'].get('containerStatuses', [])}
+              for container in pod['spec']['containers']:
+                  status = statuses.get(container['name'], {})
+                  if container['image'] in images and status.get('ready'):
+                      targets.append((pod['metadata']['name'], container['name'], container['image'], status.get('restartCount')))
+          if not 1 <= len(targets) <= 4:
+              raise SystemExit('Expected one to four Ready exact-image DEV background containers')
+
+          file_id = '0c18aee3-80f3-4904-8af7-b0ea57a86ce6'
+          attempt_id = 'afa8a0d6-a090-4138-ac81-8409f276b908'
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          timestamp = re.compile(r'(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2} [AP]M|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)')
+          cause = re.compile(r'(?i)ContextualEnrichmentError|context_generation_incomplete|contextual.*(?:empty response|input window|budget|failure)|LLMRateLimitError|LLMTimeoutError')
+          cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+          output_bytes = 0
+
+          def sanitized(text: str) -> str:
+              text = ansi.sub('', text)
+              text = re.sub(r'-----BEGIN [^-]+-----.*?-----END [^-]+-----', '[REDACTED_PEM]', text, flags=re.S)
+              text = re.sub(r'(?i)\bBearer\s+[^\s\"\'<>]+', 'Bearer [REDACTED]', text)
+              text = re.sub(r'(?i)([\"\']?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret(?:_access_key)?|private_key|client_secret|credential)[\"\']?\s*[:=]\s*)(?:[\"\'][^\"\']*[\"\']|[^\s,;}]+)', r'\1[REDACTED]', text)
+              text = re.sub(r'(https?://[^\s?\"\']+)\?[^\s\"\']+', r'\1?[REDACTED_QUERY]', text)
+              text = re.sub(r'https?://[^/\s:@]+:[^/\s@]+@', 'https://[REDACTED_USERINFO]@', text)
+              text = re.sub(r'\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b', '[REDACTED_TOKEN]', text)
+              return text
+
+          def print_safe(text: str) -> None:
+              global output_bytes
+              text = sanitized(text)[:1200]
+              output_bytes += len(text.encode()) + 1
+              if output_bytes > 256 * 1024:
+                  raise SystemExit('Scoped diagnostic output bound exceeded')
+              print(text)
+
+          def recent_lines(text: str, local_offset_seconds: int) -> list[str]:
+              lines = []
+              current_time = None
+              local_zone = timezone(timedelta(seconds=local_offset_seconds))
+              for line in sanitized(text).splitlines()[-2500:]:
+                  match = timestamp.search(line[:100])
+                  if match:
+                      value = match[1]
+                      if '/' in value:
+                          current_time = datetime.strptime(value, '%m/%d/%Y %I:%M:%S %p').replace(tzinfo=local_zone)
+                      else:
+                          current_time = datetime.fromisoformat(value.replace('Z', '+00:00').replace(',', '.'))
+                          if current_time.tzinfo is None:
+                              current_time = current_time.replace(tzinfo=local_zone)
+                  if current_time is not None and cutoff <= current_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
+                      lines.append(line)
+              return lines
+
+          remote_reader = """
+          import os, sys
+          from datetime import datetime
+          path = '/var/log/onyx/celery_worker_user_file_processing.log'
+          offset = datetime.now().astimezone().utcoffset()
+          print(int(offset.total_seconds()) if offset else 0, flush=True)
+          with open(path, 'rb') as log:
+              size = os.fstat(log.fileno()).st_size
+              log.seek(max(0, size - 2 * 1024 * 1024))
+              data = log.read(2 * 1024 * 1024)
+          sys.stdout.write(data.decode('utf-8', errors='replace'))
+          """
+          for pod, container, image, restarts in sorted(targets):
+              print_safe(f'TARGET {pod} {container} {image} restarts={restarts}')
+              commands = (
+                  ('worker_file', ['kubectl', 'exec', pod, '-n', namespace, '-c', container, '--', 'python', '-c', remote_reader]),
+                  ('container_stdout', ['kubectl', 'logs', pod, '-n', namespace, '-c', container, '--since=30m', '--tail=2500', '--limit-bytes=2097152', '--timestamps=true']),
+              )
+              excerpts = 0
+              seen = set()
+              for source, command in commands:
+                  result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+                  if result.returncode:
+                      print_safe(f'LOG_READ_FAILED {source} exit={result.returncode}')
+                      continue
+                  if len(result.stdout.encode()) > 2 * 1024 * 1024 + 32:
+                      raise SystemExit('Log read bound exceeded')
+                  content = result.stdout
+                  offset_seconds = 0
+                  if source == 'worker_file':
+                      offset, separator, content = content.partition('\n')
+                      if not separator or not re.fullmatch(r'-?\d{1,5}', offset):
+                          raise SystemExit('Invalid worker timezone header')
+                      offset_seconds = int(offset)
+                  lines = recent_lines(content, offset_seconds)
+                  print_safe(f'LOG_SCAN {source} recent_lines={len(lines)}')
+                  for index, line in enumerate(lines):
+                      scope = any(file_id in item or attempt_id in item for item in lines[max(0, index - 80):index + 81])
+                      if not scope or not (cause.search(line) or ((file_id in line or attempt_id in line) and re.search(r'(?i)fail|error|traceback', line))):
+                          continue
+                      start, end = max(0, index - 60), min(len(lines), index + 20)
+                      excerpt = '\n'.join(lines[start:end])
+                      if excerpt in seen or excerpts >= 8:
+                          continue
+                      seen.add(excerpt)
+                      excerpts += 1
+                      print_safe(f'LOG_MATCH {source} excerpt={excerpts} lines={end-start}')
+                      for excerpt_line in lines[start:end]:
+                          print_safe(excerpt_line)
+              print_safe(f'SCOPED_EXCERPTS {pod} count={excerpts}')
+          PY
       - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+        if: contains(fromJSON('["approve_462","approve_465","approve_470"]'), inputs.operation)
         shell: bash
         env:
           OPERATION: ${{ inputs.operation }}
