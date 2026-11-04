@@ -1003,6 +1003,15 @@ class LitellmLLM(LLM):
                 else:
                     optional_kwargs["reasoning_effort"] = ReasoningEffort.MEDIUM.value
 
+        # Ultra enables high-effort reasoning by default unless explicitly disabled.
+        if (
+            reasoning_effort is ReasoningEffort.OFF
+            and self.config.model_provider
+            in {LlmProviderNames.OPENROUTER, "nvidia_nim"}
+            and "nvidia/nemotron-3-ultra-550b-a55b" in model_identity_names
+        ):
+            optional_kwargs["reasoning_effort"] = "none"
+
         if tools:
             # OpenAI will error if parallel_tool_calls is True and tools are not specified
             optional_kwargs["parallel_tool_calls"] = parallel_tool_calls
