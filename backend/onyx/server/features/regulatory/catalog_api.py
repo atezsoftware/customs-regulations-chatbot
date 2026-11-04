@@ -1,5 +1,6 @@
 """API-key and session accessible admin browsing without generative search."""
 
+from collections import Counter
 from collections.abc import Sequence
 from uuid import UUID
 
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 from onyx.auth.permissions import require_permission
 from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.context.search.enums import QueryType
-from onyx.context.search.models import IndexFilters
+from onyx.context.search.models import IndexFilters, InferenceChunk
 from onyx.context.search.utils import get_query_embedding
 from onyx.db.document_intake import pending_intake_file_ids
 from onyx.db.engine.sql_engine import get_session
@@ -17,6 +18,7 @@ from onyx.db.enums import Permission, UserFileStatus
 from onyx.db.models import User, UserFile
 from onyx.db.regulatory_catalog import (
     catalog_chunk_counts,
+    catalog_chunk_page_offset,
     catalog_folder_path,
     catalog_index_requests,
     catalog_search_rows,
@@ -28,6 +30,7 @@ from onyx.db.regulatory_catalog import (
 from onyx.db.regulatory_indexing_jobs import (
     fetch_latest_regulatory_indexing_progress_for_user_files,
 )
+from onyx.db.reranking import get_reranker_configuration
 from onyx.db.search_settings import get_current_search_settings
 from onyx.document_index.factory import get_default_document_index
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -38,11 +41,16 @@ from onyx.regulatory.publication_reads import (
     observe_publication_read,
     require_publication_files,
 )
+from onyx.reranking.service import rerank_chunks
+from onyx.reranking.staged import rerank_regulatory_candidates_in_batches
 from onyx.server.features.document_set.file_models import (
     RegulatoryIndexingProgressSnapshot,
 )
 from onyx.server.features.regulatory.catalog_models import (
     CATALOG_SEARCH_CANDIDATES,
+    CATALOG_SEARCH_PER_FILE,
+    CATALOG_SEARCH_RESULTS,
+    CatalogChunkLocation,
     CatalogDocumentSet,
     CatalogFile,
     CatalogFilePage,
@@ -168,6 +176,22 @@ def index_file(
     return _file_snapshots(db_session, [file])[file.id]
 
 
+@router.get("/files/{file_id}/chunks/{chunk_id}/location")
+def locate_chunk(
+    file_id: UUID,
+    chunk_id: str,
+    limit: int = Query(default=25, ge=1, le=100),
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> CatalogChunkLocation:
+    observation = observe_publication_read()
+    offset = catalog_chunk_page_offset(db_session, file_id, chunk_id, limit=limit)
+    if offset is None:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found in this file")
+    require_publication_files(observation, (file_id,))
+    return CatalogChunkLocation(offset=offset)
+
+
 @router.get("/folders")
 def get_folders(
     parent: str = Query(default="", max_length=2000),
@@ -200,8 +224,21 @@ def search_chunks(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> CatalogSearchPage:
+    return search_catalog_chunks(request, db_session)
+
+
+def search_catalog_chunks(
+    request: CatalogSearchRequest, db_session: Session
+) -> CatalogSearchPage:
+    """Share the same bounded, reranked evidence with both admin search screens."""
     observation = observe_publication_read()
     settings = get_current_search_settings(db_session)
+    reranker = get_reranker_configuration(db_session)
+    if not reranker.enabled:
+        raise OnyxError(
+            OnyxErrorCode.SERVICE_UNAVAILABLE,
+            "Arama için indeks ayarlarından yeniden sıralayıcıyı etkinleştirin.",
+        )
     index = get_default_document_index(settings, None, db_session)
     # This permission-gated catalog deliberately spans every owner's files.
     # Tenant and publication constraints still apply inside the index adapter.
@@ -210,35 +247,20 @@ def search_chunks(
         tenant_id=get_current_tenant_id(),
         regulatory_chunks_only=True,
     )
-    if request.mode == "bm25":
-        retrieved = index.keyword_retrieval(
-            query=request.query,
-            filters=filters,
-            num_to_retrieve=CATALOG_SEARCH_CANDIDATES,
-            include_hidden=False,
-        )
-    else:
-        model = EmbeddingModel.from_db_model(
-            search_settings=settings,
-            server_host=MODEL_SERVER_HOST,
-            server_port=MODEL_SERVER_PORT,
-        )
-        embedding = get_query_embedding(request.query, embedding_model=model)
-        if request.mode == "semantic":
-            retrieved = index.semantic_retrieval(
-                query_embedding=embedding,
-                filters=filters,
-                num_to_retrieve=CATALOG_SEARCH_CANDIDATES,
-            )
-        else:
-            retrieved = index.hybrid_retrieval(
-                query=request.query,
-                query_embedding=embedding,
-                final_keywords=None,
-                query_type=QueryType.SEMANTIC,
-                filters=filters,
-                num_to_retrieve=CATALOG_SEARCH_CANDIDATES,
-            )
+    model = EmbeddingModel.from_db_model(
+        search_settings=settings,
+        server_host=MODEL_SERVER_HOST,
+        server_port=MODEL_SERVER_PORT,
+    )
+    embedding = get_query_embedding(request.query, embedding_model=model)
+    retrieved = index.hybrid_retrieval(
+        query=request.query,
+        query_embedding=embedding,
+        final_keywords=None,
+        query_type=QueryType.SEMANTIC,
+        filters=filters,
+        num_to_retrieve=CATALOG_SEARCH_CANDIDATES,
+    )[:CATALOG_SEARCH_CANDIDATES]
 
     rows = catalog_search_rows(
         db_session,
@@ -246,7 +268,8 @@ def search_chunks(
     )
     files = {file.id: file for _, file in rows.values()}
     snapshots = _file_snapshots(db_session, list(files.values()))
-    hits: list[CatalogSearchHit] = []
+    candidates: list[InferenceChunk] = []
+    hits: dict[str, CatalogSearchHit] = {}
     seen: set[str] = set()
     for result in retrieved:
         canonical_id = result.regulatory_chunk_id
@@ -256,20 +279,69 @@ def search_chunks(
         if str(file.id) != result.document_id:
             continue
         seen.add(canonical_id)
-        hits.append(
-            CatalogSearchHit(
-                file=snapshots[file.id],
-                chunk=RegulatoryChunkSnapshot.from_model(chunk),
-                score=result.score,
+        snapshot = RegulatoryChunkSnapshot.from_model(chunk)
+        hits[canonical_id] = CatalogSearchHit(
+            file=snapshots[file.id], chunk=snapshot, score=None
+        )
+        # Score the canonical text that is actually delivered to the administrator.
+        candidates.append(
+            result.model_copy(
+                update={
+                    "chunk_id": len(candidates),
+                    "content": snapshot.text,
+                    "blurb": snapshot.text,
+                    "heading_path": snapshot.heading_path,
+                    "title": file.name,
+                    "semantic_identifier": file.name,
+                    "doc_summary": "",
+                    "chunk_context": "",
+                }
             )
         )
-    hits = filter_publication_read(observation, hits, lambda hit: str(hit.file.id))
-    page = hits[request.offset : request.offset + request.limit]
+    candidates = filter_publication_read(
+        observation, candidates, lambda candidate: candidate.document_id
+    )
+    ranked_hits: list[CatalogSearchHit] = []
+    if candidates:
+        reranked = rerank_regulatory_candidates_in_batches(
+            query=request.query,
+            chunks=candidates,
+            config=reranker,
+            rerank=rerank_chunks,
+        )
+        if not reranked.used_external or len(reranked.scores_by_chunk) != len(
+            candidates
+        ):
+            raise OnyxError(
+                OnyxErrorCode.SERVICE_UNAVAILABLE,
+                "Yeniden sıralama tamamlanamadı. Lütfen tekrar deneyin.",
+            )
+        file_counts: Counter[str] = Counter()
+        for candidate in reranked.ordered_chunks:
+            if file_counts[candidate.document_id] >= CATALOG_SEARCH_PER_FILE:
+                continue
+            canonical_id = candidate.regulatory_chunk_id
+            if canonical_id is None:
+                continue
+            hit = hits[canonical_id]
+            ranked_hits.append(
+                hit.model_copy(
+                    update={
+                        "score": reranked.scores_by_chunk[
+                            (candidate.document_id, candidate.chunk_id)
+                        ]
+                    }
+                )
+            )
+            file_counts[candidate.document_id] += 1
+            if len(ranked_hits) == CATALOG_SEARCH_RESULTS:
+                break
+    page = ranked_hits[request.offset : request.offset + request.limit]
     require_publication_files(observation, tuple(hit.file.id for hit in page))
     return CatalogSearchPage(
         items=page,
-        total=len(hits),
+        total=len(ranked_hits),
         offset=request.offset,
         limit=request.limit,
-        has_more=request.offset + len(page) < len(hits),
+        has_more=request.offset + len(page) < len(ranked_hits),
     )

@@ -11,7 +11,9 @@ from onyx.server.features.document_set.file_models import (
 )
 from onyx.server.features.regulatory.models import RegulatoryChunkSnapshot
 
-CATALOG_SEARCH_CANDIDATES = 500
+CATALOG_SEARCH_CANDIDATES = 100
+CATALOG_SEARCH_RESULTS = 20
+CATALOG_SEARCH_PER_FILE = 8
 
 
 class CatalogDocumentSet(BaseModel):
@@ -64,9 +66,9 @@ class CatalogFolderPage(BaseModel):
 
 class CatalogSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
-    mode: Literal["bm25", "semantic", "hybrid"] = "bm25"
-    offset: int = Field(default=0, ge=0, le=CATALOG_SEARCH_CANDIDATES - 1)
-    limit: int = Field(default=25, ge=1, le=100)
+    mode: Literal["hybrid"] = "hybrid"
+    offset: int = Field(default=0, ge=0, lt=CATALOG_SEARCH_RESULTS)
+    limit: int = Field(default=CATALOG_SEARCH_RESULTS, ge=1, le=CATALOG_SEARCH_RESULTS)
 
     @field_validator("query")
     @classmethod
@@ -92,3 +94,9 @@ class CatalogSearchPage(BaseModel):
     # Retrieval is a bounded ranked candidate set, not an exact corpus count.
     total_is_exact: bool = False
     candidate_limit: int = CATALOG_SEARCH_CANDIDATES
+    result_limit: int = CATALOG_SEARCH_RESULTS
+    per_file_limit: int = CATALOG_SEARCH_PER_FILE
+
+
+class CatalogChunkLocation(BaseModel):
+    offset: int
