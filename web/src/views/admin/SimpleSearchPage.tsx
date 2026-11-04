@@ -31,6 +31,13 @@ export default function SimpleSearchPage() {
   const rewrittenQuery = search.data?.query_rewritten
     ? search.data.search_query?.trim()
     : null;
+  const providerCost = search.data?.summary_usage?.provider_cost_usd;
+  const summaryCostLabel =
+    typeof providerCost === "number" &&
+    Number.isFinite(providerCost) &&
+    providerCost >= 0
+      ? `Nemotron maliyeti: $${providerCost.toFixed(6)}`
+      : null;
   return (
     <SettingsLayouts.Root width="lg">
       <SettingsLayouts.Header
@@ -141,6 +148,11 @@ export default function SimpleSearchPage() {
                 font="secondary-body"
                 color="text-03"
               >{`${search.data.summary_model.includes("nemotron-3-ultra") ? "Nemotron 3 Ultra" : search.data.summary_model} · Kaynak içeriklerinin kısa özeti.`}</Text>
+              {summaryCostLabel && (
+                <Text font="secondary-body" color="text-03">
+                  {summaryCostLabel}
+                </Text>
+              )}
             </section>
             <Text
               font="main-ui-action"

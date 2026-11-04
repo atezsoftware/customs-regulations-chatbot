@@ -58,6 +58,13 @@ export interface LegistationsQuery {
   offset: number;
 }
 
+export interface LegislationSummaryUsage {
+  response_id: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  provider_cost_usd: number | null;
+}
+
 export interface LegislationSimpleSearchResponse {
   search: LegislationSearchPage;
   summary: string | null;
@@ -65,6 +72,9 @@ export interface LegislationSimpleSearchResponse {
   summary_error: string | null;
   search_query?: string;
   query_rewritten?: boolean;
+  summary_usage?: LegislationSummaryUsage | null;
+  summary_error_code?: string | null;
+  request_id?: string;
 }
 
 export interface LegislationSearchFileGroup {
