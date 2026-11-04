@@ -1,4 +1,4 @@
-"""Reuse immutable native evidence within one labeling review operation only."""
+"""Reuse immutable native evidence within one bounded publication operation."""
 
 import hashlib
 from collections.abc import Callable, Iterator, Sequence
@@ -53,6 +53,9 @@ _EVIDENCE: ContextVar[_OperationEvidence | None] = ContextVar(
 
 @contextmanager
 def native_caption_proof_operation() -> Iterator[None]:
+    if _EVIDENCE.get() is not None:
+        yield
+        return
     token = _EVIDENCE.set(_OperationEvidence())
     try:
         yield

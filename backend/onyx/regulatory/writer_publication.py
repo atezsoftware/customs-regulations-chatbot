@@ -511,6 +511,9 @@ def republish_user_file(
     from onyx.document_index.publication_models import PublicationScope
     from onyx.regulatory.amendments.annexes import config
     from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+    from onyx.regulatory.labeling.chapter_caption_cache import (
+        native_caption_proof_operation,
+    )
     from onyx.regulatory.writer_projection import prepare_owned_correction
 
     require_publication_file_for_tenant(user_file_id, tenant_id)
@@ -528,7 +531,7 @@ def republish_user_file(
 
             validate_user_file_index_request(owner, index_request_attempt_id)
         owner = recover_owned_writer_before_next(owner)
-        with publication_heartbeat(owner) as lost:
+        with publication_heartbeat(owner) as lost, native_caption_proof_operation():
             inputs = load_owned_writer_inputs(owner)
             allowed = {UserFileStatus.COMPLETED}
             if include_chunked:
