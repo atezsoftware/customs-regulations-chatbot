@@ -138,7 +138,7 @@ jobs:
               global output_bytes
               text = sanitized(text)[:1200]
               output_bytes += len(text.encode()) + 1
-              if output_bytes > 256 * 1024:
+              if output_bytes > 2 * 1024 * 1024:
                   raise SystemExit('Scoped diagnostic output bound exceeded')
               print(text)
 
@@ -160,17 +160,123 @@ jobs:
                       lines.append(line)
               return lines
 
-          remote_reader = """
-          import os, sys
-          from datetime import datetime
-          path = '/var/log/onyx/celery_worker_user_file_processing.log'
+          remote_reader = r"""
+          import json, os, re, stat, sys
+          from collections import deque
+          from datetime import datetime, timedelta, timezone
+          base = '/var/log/onyx/celery_worker_user_file_processing.log'
           offset = datetime.now().astimezone().utcoffset()
-          print(int(offset.total_seconds()) if offset else 0, flush=True)
-          with open(path, 'rb') as log:
-              size = os.fstat(log.fileno()).st_size
-              log.seek(max(0, size - 2 * 1024 * 1024))
-              data = log.read(2 * 1024 * 1024)
-          sys.stdout.write(data.decode('utf-8', errors='replace'))
+          offset_seconds = int(offset.total_seconds()) if offset else 0
+          local_zone = timezone(timedelta(seconds=offset_seconds))
+          cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+          identities = (
+              ('0c18aee3-80f3-4904-8af7-b0ea57a86ce6', 'afa8a0d6-a090-4138-ac81-8409f276b908'),
+              ('73fd455a-4e58-4966-bfc0-edec5f2d3ca7', 'e89d67e3-7bbd-4af5-8ff4-572adad7db73'),
+              ('020d22e4-d45f-4891-bb73-a07ef9fe3142', '851f51a8-8e4d-4eeb-88a4-6a34f8af6c1d'),
+              ('5797281f-246b-49cd-a350-fef757ef92c1', '8741d353-f898-46ef-bead-a842679d72bc'),
+              ('8aed383b-e0ae-4299-9fd4-021c30988e0f', '647d4322-1f02-4b99-89de-ace4a42740bb'),
+              ('92de9f63-79e3-433a-934f-e02dfda5b4f7', 'd53b4f4f-f32b-4c1c-8144-bc51e3a6635c'),
+              ('ad6e2314-9c51-454d-b7f1-ea014b1929a4', '80f81fb9-7677-4310-811a-243a750f8ed5'),
+              ('c4cc37a0-4396-4ec9-8ddc-ed0d1603dea6', '3fd4168c-e1b1-4cf0-ad05-0739c89cca5f'),
+              ('e54fbe4a-bfc2-4f5f-b22b-598b254b6c20', 'e68d977a-bed6-4991-a56b-e183d5d3698e'),
+              ('f00cc0fc-6da2-405a-9f39-cda46153b8b3', 'a16f8aec-0957-4db9-87ce-076266919a28'),
+          )
+          stamp = re.compile(r'(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2} [AP]M|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)')
+          error = re.compile(r'(?i)ContextualEnrichmentError|context_generation_incomplete|contextual.*(?:empty response|input window|budget|failure)|LLMRateLimitError|LLMTimeoutError|failed|traceback')
+          reports, windows, total_read = [], [], 0
+          budget = 128 * 1024 * 1024
+          for number in range(4):
+              path = base + ('.' + str(number) if number else '')
+              basename = os.path.basename(path)
+              try:
+                  descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+              except FileNotFoundError:
+                  reports.append({'basename': basename, 'missing': True})
+                  continue
+              history = deque(maxlen=161)
+              position, matches, errors, consumed, skipped = 0, 0, set(), 0, 0
+              current_time, first_time, last_time = None, None, None
+              dropping = False
+
+              def capture(anchor, priority):
+                  for window in windows:
+                      if window['basename'] == basename and window['start_line'] <= anchor < window['end_line']:
+                          window['priority'] = min(window['priority'], priority)
+                          return
+                  if len(windows) >= 8:
+                      worst = max(windows, key=lambda item: item['priority'])
+                      if worst['priority'] <= priority:
+                          return
+                      windows.remove(worst)
+                  start, end = max(0, anchor - 60), anchor + 100
+                  windows.append({'basename': basename, 'priority': priority, 'start_line': start,
+                                  'end_line': end, 'lines': [line for index, line, _, _ in history if start <= index < end]})
+
+              with os.fdopen(descriptor, 'rb') as log:
+                  info = os.fstat(log.fileno())
+                  if not stat.S_ISREG(info.st_mode):
+                      raise SystemExit('Fixed worker log is not a regular file')
+                  while total_read < budget:
+                      data = log.readline(min(1024 * 1024, budget - total_read))
+                      if not data:
+                          break
+                      consumed += len(data)
+                      total_read += len(data)
+                      if dropping:
+                          dropping = not data.endswith(b'\n')
+                          continue
+                      if not data.endswith(b'\n') and len(data) >= 1024 * 1024:
+                          skipped += 1
+                          dropping = True
+                          continue
+                      text = data.decode('utf-8', errors='replace').rstrip('\r\n')
+                      match = stamp.search(text[:100])
+                      if match:
+                          value = match[1]
+                          if '/' in value:
+                              current_time = datetime.strptime(value, '%m/%d/%Y %I:%M:%S %p').replace(tzinfo=local_zone)
+                          else:
+                              current_time = datetime.fromisoformat(value.replace('Z', '+00:00').replace(',', '.'))
+                              if current_time.tzinfo is None:
+                                  current_time = current_time.replace(tzinfo=local_zone)
+                          first_time = current_time if first_time is None else min(first_time, current_time)
+                          last_time = current_time if last_time is None else max(last_time, current_time)
+                      if current_time is None or not cutoff <= current_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
+                          continue
+                      priority = next((rank for rank, pair in enumerate(identities) if any(identity in text for identity in pair)), None)
+                      is_error = bool(error.search(text))
+                      line = text[:1200]
+                      for window in windows:
+                          if window['basename'] == basename and window['start_line'] <= position < window['end_line']:
+                              window['lines'].append(line)
+                      history.append((position, line, priority, is_error))
+                      if priority is not None:
+                          matches += 1
+                          for index, _, _, previous_error in history:
+                              if position - index <= 100 and previous_error:
+                                  errors.add(index)
+                                  capture(index, priority)
+                      if is_error:
+                          priorities = [rank for index, _, rank, _ in history if position - index <= 100 and rank is not None]
+                          if priorities:
+                              errors.add(position)
+                              capture(position, min(priorities))
+                      position += 1
+              reports.append({'basename': basename, 'size_at_open': info.st_size, 'read_bytes': consumed,
+                              'complete_initial_file': consumed >= info.st_size, 'read_cap_exhausted': total_read >= budget,
+                              'first_timestamp': first_time.isoformat() if first_time else None,
+                              'last_timestamp': last_time.isoformat() if last_time else None,
+                              'recent_lines': position, 'identity_matches': matches, 'scoped_error_matches': len(errors),
+                              'oversized_lines_skipped': skipped})
+          for window in windows:
+              window['text'] = '\n'.join(window.pop('lines'))
+          windows.sort(key=lambda item: (item['priority'], item['basename'], item['start_line']))
+          payload = json.dumps({'files': reports, 'read_bytes': total_read, 'read_cap_exhausted': total_read >= budget,
+                                'utc_cutoff': cutoff.isoformat(), 'windows': windows}, ensure_ascii=False)
+          if len(payload.encode()) > 2 * 1024 * 1024:
+              raise SystemExit('Scoped worker log response bound exceeded')
+          print(offset_seconds)
+          sys.stdout.write(payload)
           """
           for pod, container, image, restarts in sorted(targets):
               print_safe(f'TARGET {pod} {container} {image} restarts={restarts}')
@@ -181,7 +287,7 @@ jobs:
               excerpts = 0
               seen = set()
               for source, command in commands:
-                  result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+                  result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=90 if source == 'worker_file' else 30)
                   if result.returncode:
                       print_safe(f'LOG_READ_FAILED {source} exit={result.returncode}')
                       continue
@@ -194,6 +300,16 @@ jobs:
                       if not separator or not re.fullmatch(r'-?\d{1,5}', offset):
                           raise SystemExit('Invalid worker timezone header')
                       offset_seconds = int(offset)
+                      report = json.loads(content)
+                      print_safe(f"WORKER_LOG_SCAN read_bytes={report['read_bytes']} cap_exhausted={report['read_cap_exhausted']} utc_cutoff={report['utc_cutoff']}")
+                      for metadata in report['files']:
+                          print_safe('WORKER_LOG_FILE ' + json.dumps(metadata, sort_keys=True))
+                      for window in report['windows']:
+                          excerpts += 1
+                          print_safe(f"LOG_MATCH worker_file excerpt={excerpts} basename={window['basename']} priority={window['priority']} recent_lines={window['start_line']}:{window['end_line']}")
+                          for excerpt_line in sanitized(window['text']).splitlines():
+                              print_safe(excerpt_line)
+                      continue
                   lines = recent_lines(content, offset_seconds)
                   print_safe(f'LOG_SCAN {source} recent_lines={len(lines)}')
                   for index, line in enumerate(lines):
