@@ -135,8 +135,21 @@ test("keeps retrieved chunks accessible when the summary model fails", async () 
   expect(screen.getByRole("button", { name: "Dosyaya git" })).toBeEnabled();
 });
 
-test("does not submit a blank search", async () => {
+test("renders the empty search and draft without fetching until submission", async () => {
+  const user = setupUser();
   render(<SimpleSearchPage />);
+  expect(screen.getByRole("button", { name: "Ara" })).toBeDisabled();
+  expect(
+    screen.getByText(/Arama yapın; ilgili kaynakların özeti/)
+  ).toBeVisible();
+  await user.type(
+    screen.getByRole("textbox", { name: "Basit mevzuat araması" }),
+    "gümrük"
+  );
+  expect(screen.getByRole("button", { name: "Ara" })).toBeEnabled();
+  await user.clear(
+    screen.getByRole("textbox", { name: "Basit mevzuat araması" })
+  );
   expect(screen.getByRole("button", { name: "Ara" })).toBeDisabled();
   await waitFor(() => expect(fetchSpy).not.toHaveBeenCalled());
 });

@@ -18,17 +18,16 @@ export default function SimpleSearchPage() {
   } | null>(null);
   const [selectedHit, setSelectedHit] =
     useState<LegislationSearchResult | null>(null);
-  const search = useSWR(
-    request
-      ? ["legistations-simple-search", request.query, request.sequence]
-      : null,
-    () => simpleSearchCatalog(request!.query),
-    {
-      revalidateOnFocus: false,
-      revalidateOnReconnect: false,
-      shouldRetryOnError: false,
-    }
-  );
+  const searchKey:
+    | readonly ["legistations-simple-search", string, number]
+    | null = request
+    ? ["legistations-simple-search", request.query, request.sequence]
+    : null;
+  const search = useSWR(searchKey, ([, query]) => simpleSearchCatalog(query), {
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    shouldRetryOnError: false,
+  });
   return (
     <SettingsLayouts.Root width="lg">
       <SettingsLayouts.Header
