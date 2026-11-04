@@ -1,6 +1,9 @@
 import { render, screen, setupUser, waitFor } from "@tests/setup/test-utils";
 import SimpleSearchPage from "@/views/admin/SimpleSearchPage";
-import type { LegislationFile } from "@/lib/legistations/interfaces";
+import type {
+  LegislationFile,
+  LegislationSummaryUsage,
+} from "@/lib/legistations/interfaces";
 import type { RegulatoryChunk } from "@/lib/regulatory/interfaces";
 
 jest.mock("next/navigation", () => ({
@@ -40,12 +43,14 @@ const chunk: RegulatoryChunk = {
 };
 let fetchSpy: jest.SpyInstance;
 let summaryError: string | null;
+let summaryUsage: LegislationSummaryUsage | undefined;
 let queryMetadata: { search_query: string; query_rewritten: boolean } | null;
 function jsonResponse(body: unknown): Response {
   return { ok: true, json: async () => body } as Response;
 }
 beforeEach(() => {
   summaryError = null;
+  summaryUsage = undefined;
   queryMetadata = null;
   fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async (input) => {
     const url = new URL(String(input), "http://localhost:3000");
@@ -68,6 +73,7 @@ beforeEach(() => {
           : "Bu dosyada gümrük vergisi hakkında bir bölüm buldum. [1]",
         summary_model: "nvidia/nemotron-3-ultra-550b-a55b",
         summary_error: summaryError,
+        summary_usage: summaryUsage,
         ...queryMetadata,
       });
     // GET catalog file: refresh selected file metadata.
@@ -106,6 +112,7 @@ test("shows a source summary and numbered chunk cards with highlighted file navi
   const user = await runSearch();
   expect(await screen.findByText(/Bu dosyada gümrük vergisi/)).toBeVisible();
   expect(screen.getByText("Kaynak [1] · Chunk #80")).toBeVisible();
+  expect(screen.queryByText(/^Nemotron maliyeti:/)).not.toBeInTheDocument();
   expect(
     screen.queryByRole("button", { name: "Düzenle" })
   ).not.toBeInTheDocument();
@@ -195,5 +202,55 @@ test.each([
     await runSearch();
     expect(await screen.findByText(/Bu dosyada gümrük vergisi/)).toBeVisible();
     expect(screen.queryByText(/^Aranan ifade:/)).not.toBeInTheDocument();
+  }
+);
+
+test.each([null, "Özet doğrulanamadı; bulunan kaynakları inceleyebilirsiniz."])(
+  "shows the provider's Nemotron charge even when the summary is rejected: %s",
+  async (error) => {
+    summaryError = error;
+    summaryUsage = {
+      response_id: "provider-response",
+      input_tokens: 2400,
+      output_tokens: 320,
+      provider_cost_usd: 0.004676,
+    };
+    await runSearch();
+    expect(
+      await screen.findByText("Nemotron maliyeti: $0.004676")
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Dosyaya git" })).toBeEnabled();
+    if (error) expect(screen.getByRole("alert")).toHaveTextContent(error);
+    expect(
+      fetchSpy.mock.calls.filter(([input]) =>
+        String(input).endsWith("/simple-search")
+      )
+    ).toHaveLength(1);
+  }
+);
+
+test("shows a zero provider charge", async () => {
+  summaryUsage = {
+    response_id: null,
+    input_tokens: null,
+    output_tokens: null,
+    provider_cost_usd: 0,
+  };
+  await runSearch();
+  expect(await screen.findByText("Nemotron maliyeti: $0.000000")).toBeVisible();
+});
+
+test.each([null, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+  "omits an unavailable or invalid provider charge: %s",
+  async (cost) => {
+    summaryUsage = {
+      response_id: null,
+      input_tokens: null,
+      output_tokens: null,
+      provider_cost_usd: cost,
+    };
+    await runSearch();
+    expect(await screen.findByText(/Bu dosyada gümrük vergisi/)).toBeVisible();
+    expect(screen.queryByText(/^Nemotron maliyeti:/)).not.toBeInTheDocument();
   }
 );

@@ -1,7 +1,10 @@
 """Admin simple-search wire models."""
 
+from uuid import UUID
+
 from pydantic import BaseModel, Field, field_validator
 
+from onyx.regulatory.catalog_summary_usage import CatalogSummaryUsage
 from onyx.server.features.regulatory.catalog_models import CatalogSearchPage
 
 
@@ -24,3 +27,6 @@ class SimpleSearchResponse(BaseModel):
     summary_error: str | None = None
     search_query: str
     query_rewritten: bool = False
+    request_id: UUID
+    summary_usage: CatalogSummaryUsage | None = None
+    summary_error_code: str | None = None

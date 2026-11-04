@@ -69,6 +69,13 @@ def catalog_query_needs_preparation(query: str) -> bool:
         return False
     if any(cue in normalized for cue in _DESCRIPTION_CUES):
         return True
+    if re.search(
+        r"\b(?:bi|bir)\b[^.!?\n]*\bvardı\b|\bkararı\s+vardı\b", normalized
+    ) or (
+        re.search(r"^\s*ya\s+(?:bu|şu)\b", normalized)
+        and re.search(r"\b(?:onu|bunu|şunu)\s+bul\b", normalized)
+    ):
+        return True
     words = re.findall(r"\w+", normalized)
     if len(words) <= 12:
         return False
