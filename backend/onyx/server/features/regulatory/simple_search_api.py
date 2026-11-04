@@ -1,5 +1,7 @@
 """Admin discovery search: shared retrieval followed by a factual source overview."""
 
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -14,6 +16,7 @@ from onyx.regulatory.catalog_summary import (
     CatalogSummaryUnavailable,
     generate_catalog_summary,
 )
+from onyx.regulatory.catalog_summary_usage import CatalogSummaryUsage
 from onyx.regulatory.publication_reads import (
     observe_publication_read,
     require_publication_files,
@@ -25,6 +28,7 @@ from onyx.server.features.regulatory.simple_search_models import (
     SimpleSearchResponse,
 )
 from onyx.server.utils_vector_db import require_vector_db
+from onyx.tracing.framework.create import ensure_trace
 from onyx.utils.logger import setup_logger
 
 router = APIRouter(prefix="/regulatory/catalog", tags=PUBLIC_API_TAGS)
@@ -37,24 +41,61 @@ def simple_search(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> SimpleSearchResponse:
-    prepared_query = prepare_catalog_search_query(request.query, db_session)
-    observation = observe_publication_read()
-    search = search_catalog_chunks(
-        CatalogSearchRequest(query=prepared_query.query), db_session
-    )
+    request_id = uuid4()
     summary: str | None = None
     summary_error: str | None = None
-    try:
-        summary = generate_catalog_summary(request.query, search, db_session)
-    except CatalogSummaryUnavailable as error:
-        summary_error = str(error)
-    except Exception as error:
-        # Provider errors may contain credentials or source text.
-        logger.warning("Catalog summary failed: %s", type(error).__name__)
-        summary_error = (
-            "Nemotron özeti üretilemedi. Arama sonuçlarını inceleyebilirsiniz."
+    summary_error_code: str | None = None
+    summary_usage: CatalogSummaryUsage | None = None
+
+    def observe_usage(usage: CatalogSummaryUsage) -> None:
+        nonlocal summary_usage
+        summary_usage = usage
+
+    with ensure_trace(
+        "catalog_simple_search",
+        trace_id=f"trace_{request_id.hex}",
+        group_id=str(request_id),
+        metadata={"request_id": str(request_id)},
+    ):
+        prepared_query = prepare_catalog_search_query(request.query, db_session)
+        observation = observe_publication_read()
+        search = search_catalog_chunks(
+            CatalogSearchRequest(query=prepared_query.query), db_session
         )
-    require_publication_files(observation, tuple(hit.file.id for hit in search.items))
+        try:
+            summary = generate_catalog_summary(
+                request.query, search, db_session, usage_observer=observe_usage
+            )
+        except CatalogSummaryUnavailable as error:
+            summary_error = str(error)
+            summary_error_code = error.code.value
+        except Exception as error:
+            # Provider errors may contain credentials or source text.
+            logger.warning(
+                "Catalog summary failed request_id=%s error_type=%s",
+                request_id,
+                type(error).__name__,
+            )
+            summary_error_code = "provider_error"
+            summary_error = (
+                "Nemotron özeti üretilemedi. Arama sonuçlarını inceleyebilirsiniz."
+            )
+        require_publication_files(
+            observation, tuple(hit.file.id for hit in search.items)
+        )
+    logger.info(
+        "Catalog simple search request_id=%s summary_error_code=%s "
+        "summary_response_id=%s summary_input_tokens=%s summary_output_tokens=%s "
+        "summary_provider_cost_usd=%s result_count=%d query_rewritten=%s",
+        request_id,
+        summary_error_code,
+        summary_usage.response_id if summary_usage else None,
+        summary_usage.input_tokens if summary_usage else None,
+        summary_usage.output_tokens if summary_usage else None,
+        summary_usage.provider_cost_usd if summary_usage else None,
+        len(search.items),
+        prepared_query.rewritten,
+    )
     return SimpleSearchResponse(
         search=search,
         summary=summary,
@@ -62,4 +103,7 @@ def simple_search(
         summary_error=summary_error,
         search_query=prepared_query.query,
         query_rewritten=prepared_query.rewritten,
+        request_id=request_id,
+        summary_usage=summary_usage,
+        summary_error_code=summary_error_code,
     )
