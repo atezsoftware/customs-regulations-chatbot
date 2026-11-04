@@ -141,3 +141,28 @@ def catalog_search_rows(
         .execution_options(populate_existing=True)
     ).all()
     return {chunk.id: (chunk, file) for chunk, file in rows}
+
+
+def catalog_chunk_page_offset(
+    db_session: Session, file_id: UUID, chunk_id: str, *, limit: int
+) -> int | None:
+    """Locate a canonical chunk using the full file viewer's stable row order."""
+    if not 1 <= limit <= 100:
+        raise ValueError("Chunk page limit must be between 1 and 100")
+    ordered = (
+        select(
+            RegulatoryChunk.id,
+            (
+                func.row_number().over(
+                    order_by=(RegulatoryChunk.position, RegulatoryChunk.id)
+                )
+                - 1
+            ).label("row_offset"),
+        )
+        .where(RegulatoryChunk.user_file_id == file_id)
+        .subquery()
+    )
+    offset = db_session.scalar(
+        select(ordered.c.row_offset).where(ordered.c.id == chunk_id)
+    )
+    return None if offset is None else (int(offset) // limit) * limit
