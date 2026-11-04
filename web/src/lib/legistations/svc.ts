@@ -3,10 +3,12 @@ import type {
   LegislationFile,
   LegislationFolder,
   LegislationSearchPage,
+  LegislationSimpleSearchResponse,
   LegistationsQuery,
 } from "@/lib/legistations/interfaces";
 
 export const CATALOG_PAGE_SIZE = 25;
+export const CATALOG_SEARCH_SIZE = 20;
 export const FOLDER_PAGE_SIZE = 50;
 
 async function catalogResponse<T>(response: Response): Promise<T> {
@@ -89,10 +91,36 @@ export async function searchCatalogChunks(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         query: state.query,
-        mode: state.mode,
+        mode: "hybrid",
         offset: state.offset,
-        limit: CATALOG_PAGE_SIZE,
+        limit: CATALOG_SEARCH_SIZE,
       }),
+    })
+  );
+}
+
+export function catalogChunkLocationUrl(
+  fileId: string,
+  chunkId: string
+): string {
+  return `${catalogFileUrl(fileId)}/chunks/${encodeURIComponent(chunkId)}/location?limit=25`;
+}
+
+export async function fetchCatalogChunkLocation(
+  fileId: string,
+  chunkId: string
+): Promise<{ offset: number }> {
+  return catalogResponse(await fetch(catalogChunkLocationUrl(fileId, chunkId)));
+}
+
+export async function simpleSearchCatalog(
+  query: string
+): Promise<LegislationSimpleSearchResponse> {
+  return catalogResponse(
+    await fetch("/api/regulatory/catalog/simple-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
     })
   );
 }

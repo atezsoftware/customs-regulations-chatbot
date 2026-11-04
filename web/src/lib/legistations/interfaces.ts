@@ -1,7 +1,7 @@
 import type { RegulatoryChunk } from "@/lib/regulatory/interfaces";
 import type { RegulatoryIndexingProgress } from "@/lib/projects/types";
 
-export type LegistationsSearchMode = "files" | "bm25" | "semantic" | "hybrid";
+export type LegistationsSearchMode = "files" | "hybrid";
 
 export interface LegislationFile {
   id: string;
@@ -46,6 +46,9 @@ export interface LegislationSearchResult {
 export interface LegislationSearchPage extends CatalogPage<LegislationSearchResult> {
   has_more: boolean;
   total_is_exact: boolean;
+  candidate_limit: number;
+  result_limit: number;
+  per_file_limit: number;
 }
 
 export interface LegistationsQuery {
@@ -53,4 +56,16 @@ export interface LegistationsQuery {
   query: string;
   folder: string | null;
   offset: number;
+}
+
+export interface LegislationSimpleSearchResponse {
+  search: LegislationSearchPage;
+  summary: string | null;
+  summary_model: string;
+  summary_error: string | null;
+}
+
+export interface LegislationSearchFileGroup {
+  file: LegislationFile;
+  hits: LegislationSearchResult[];
 }

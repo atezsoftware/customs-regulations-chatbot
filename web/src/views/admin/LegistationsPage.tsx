@@ -5,22 +5,25 @@ import { Button, InputTypeIn, Text } from "@opal/components";
 import { SettingsLayouts } from "@opal/layouts";
 import { SvgArrowLeft, SvgBookOpen, SvgFolder, SvgSearch } from "@opal/icons";
 import { cn } from "@opal/utils";
-import { useCatalogFiles, useCatalogSearch } from "@/lib/legistations/hooks";
+import {
+  groupLegislationSearchResults,
+  useCatalogFiles,
+  useCatalogSearch,
+} from "@/lib/legistations/hooks";
 import type {
   LegislationFile,
   LegistationsQuery,
   LegistationsSearchMode,
+  LegislationSearchResult,
 } from "@/lib/legistations/interfaces";
 import { CATALOG_PAGE_SIZE } from "@/lib/legistations/svc";
 import FolderTree from "@/sections/legistations/FolderTree";
 import SelectedLegislationFile from "@/sections/legistations/SelectedLegislationFile";
-import LegislationSearchChunkCard from "@/sections/cards/LegislationSearchChunkCard";
+import LegislationSearchFileCard from "@/sections/cards/LegislationSearchFileCard";
 
 const SEARCH_MODES: { mode: LegistationsSearchMode; label: string }[] = [
   { mode: "files", label: "Dosya adı" },
-  { mode: "bm25", label: "Chunk · BM25" },
-  { mode: "semantic", label: "Chunk · Embedding" },
-  { mode: "hybrid", label: "Chunk · Hibrit" },
+  { mode: "hybrid", label: "İçerik araması" },
 ];
 
 interface CatalogPaginationProps {
@@ -76,13 +79,22 @@ export default function LegistationsPage() {
   const [selectedFile, setSelectedFile] = useState<LegislationFile | null>(
     null
   );
+  const [focusedHit, setFocusedHit] = useState<LegislationSearchResult | null>(
+    null
+  );
   const [foldersVisible, setFoldersVisible] = useState(true);
   const files = useCatalogFiles(state, selectedFile === null);
-  const search = useCatalogSearch(state, selectedFile === null);
+  const search = useCatalogSearch(state, true);
   const response = state.mode === "files" ? files : search;
+
+  function openSearchFile(hit: LegislationSearchResult) {
+    setFocusedHit(hit);
+    setSelectedFile(hit.file);
+  }
 
   function selectFolder(folder: string | null) {
     setSelectedFile(null);
+    setFocusedHit(null);
     setMode("files");
     setState((current) => ({
       mode: "files",
@@ -110,6 +122,7 @@ export default function LegistationsPage() {
             event.preventDefault();
             if (mode !== "files" && !draft.trim()) return;
             setSelectedFile(null);
+            setFocusedHit(null);
             setState({
               mode,
               query: draft.trim(),
@@ -166,8 +179,8 @@ export default function LegistationsPage() {
             </Button>
           </div>
           <Text font="secondary-body" color="text-03">
-            Arama LLM veya yeniden sıralama çağrısı yapmaz. Embedding ve hibrit
-            arama yalnızca sorgu vektörü üretir.
+            İçerik araması en fazla 100 adayı yeniden sıralar; dosya başına en
+            fazla 8 chunk ile 20 sonuç gösterir.
           </Text>
         </form>
       </SettingsLayouts.Header>
@@ -204,6 +217,12 @@ export default function LegistationsPage() {
                 <SelectedLegislationFile
                   key={selectedFile.id}
                   file={selectedFile}
+                  matchingChunks={
+                    search.data?.items
+                      .filter((hit) => hit.file.id === selectedFile.id)
+                      .map((hit) => hit.chunk) ?? []
+                  }
+                  focusedChunkId={focusedHit?.chunk.id}
                   onRenamed={(name) => {
                     setSelectedFile({ ...selectedFile, name });
                     void files.mutate();
@@ -267,7 +286,10 @@ export default function LegistationsPage() {
                         <Button
                           size="sm"
                           prominence="secondary"
-                          onClick={() => setSelectedFile(file)}
+                          onClick={() => {
+                            setFocusedHit(null);
+                            setSelectedFile(file);
+                          }}
                         >
                           Dosyayı aç
                         </Button>
@@ -299,23 +321,16 @@ export default function LegistationsPage() {
                         değildir.
                       </Text>
                     )}
-                    {search.data?.items.map((result) => (
-                      <LegislationSearchChunkCard
-                        key={result.chunk.id}
-                        result={result}
-                        onOpenFile={() => setSelectedFile(result.file)}
+                    {groupLegislationSearchResults(
+                      search.data?.items ?? []
+                    ).map((group) => (
+                      <LegislationSearchFileCard
+                        key={group.file.id}
+                        group={group}
+                        onOpenFile={openSearchFile}
                         onSaved={() => void search.mutate()}
                       />
                     ))}
-                    {search.data && (
-                      <CatalogPagination
-                        offset={state.offset}
-                        count={search.data.items.length}
-                        total={search.data.total}
-                        hasMore={search.data.has_more}
-                        onChange={changeOffset}
-                      />
-                    )}
                   </>
                 )}
               </>
