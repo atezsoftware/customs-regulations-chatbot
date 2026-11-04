@@ -40,11 +40,13 @@ const chunk: RegulatoryChunk = {
 };
 let fetchSpy: jest.SpyInstance;
 let summaryError: string | null;
+let queryMetadata: { search_query: string; query_rewritten: boolean } | null;
 function jsonResponse(body: unknown): Response {
   return { ok: true, json: async () => body } as Response;
 }
 beforeEach(() => {
   summaryError = null;
+  queryMetadata = null;
   fetchSpy = jest.spyOn(global, "fetch").mockImplementation(async (input) => {
     const url = new URL(String(input), "http://localhost:3000");
     // POST /api/regulatory/catalog/simple-search: source summary and ranked chunks.
@@ -66,6 +68,7 @@ beforeEach(() => {
           : "Bu dosyada gümrük vergisi hakkında bir bölüm buldum. [1]",
         summary_model: "nvidia/nemotron-3-ultra-550b-a55b",
         summary_error: summaryError,
+        ...queryMetadata,
       });
     // GET catalog file: refresh selected file metadata.
     if (url.pathname === `/api/regulatory/catalog/files/${file.id}`)
@@ -153,3 +156,44 @@ test("renders the empty search and draft without fetching until submission", asy
   expect(screen.getByRole("button", { name: "Ara" })).toBeDisabled();
   await waitFor(() => expect(fetchSpy).not.toHaveBeenCalled());
 });
+
+test("shows the rewritten search expression while keeping source cards and file highlights", async () => {
+  queryMetadata = {
+    search_query: "Gümrük Kanunu verginin hesaplanması",
+    query_rewritten: true,
+  };
+  const user = await runSearch();
+  expect(
+    await screen.findByText("Aranan ifade: Gümrük Kanunu verginin hesaplanması")
+  ).toBeVisible();
+  expect(screen.getByText("Kaynak [1] · Chunk #80")).toBeVisible();
+  expect(
+    screen.getByRole("textbox", { name: "Basit mevzuat araması" })
+  ).toHaveValue("gümrük vergisi");
+  await user.click(screen.getByRole("button", { name: "Dosyaya git" }));
+  expect(
+    await screen.findByLabelText("Arama eşleşmesi · Chunk #80")
+  ).toHaveTextContent(chunk.text);
+  await user.click(screen.getByRole("button", { name: "Sonuçlara dön" }));
+  expect(
+    await screen.findByText("Aranan ifade: Gümrük Kanunu verginin hesaplanması")
+  ).toBeVisible();
+  expect(
+    fetchSpy.mock.calls.filter(([input]) =>
+      String(input).endsWith("/simple-search")
+    )
+  ).toHaveLength(1);
+});
+
+test.each([
+  { search_query: "gümrük vergisi", query_rewritten: false },
+  { search_query: "gümrük vergisi", query_rewritten: true },
+])(
+  "hides search-expression metadata for direct or unchanged wording: %j",
+  async (metadata) => {
+    queryMetadata = metadata;
+    await runSearch();
+    expect(await screen.findByText(/Bu dosyada gümrük vergisi/)).toBeVisible();
+    expect(screen.queryByText(/^Aranan ifade:/)).not.toBeInTheDocument();
+  }
+);
