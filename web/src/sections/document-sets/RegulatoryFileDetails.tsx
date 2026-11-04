@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button, InputTextArea, Modal, Tag, Text } from "@opal/components";
 import { toast } from "@opal/layouts";
@@ -257,6 +257,9 @@ interface RegulatoryFileDetailsProps {
   onOpenRelatedFile?: (fileId: string) => void;
   readOnly?: boolean;
   indexed?: boolean;
+  initialChunkOffset?: number;
+  highlightedChunkIds?: readonly string[];
+  focusedChunkId?: string;
 }
 
 interface EditingChunkState {
@@ -271,14 +274,29 @@ export default function RegulatoryFileDetails({
   onOpenRelatedFile,
   readOnly = false,
   indexed = true,
+  initialChunkOffset = 0,
+  highlightedChunkIds = [],
+  focusedChunkId,
 }: RegulatoryFileDetailsProps) {
-  const [chunkPage, setChunkPage] = useState({ fileId: file.id, offset: 0 });
+  const [chunkPage, setChunkPage] = useState({
+    fileId: file.id,
+    offset: initialChunkOffset,
+  });
   const chunkOffset = chunkPage.fileId === file.id ? chunkPage.offset : 0;
   const { chunks, total, error, isLoading, refreshChunks } = useFileChunks(
     file.id,
     chunkOffset,
     CHUNKS_PER_PAGE
   );
+  const focusedChunkRef = useRef<HTMLDivElement>(null);
+  const highlighted = new Set(highlightedChunkIds);
+  useEffect(() => {
+    if (!isLoading)
+      focusedChunkRef.current?.scrollIntoView?.({
+        block: "center",
+        behavior: "smooth",
+      });
+  }, [isLoading, focusedChunkId, chunkOffset]);
   const [editingChunk, setEditingChunk] = useState<EditingChunkState | null>(
     null
   );
@@ -412,11 +430,19 @@ export default function RegulatoryFileDetails({
         chunks.map((chunk) => (
           <div
             key={chunk.id}
+            ref={chunk.id === focusedChunkId ? focusedChunkRef : undefined}
+            aria-label={
+              highlighted.has(chunk.id)
+                ? `Arama eşleşmesi · Chunk #${chunk.position}`
+                : undefined
+            }
             className={cn(
               "rounded-lg border p-3 flex flex-col gap-2",
               chunk.status === "superseded"
                 ? "border-border-01 bg-background-tint-01"
-                : "border-border-02"
+                : "border-border-02",
+              highlighted.has(chunk.id) &&
+                "border-theme-yellow-05 bg-theme-yellow-01"
             )}
           >
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -424,6 +450,7 @@ export default function RegulatoryFileDetails({
                 {`#${chunk.position} · ${chunk.chunk_type ?? "text"} · ${chunk.heading_path.join(" > ")}`}
               </Text>
               <div className="flex items-center gap-1 shrink-0">
+                {highlighted.has(chunk.id) && <Tag title="Arama eşleşmesi" />}
                 {chunk.source === "amendment" && <Tag title="Amendment" />}
                 {chunk.status === "superseded" && <Tag title="Superseded" />}
                 <Button

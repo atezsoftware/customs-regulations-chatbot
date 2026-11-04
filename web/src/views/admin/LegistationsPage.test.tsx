@@ -53,6 +53,8 @@ let aggregate: boolean;
 let patchFailure: number | null;
 let fileStatus: string;
 let indexQueued: boolean;
+let searchChunks: RegulatoryChunk[];
+let lateChunkPage: boolean;
 
 function jsonResponse(body: unknown): Response {
   return { ok: true, json: async () => body } as Response;
@@ -65,6 +67,8 @@ beforeEach(() => {
   patchFailure = null;
   fileStatus = "COMPLETED";
   indexQueued = false;
+  searchChunks = [chunk];
+  lateChunkPage = false;
   fetchSpy = jest
     .spyOn(global, "fetch")
     .mockImplementation(async (input, init) => {
@@ -117,20 +121,21 @@ beforeEach(() => {
             : null,
         });
       }
-      // POST /api/regulatory/catalog/search: raw retrieval, no chat route.
+      // GET catalog chunk locator: exact canonical page offset, independent of position.
+      if (url.pathname.endsWith("/location"))
+        return jsonResponse({ offset: lateChunkPage ? 25 : 0 });
+      // POST /api/regulatory/catalog/search: reranked hybrid retrieval, no chat route.
       if (url.pathname === "/api/regulatory/catalog/search") {
         latestSearchBody = JSON.parse(String(init?.body));
         return jsonResponse({
-          items: [
-            {
-              file: { ...file, pending_review: pendingReview },
-              chunk: aggregate
-                ? { ...chunk, chunk_type: "hierarchical_aggregate" }
-                : chunk,
-              score: 0.8,
-            },
-          ],
-          total: 1,
+          items: searchChunks.map((item) => ({
+            file: { ...file, pending_review: pendingReview },
+            chunk: aggregate
+              ? { ...item, chunk_type: "hierarchical_aggregate" }
+              : item,
+            score: 0.8,
+          })),
+          total: searchChunks.length,
           offset: 0,
           limit: 25,
           has_more: false,
@@ -139,6 +144,13 @@ beforeEach(() => {
       }
       // GET /api/regulatory/files/:id/chunks/page: all chunks of the selected file.
       if (url.pathname === `/api/regulatory/files/${file.id}/chunks/page`) {
+        if (lateChunkPage && url.searchParams.get("offset") === "25")
+          return jsonResponse({
+            items: searchChunks,
+            total: 30,
+            offset: 25,
+            limit: 25,
+          });
         return jsonResponse({
           items: [
             aggregate
@@ -196,26 +208,32 @@ test("paginates files and selects a global folder independent of the current pag
   ).toHaveAttribute("aria-expanded", "true");
 });
 
-test("opens all file chunks from an embedding result and returns to the same search", async () => {
+test("opens all file chunks from a hybrid result and returns to the same search", async () => {
   const user = setupUser();
   render(<LegistationsPage />);
-  await user.click(screen.getByRole("button", { name: "Chunk · Embedding" }));
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
   await user.type(
     screen.getByRole("textbox", { name: "Mevzuat araması" }),
     "gümrük vergisi"
   );
   await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
   await user.click(await screen.findByRole("button", { name: "Dosyaya git" }));
   expect(await screen.findByText("Dosyanın diğer chunkı.")).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Sonuçlara dön" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
   expect(
     await screen.findByRole("button", { name: "Dosyaya git" })
   ).toBeVisible();
   expect(latestSearchBody).toEqual({
     query: "gümrük vergisi",
-    mode: "semantic",
+    mode: "hybrid",
     offset: 0,
-    limit: 25,
+    limit: 20,
   });
   expect(screen.getByRole("textbox", { name: "Mevzuat araması" })).toHaveValue(
     "gümrük vergisi"
@@ -228,12 +246,15 @@ test("opens all file chunks from an embedding result and returns to the same sea
 test("edits a search chunk with its revision and reindexes only that chunk", async () => {
   const user = setupUser();
   render(<LegistationsPage />);
-  await user.click(screen.getByRole("button", { name: "Chunk · BM25" }));
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
   await user.type(
     screen.getByRole("textbox", { name: "Mevzuat araması" }),
     "gümrük"
   );
   await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
   await user.click(await screen.findByRole("button", { name: "Düzenle" }));
   const dialog = await screen.findByRole("dialog");
   const textInput = within(dialog).getAllByRole("textbox")[0]!;
@@ -309,12 +330,15 @@ test("preserves the editor draft and search view after a concurrent edit conflic
   patchFailure = 409;
   const user = setupUser();
   render(<LegistationsPage />);
-  await user.click(screen.getByRole("button", { name: "Chunk · BM25" }));
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
   await user.type(
     screen.getByRole("textbox", { name: "Mevzuat araması" }),
     "gümrük"
   );
   await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
   await user.click(await screen.findByRole("button", { name: "Düzenle" }));
   const dialog = await screen.findByRole("dialog");
   const textInput = within(dialog).getByRole("textbox", {
@@ -340,12 +364,15 @@ test("shows derived chunks in search and file views while directing edits to the
   aggregate = true;
   const user = setupUser();
   render(<LegistationsPage />);
-  await user.click(screen.getByRole("button", { name: "Chunk · BM25" }));
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
   await user.type(
     screen.getByRole("textbox", { name: "Mevzuat araması" }),
     "gümrük"
   );
   await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
   expect(await screen.findByRole("button", { name: "Düzenle" })).toBeDisabled();
   expect(screen.getByText(/Bu chunk alt chunklardan türetilir/)).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Dosyaya git" }));
@@ -399,4 +426,69 @@ test("saves unindexed chunk edits before explicit initial indexing and refreshes
   expect(
     await screen.findByRole("button", { name: "Edit chunk 1" })
   ).toBeEnabled();
+});
+
+test("groups search by file and previews only three chunks before opening all highlighted matches", async () => {
+  searchChunks = Array.from({ length: 5 }, (_, index) => ({
+    ...chunk,
+    id: `match-${index}`,
+    position: index + 1,
+    text: `Eşleşme ${index + 1}`,
+  }));
+  const user = setupUser();
+  render(<LegistationsPage />);
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
+  await user.type(
+    screen.getByRole("textbox", { name: "Mevzuat araması" }),
+    "gümrük"
+  );
+  await user.click(screen.getByRole("button", { name: "Ara" }));
+  const group = await screen.findByRole("button", {
+    name: `${file.name} · 5 chunk`,
+  });
+  expect(screen.queryByText("Eşleşme 1")).not.toBeInTheDocument();
+  await user.click(group);
+  expect(await screen.findByText("Eşleşme 3")).toBeVisible();
+  expect(screen.queryByText("Eşleşme 4")).not.toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "Dosyaya git" })).toHaveLength(
+    3
+  );
+  await user.click(screen.getByRole("button", { name: "Daha fazla göster" }));
+  const matches = await screen.findByRole("region", {
+    name: "Arama eşleşmeleri",
+  });
+  expect(within(matches).getAllByRole("button")).toHaveLength(5);
+});
+
+test("locates a match beyond the first page and highlights its canonical chunk", async () => {
+  lateChunkPage = true;
+  searchChunks = [
+    {
+      ...chunk,
+      id: "historical-match",
+      position: 800,
+      text: "Sonraki sayfadaki eşleşme.",
+    },
+  ];
+  const user = setupUser();
+  render(<LegistationsPage />);
+  await user.click(screen.getByRole("button", { name: "İçerik araması" }));
+  await user.type(
+    screen.getByRole("textbox", { name: "Mevzuat araması" }),
+    "gümrük"
+  );
+  await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", { name: `${file.name} · 1 chunk` })
+  );
+  await user.click(screen.getByRole("button", { name: "Dosyaya git" }));
+  expect(
+    await screen.findByLabelText("Arama eşleşmesi · Chunk #800")
+  ).toHaveTextContent("Sonraki sayfadaki eşleşme.");
+  expect(fetchSpy).toHaveBeenCalledWith(
+    `/api/regulatory/catalog/files/${file.id}/chunks/historical-match/location?limit=25`
+  );
+  expect(fetchSpy).toHaveBeenCalledWith(
+    `/api/regulatory/files/${file.id}/chunks/page?offset=25&limit=25`
+  );
 });

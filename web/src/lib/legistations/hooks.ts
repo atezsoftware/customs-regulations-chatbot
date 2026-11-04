@@ -4,6 +4,8 @@ import useSWR from "swr";
 import type {
   LegislationFile,
   LegistationsQuery,
+  LegislationSearchResult,
+  LegislationSearchFileGroup,
 } from "@/lib/legistations/interfaces";
 import {
   catalogFilesUrl,
@@ -46,7 +48,12 @@ export function useCatalogSearch(state: LegistationsQuery, enabled: boolean) {
     enabled && state.mode !== "files" && state.query.trim()
       ? ["legistations-search", state.mode, state.query, state.offset]
       : null,
-    () => searchCatalogChunks(state)
+    () => searchCatalogChunks(state),
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      shouldRetryOnError: false,
+    }
   );
 }
 
@@ -58,4 +65,16 @@ export function useCatalogFolders(
   return useSWR(catalogFoldersUrl(parent, query, offset), () =>
     fetchCatalogFolders(parent, query, offset)
   );
+}
+
+export function groupLegislationSearchResults(
+  hits: LegislationSearchResult[]
+): LegislationSearchFileGroup[] {
+  const groups = new Map<string, LegislationSearchFileGroup>();
+  for (const hit of hits) {
+    const group = groups.get(hit.file.id);
+    if (group) group.hits.push(hit);
+    else groups.set(hit.file.id, { file: hit.file, hits: [hit] });
+  }
+  return Array.from(groups.values());
 }

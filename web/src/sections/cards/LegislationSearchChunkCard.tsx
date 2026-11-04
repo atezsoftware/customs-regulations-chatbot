@@ -10,13 +10,17 @@ import { ChunkEditModal } from "@/sections/document-sets/RegulatoryFileDetails";
 interface LegislationSearchChunkCardProps {
   result: LegislationSearchResult;
   onOpenFile: () => void;
-  onSaved: () => void;
+  onSaved?: () => void;
+  allowEditing?: boolean;
+  sourceNumber?: number;
 }
 
 export default function LegislationSearchChunkCard({
   result,
   onOpenFile,
-  onSaved,
+  onSaved = () => {},
+  allowEditing = true,
+  sourceNumber,
 }: LegislationSearchChunkCardProps) {
   const [details, setDetails] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -26,6 +30,9 @@ export default function LegislationSearchChunkCard({
     <article className="flex flex-col gap-3 rounded-lg border border-border-02 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0 flex-1 flex flex-col gap-1 break-words [overflow-wrap:anywhere]">
+          <Tag
+            title={`${sourceNumber ? `Kaynak [${sourceNumber}] · ` : ""}Chunk #${chunk.position}`}
+          />
           <Text font="main-ui-action" as="h3">
             {file.name}
           </Text>
@@ -45,16 +52,18 @@ export default function LegislationSearchChunkCard({
           >
             Dosyaya git
           </Button>
-          <Button
-            prominence="tertiary"
-            size="sm"
-            icon={SvgEdit}
-            disabled={file.pending_review || editRestriction !== null}
-            tooltip={editRestriction ?? undefined}
-            onClick={() => setEditing(true)}
-          >
-            Düzenle
-          </Button>
+          {allowEditing && (
+            <Button
+              prominence="tertiary"
+              size="sm"
+              icon={SvgEdit}
+              disabled={file.pending_review || editRestriction !== null}
+              tooltip={editRestriction ?? undefined}
+              onClick={() => setEditing(true)}
+            >
+              Düzenle
+            </Button>
+          )}
         </div>
       </div>
       {editRestriction && (
