@@ -27,6 +27,10 @@ PREPARED = "İthalat işlemlerinde verilen teminatın iadesi koşulları"
         "4458 sayılı kanunu getir",
         'Bana "gümrük kıymeti" ile ilgili bölüm bul',
         "Şöyle bir şey vardı 4458 sayılı Kanun kapsamında bir istisnaydı",
+        "Gümrük Kanunu usulsüzlük maddesi AYM kararı",
+        "ya bu 4458 sayılı kanundaki bi madde vardı onu bul",
+        "bi 2020/6 sayılı genelge vardı onu bul",
+        'ya bu "usulsüzlük cezası" ile ilgili bi karar vardı onu bul',
     ],
 )
 def test_explicit_lookup_and_short_keywords_make_no_model_or_database_call(
@@ -75,6 +79,51 @@ def test_description_uses_one_small_traced_call_with_complete_original_request()
         "provider_compatibility_attempts": 1,
     }
     assert span.call_args.kwargs["flow"] is query.LLMFlow.CATALOG_QUERY_PREPARATION
+
+
+@pytest.mark.parametrize(
+    ("description", "prepared"),
+    [
+        (
+            "ya bu gümrük kanunundaki usulsüzlük maddesi ile ilgili bi aym kararı vardı onu bul",
+            "Gümrük Kanunu usulsüzlük maddesi AYM kararı",
+        ),
+        (
+            "bir teminat iadesi düzenlemesi vardı onu bul",
+            "Teminat iadesi düzenlemesi",
+        ),
+        (
+            "bi teminat iadesi düzenlemesi vardı onu bul",
+            "Teminat iadesi düzenlemesi",
+        ),
+        (
+            "usulsüzlük maddesi hakkında AYM kararı vardı",
+            "Usulsüzlük maddesi AYM kararı",
+        ),
+        (
+            "ya bu teminatın iadesiyle ilgiliydi onu bul",
+            "Teminat iadesi düzenlemesi",
+        ),
+    ],
+)
+def test_colloquial_descriptions_use_one_preparation_call(
+    description: str, prepared: str
+) -> None:
+    llm = MagicMock()
+    llm.config.max_input_tokens = 100_000
+    llm.invoke.return_value = _response(prepared)
+    with (
+        patch.object(query, "get_catalog_query_llm", return_value=llm),
+        patch.object(query, "llm_generation_span"),
+        patch.object(query, "record_llm_response"),
+    ):
+        result = query.prepare_catalog_search_query(description, MagicMock())
+    assert result.query == prepared
+    assert result.rewritten is True
+    llm.invoke.assert_called_once()
+    assert json.loads(str(llm.invoke.call_args.args[0][1].content)) == {
+        "user_request": description
+    }
 
 
 @pytest.mark.parametrize(
