@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from onyx.db.regulatory_chunks import RegulatoryFileValidityUpdateResult
     from onyx.db.regulatory_writer_publication import OwnedWriterInputs
     from onyx.document_index.interfaces_new import MetadataUpdateRequest
+    from onyx.regulatory.chunk_corrections import ChunkCorrectionBatch
 
 
 class _EmbeddingConcurrencyOptions(TypedDict, total=False):
@@ -487,6 +488,83 @@ def correct_owned_chunk(
             raise ValueError("correction publication ownership heartbeat lost")
     execute_writer_publication(owner, client, manifest)
 
+    return owner
+
+
+def correct_owned_chunks(
+    owner: FileOwnership,
+    client: Elasticsearch,
+    corrections: "ChunkCorrectionBatch",
+) -> FileOwnership:
+    """Publish one fully preflighted same-file correction as one fenced writer."""
+    from onyx.db.regulatory_chunk_edits import (
+        ChunkEditConflict,
+        require_owned_chunk_revisions,
+    )
+    from onyx.db.regulatory_chunks import is_hierarchical_aggregate_chunk, update_chunk
+    from onyx.db.regulatory_writer_publication import (
+        apply_owned_deferred_edit,
+        load_owned_writer_inputs,
+    )
+    from onyx.regulatory.amendments.annexes.publication_representations import _snapshot
+    from onyx.regulatory.amendments.annexes.staging import canonical_snapshot_rows
+    from onyx.regulatory.writer_projection import prepare_owned_correction
+
+    expected = {
+        update.chunk_id: update.expected_updated_at for update in corrections.updates
+    }
+    replacement_texts = {update.chunk_id: update.text for update in corrections.updates}
+    require_owned_chunk_revisions(owner, expected, replacement_texts=replacement_texts)
+    previous_owner = owner
+    owner = recover_owned_writer_before_next(owner)
+    if owner != previous_owner:
+        require_owned_chunk_revisions(
+            owner, expected, replacement_texts=replacement_texts
+        )
+    authority = PublicationStore(owner.scope)
+    with publication_heartbeat(owner) as lost:
+        inputs = load_owned_writer_inputs(owner)
+        rows = canonical_snapshot_rows(inputs.canonical)
+        targets = {row.id: row for row in rows if row.id in expected}
+        if set(targets) != set(expected) or any(
+            is_hierarchical_aggregate_chunk(row) for row in targets.values()
+        ):
+            raise ChunkEditConflict(
+                "Correction targets are outside the editable canonical file"
+            )
+        for update in corrections.updates:
+            update_chunk(
+                targets[update.chunk_id],
+                text=update.text,
+                heading_path=update.heading_path,
+                chunk_metadata=update.chunk_metadata,
+            )
+        after = [_snapshot(row) for row in rows]
+        if apply_owned_deferred_edit(
+            owner,
+            canonical_before_sha256=publication_digest(
+                [row.model_dump(mode="json") for row in inputs.canonical]
+            ),
+            canonical_after=after,
+        ):
+            return owner
+
+        def check_owner() -> None:
+            if lost.is_set():
+                raise PublicationOwnershipLost("correction publication heartbeat lost")
+            authority.reservations(owner)
+
+        check_owner()
+        manifest = prepare_owned_correction(
+            owner,
+            client,
+            inputs,
+            after,
+            changed_id=None,
+            before_embedding_request=check_owner,
+        )
+        check_owner()
+    execute_writer_publication(owner, client, manifest)
     return owner
 
 

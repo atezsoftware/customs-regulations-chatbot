@@ -43,7 +43,7 @@ from onyx.db.document_intake import pending_intake_file_ids
 from onyx.db.document_intake_preview import intake_prepared_preview
 from onyx.db.document_set import get_document_set_by_id_for_user
 from onyx.db.engine.sql_engine import get_session
-from onyx.db.enums import AmendmentBatchStatus, Permission
+from onyx.db.enums import AmendmentBatchStatus, Permission, UserFileStatus
 from onyx.db.file_record import FileRecordNotFoundError
 from onyx.db.models import DocumentSet, User, UserFile
 from onyx.db.regulatory_amendments import (
@@ -72,6 +72,7 @@ from onyx.db.regulatory_chunks import (
     get_chunk_snapshot_by_id,
     get_chunks_for_file,
     get_chunks_for_file_page_snapshot,
+    has_regulatory_chunks_for_file,
     is_hierarchical_aggregate_chunk,
 )
 from onyx.error_handling.error_codes import OnyxErrorCode
@@ -90,7 +91,13 @@ from onyx.regulatory.amendments.source_extraction import (
 from onyx.regulatory.amendments.source_extraction import (
     extract_amendment_pdf as extract_amendment_pdf_text,
 )
+from onyx.regulatory.chunk_corrections import ChunkCorrectionBatch
 from onyx.regulatory.pdf import render_chunk_pdf, render_document_pdf
+from onyx.regulatory.source_image_evidence import (
+    MAX_SOURCE_IMAGE_BYTES,
+    SourceImageUploadReceipt,
+    validate_source_image,
+)
 from onyx.server.features.projects.models import UserFileSnapshot
 from onyx.server.features.regulatory.annex_api import router as annex_router
 from onyx.server.features.regulatory.document_intake_api import (
@@ -148,6 +155,51 @@ def _get_owned_user_file(
     if user_file.user_id != user.id and user.role != UserRole.ADMIN:
         raise OnyxError(OnyxErrorCode.UNAUTHORIZED, "Not your file")
     return user_file
+
+
+@router.post("/files/{user_file_id}/source-images", tags=PUBLIC_API_TAGS)
+def upload_source_image(
+    user_file_id: UUID,
+    file: UploadFile = File(...),
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> SourceImageUploadReceipt:
+    """Store an original source image; ordinary chunk edits attach it separately."""
+    target = _get_owned_user_file(db_session, user_file_id, user)
+    if target.status != UserFileStatus.COMPLETED:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT, "Source images require a completed document"
+        )
+    _require_ordinary_edit_channel(db_session, user_file_id)
+    if not has_regulatory_chunks_for_file(db_session, user_file_id):
+        raise OnyxError(OnyxErrorCode.CONFLICT, "This file has no regulatory chunks")
+    content = file.file.read(MAX_SOURCE_IMAGE_BYTES + 1)
+    if len(content) > MAX_SOURCE_IMAGE_BYTES:
+        raise OnyxError(
+            OnyxErrorCode.PAYLOAD_TOO_LARGE, "Source images may not exceed 8 MiB"
+        )
+    try:
+        descriptor = validate_source_image(content, file.content_type)
+    except ValueError as error:
+        raise OnyxError(OnyxErrorCode.INVALID_INPUT, str(error)) from error
+    filename = (file.filename or "source-image").replace("\\", "/").rsplit("/", 1)[-1]
+    raw_file_id = get_default_file_store().save_file(
+        io.BytesIO(content),
+        display_name=filename[:255],
+        file_origin=FileOrigin.OTHER,
+        file_type=descriptor.mime_type,
+        file_metadata={
+            "purpose": "regulatory_source_image",
+            "regulatory_user_file_id": str(user_file_id),
+            "uploaded_by": str(user.id),
+            **descriptor.model_dump(),
+        },
+    )
+    return SourceImageUploadReceipt(
+        file_id=raw_file_id,
+        user_file_id=user_file_id,
+        **descriptor.model_dump(),
+    )
 
 
 @router.get("/files/{user_file_id}/chunks", tags=PUBLIC_API_TAGS)
@@ -461,6 +513,58 @@ def patch_chunk(
     if current is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Chunk not found")
     return RegulatoryChunkSnapshot.from_model(current)
+
+
+@router.patch("/files/{user_file_id}/chunks", tags=PUBLIC_API_TAGS)
+def patch_file_chunks(
+    user_file_id: UUID,
+    corrections: ChunkCorrectionBatch,
+    user: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[RegulatoryChunkSnapshot]:
+    from uuid import uuid4
+
+    from onyx.db.regulatory_chunk_edits import ChunkEditConflict
+    from onyx.db.regulatory_publication import PublicationStore
+    from onyx.document_index.elasticsearch.client import ElasticsearchClient
+    from onyx.document_index.publication_models import PublicationScope
+    from onyx.regulatory.amendments.annexes.publication_execution import LEASE_TTL
+    from onyx.regulatory.writer_publication import correct_owned_chunks
+
+    target = _get_owned_user_file(db_session, user_file_id, user)
+    if target.status != UserFileStatus.COMPLETED:
+        raise OnyxError(
+            OnyxErrorCode.CONFLICT, "Batch corrections require a completed document"
+        )
+    _require_ordinary_edit_channel(db_session, user_file_id)
+    db_session.rollback()
+    authority = PublicationStore(
+        PublicationScope(
+            tenant_id=get_current_tenant_id(),
+            environment=annex_config.REGULATORY_ANNEX_ENVIRONMENT,
+            database_identity=annex_config.ANNEX_DATABASE_IDENTITY,
+        )
+    )
+    owner = authority.acquire(user_file_id, owner_id=uuid4(), ttl=LEASE_TTL)
+    try:
+        with ElasticsearchClient() as transport:
+            owner = correct_owned_chunks(
+                owner, transport.publication_client(), corrections
+            )
+    except ChunkEditConflict as error:
+        raise OnyxError(OnyxErrorCode.CONFLICT, str(error)) from error
+    finally:
+        try:
+            authority.release(owner)
+        except ValueError:
+            pass
+    current = []
+    for update in corrections.updates:
+        chunk = get_chunk_snapshot_by_id(db_session, update.chunk_id)
+        if chunk is None or chunk.user_file_id != user_file_id:
+            raise OnyxError(OnyxErrorCode.NOT_FOUND, "Corrected chunk not found")
+        current.append(RegulatoryChunkSnapshot.from_model(chunk))
+    return current
 
 
 @router.patch("/files/{user_file_id}/validity", tags=PUBLIC_API_TAGS)
