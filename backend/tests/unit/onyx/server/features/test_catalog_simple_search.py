@@ -91,6 +91,30 @@ def test_empty_search_skips_model(search_page: CatalogSearchPage) -> None:
     get_llm.assert_not_called()
 
 
+def test_summary_contract_keeps_source_scope_when_compressing_content(
+    search_page: CatalogSearchPage,
+) -> None:
+    messages = summary.catalog_summary_messages(
+        "Geçici ithal edilen taşıtları bul", search_page
+    )
+    instructions = str(messages[0].content)
+    assert messages[0].role == "system"
+    assert (
+        "hukuki üstünlüğü, önceliği veya güncelliği hakkında iddia kurma"
+        in instructions
+    )
+    assert "sona erme sebebini metinde yoksa ekleme" in instructions
+    assert (
+        "yararlanma şartlarını" in instructions
+        and "önemli istisnaları birlikte koru" in instructions
+    )
+    assert "'Bu kapsamda', 'bu taşıtlar'" in instructions
+    assert (
+        "koşul veya istisna kaybolacaksa sayısal bir genel kural yazma" in instructions
+    )
+    assert "tek kısa paragraf ve 2–4 cümle" in instructions
+
+
 def test_model_resolution_never_falls_back_to_another_nemotron() -> None:
     provider = MagicMock(id=1)
     provider.model_configurations = [
