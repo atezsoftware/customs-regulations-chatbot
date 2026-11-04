@@ -31,6 +31,7 @@ from onyx.document_index.publication_models import (
     publication_digest,
 )
 from onyx.regulatory.amendments.annexes import config
+from tests.external_dependency_unit.conftest import create_test_user
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
 )
@@ -98,7 +99,7 @@ def test_initial_intake_embedding_policy_is_fresh_scoped_and_read_only(
     elif change == "foreign-token":
         request.attempt_id = uuid4()
     elif change == "owner":
-        file.user_id = uuid4()
+        file.user_id = create_test_user(session, "different-embedding-owner").id
     elif change == "membership":
         session.execute(
             delete(DocumentSet__UserFile).where(
@@ -136,9 +137,6 @@ def test_initial_intake_embedding_policy_is_fresh_scoped_and_read_only(
         publication.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     elif change == "gate":
         publication.gate_closed = True
-    if change == "owner":
-        # Keep the foreign identity relationally valid without assigning a nonexistent user.
-        file.user_id = None
     session.flush()
     before = (
         publication.epoch,
