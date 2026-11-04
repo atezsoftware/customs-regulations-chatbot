@@ -12,6 +12,10 @@ from sqlalchemy.orm import Session
 from onyx.db import regulatory_labeling_chapter_caption as captions
 from onyx.db import regulatory_labeling_review_authority as authority
 from onyx.db.models import RegulatoryChunk, UserFile
+from onyx.regulatory.document_intake.embedding import (
+    FrozenEmbeddingGroup,
+    encode_intake_embedding_groups,
+)
 from onyx.regulatory.labeling import chapter_caption as chapter
 from onyx.regulatory.labeling import chapter_caption_cache as cache
 from tests.external_dependency_unit.regulatory.test_intake_chapter_caption_flow import (
@@ -51,6 +55,55 @@ def test_review_nested_contexts_read_parse_once_and_next_operation_reopens(
             assert read.call_count == parse.call_count == operation
             assert validate.call_count >= 3 * operation
             assert owned.call_count == validate.call_count
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_encoder_guard_nested_reviews_reuse_native_proof_but_recheck_postgres(
+    labeling_data: LabelingData,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: bool,
+) -> None:
+    with Session(labeling_data.database.engine) as session:
+        fixture = seed(session, labeling_data, monkeypatch)
+        apply_caption(session, fixture)
+        expected = authority.labeling_review_authority(session, fixture.run.id)
+        read = Mock(wraps=fixture.store.read_file)
+        parse = Mock(wraps=cache.build_chapter_caption_source_proof)
+        monkeypatch.setattr(fixture.store, "read_file", read)
+        monkeypatch.setattr(cache, "build_chapter_caption_source_proof", parse)
+        checks = 0
+
+        def guard() -> None:
+            nonlocal checks
+            checks += 1
+            if drift and checks == 4:
+                row = session.get_one(RegulatoryChunk, fixture.data.derived_id)
+                row.text += " changed after native cache warmed"
+                session.flush()
+            assert (
+                authority.labeling_review_authority(session, fixture.run.id) == expected
+            )
+
+        def run() -> None:
+            encode_intake_embedding_groups(
+                [FrozenEmbeddingGroup(str(index), (str(index),)) for index in range(6)],
+                encode=lambda texts: [[0.1, 0.2, 0.3] for _ in texts],
+                expected_dimension=3,
+                check_owner=guard,
+            )
+
+        with cache.native_caption_proof_operation():
+            if drift:
+                with pytest.raises(ValueError):
+                    run()
+                assert checks == 4
+            else:
+                run()
+                assert checks >= 18
+        assert read.call_count == parse.call_count == 1
+        if not drift:
+            authority.labeling_review_authority(session, fixture.run.id)
+            assert read.call_count == parse.call_count == 2
 
 
 @pytest.mark.parametrize(
