@@ -92,6 +92,12 @@ export const ADMIN_ROUTES = {
     title: "Legistations",
     sidebarLabel: "Legistations",
   },
+  SIMPLE_SEARCH: {
+    path: "/admin/simple-search",
+    icon: SvgSearchMenu,
+    title: "Basit arama",
+    sidebarLabel: "Basit arama",
+  },
   BENCHMARK: {
     path: "/admin/benchmark",
     icon: SvgBarChart,
