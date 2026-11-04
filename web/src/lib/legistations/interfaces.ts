@@ -63,6 +63,8 @@ export interface LegislationSimpleSearchResponse {
   summary: string | null;
   summary_model: string;
   summary_error: string | null;
+  search_query?: string;
+  query_rewritten?: boolean;
 }
 
 export interface LegislationSearchFileGroup {

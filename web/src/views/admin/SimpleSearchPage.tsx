@@ -28,6 +28,9 @@ export default function SimpleSearchPage() {
     revalidateOnReconnect: false,
     shouldRetryOnError: false,
   });
+  const rewrittenQuery = search.data?.query_rewritten
+    ? search.data.search_query?.trim()
+    : null;
   return (
     <SettingsLayouts.Root width="lg">
       <SettingsLayouts.Header
@@ -108,6 +111,13 @@ export default function SimpleSearchPage() {
           </div>
         ) : search.data ? (
           <div className="flex flex-col gap-5">
+            {rewrittenQuery && rewrittenQuery !== request?.query && (
+              <Text
+                font="secondary-body"
+                color="text-03"
+                as="p"
+              >{`Aranan ifade: ${rewrittenQuery}`}</Text>
+            )}
             <section
               aria-label="Bulunanların özeti"
               className="flex flex-col gap-3 rounded-lg border border-border-02 bg-background-tint-01 p-4"

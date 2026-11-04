@@ -22,3 +22,5 @@ class SimpleSearchResponse(BaseModel):
     summary: str | None
     summary_model: str
     summary_error: str | None = None
+    search_query: str
+    query_rewritten: bool = False

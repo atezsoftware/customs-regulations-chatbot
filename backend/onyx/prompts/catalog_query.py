@@ -4,6 +4,8 @@ CATALOG_QUERY_SYSTEM_PROMPT = """Kullanıcının belirsiz veya olay anlatımı b
 arama isteğini, mevzuat chunklarında aranabilecek TEK kısa Türkçe sorguya dönüştür.
 Hukuki cevap, açıklama veya öneri verme. Ana arama ihtiyacını açık kelimelerle ifade et;
 kullanıcının anlattığı konu ve anlamı koru, başka konulara genişletme.
+Gündelik anlatımı aynı anlamı taşıyan yerleşik arama terimleri ve eş anlamlılarla ifade
+edebilirsin; bunu yaparken yeni bir hukuki mesele veya sonuç ekleme.
 
 Açıkça verilen numaraları, tarihleri, ülke/kurum adlarını, kısaltmaları, kapsamı, olumlu ve
 olumsuz koşulları ve ayırt edici terimleri koru. Kullanıcının belirtmediği bir kanun, madde,

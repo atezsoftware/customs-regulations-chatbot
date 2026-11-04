@@ -8,6 +8,7 @@ from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
+from onyx.regulatory.catalog_query import prepare_catalog_search_query
 from onyx.regulatory.catalog_summary import (
     CATALOG_SUMMARY_MODEL,
     CatalogSummaryUnavailable,
@@ -36,9 +37,10 @@ def simple_search(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> SimpleSearchResponse:
+    prepared_query = prepare_catalog_search_query(request.query, db_session)
     observation = observe_publication_read()
     search = search_catalog_chunks(
-        CatalogSearchRequest(query=request.query), db_session
+        CatalogSearchRequest(query=prepared_query.query), db_session
     )
     summary: str | None = None
     summary_error: str | None = None
@@ -58,4 +60,6 @@ def simple_search(
         summary=summary,
         summary_model=CATALOG_SUMMARY_MODEL,
         summary_error=summary_error,
+        search_query=prepared_query.query,
+        query_rewritten=prepared_query.rewritten,
     )

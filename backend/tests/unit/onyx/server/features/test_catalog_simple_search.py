@@ -11,6 +11,7 @@ from fastapi.routing import APIRoute
 from onyx.db.enums import Permission
 from onyx.llm.model_response import Choice, Message, ModelResponse
 from onyx.regulatory import catalog_summary as summary
+from onyx.regulatory.catalog_query_models import CatalogQueryPreparation
 from onyx.server.features.regulatory import simple_search_api as api
 from onyx.server.features.regulatory.catalog_models import (
     CatalogFile,
@@ -239,6 +240,36 @@ def test_summary_failure_preserves_results_and_rechecks_publication(
     require.assert_called_once_with(
         observe.return_value, tuple(hit.file.id for hit in search_page.items)
     )
+
+
+def test_descriptive_query_searches_once_and_summary_keeps_the_original_request(
+    search_page: CatalogSearchPage,
+) -> None:
+    original = (
+        "Adını hatırlamıyorum, transit taşımalardaki teminatla ilgili bir belge vardı"
+    )
+    prepared = CatalogQueryPreparation(query="transit taşıma teminat", rewritten=True)
+    session = MagicMock()
+    with (
+        patch.object(
+            api, "prepare_catalog_search_query", return_value=prepared
+        ) as prepare,
+        patch.object(api, "observe_publication_read"),
+        patch.object(api, "search_catalog_chunks", return_value=search_page) as search,
+        patch.object(
+            api, "generate_catalog_summary", return_value="Kaynak özeti [1]."
+        ) as generate,
+        patch.object(api, "require_publication_files"),
+    ):
+        response = api.simple_search(
+            SimpleSearchRequest(query=original), MagicMock(), session
+        )
+    prepare.assert_called_once_with(original, session)
+    search.assert_called_once()
+    assert search.call_args.args[0].query == prepared.query
+    generate.assert_called_once_with(original, search_page, session)
+    assert response.search_query == prepared.query
+    assert response.query_rewritten is True
 
 
 def test_publication_change_during_summary_blocks_whole_response(
