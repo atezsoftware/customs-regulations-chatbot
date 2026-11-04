@@ -58,6 +58,7 @@ class LLMFlow(StrEnum):
     # Secondary LLM flows
     SEMANTIC_QUERY_REPHRASE = "semantic_query_rephrase"
     CATALOG_SEARCH_SUMMARY = "catalog_search_summary"
+    CATALOG_QUERY_PREPARATION = "catalog_query_preparation"
     KEYWORD_QUERY_EXPANSION = "keyword_query_expansion"
     REGULATORY_ANNEX_CORRECTION = "regulatory_annex_correction"
     REGULATORY_ANNEX_EFFECTIVE_DATE = "regulatory_annex_effective_date"
