@@ -169,6 +169,22 @@ jobs:
           offset_seconds = int(offset.total_seconds()) if offset else 0
           local_zone = timezone(timedelta(seconds=offset_seconds))
           cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+          activity_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+          environment_keys = (
+              'CONTEXTUAL_RAG_MAX_WORKERS', 'CONTEXTUAL_RAG_MAX_RETRIES',
+              'CONTEXTUAL_RAG_LLM_TIMEOUT_SECONDS', 'CONTEXTUAL_RAG_RETRY_BASE_SECONDS',
+              'CONTEXTUAL_RAG_RETRY_MAX_SECONDS', 'USE_DOCUMENT_SUMMARY', 'USE_CHUNK_SUMMARY',
+          )
+          environment = {key: os.environ.get(key) for key in environment_keys}
+          activity_counts = {'matched_lines': 0, 'warning_lines': 0, 'error_lines': 0,
+                             'retry_lines': 0, 'explicit_firstzip_identity_lines': 0}
+          activity_samples = []
+          activity_context = re.compile(r'(?i)contextual|vertex|gemini|litellm|llm|timeout|rate.?limit')
+          activity_kinds = {
+              'warning_lines': re.compile(r'(?i)warn'),
+              'error_lines': re.compile(r'(?i)error|exception|failed'),
+              'retry_lines': re.compile(r'(?i)retry|retrying'),
+          }
           identities = (
               ('0c18aee3-80f3-4904-8af7-b0ea57a86ce6', 'afa8a0d6-a090-4138-ac81-8409f276b908'),
               ('73fd455a-4e58-4966-bfc0-edec5f2d3ca7', 'e89d67e3-7bbd-4af5-8ff4-572adad7db73'),
@@ -194,6 +210,7 @@ jobs:
                   reports.append({'basename': basename, 'missing': True})
                   continue
               history = deque(maxlen=161)
+              activity_tail = deque(maxlen=20)
               position, matches, errors, consumed, skipped = 0, 0, set(), 0, 0
               current_time, first_time, last_time = None, None, None
               dropping = False
@@ -244,6 +261,16 @@ jobs:
                       if current_time is None or not cutoff <= current_time <= datetime.now(timezone.utc) + timedelta(minutes=1):
                           continue
                       priority = next((rank for rank, pair in enumerate(identities) if any(identity in text for identity in pair)), None)
+                      kinds = [name for name, pattern in activity_kinds.items() if pattern.search(text)]
+                      if current_time >= activity_cutoff and activity_context.search(text) and kinds:
+                          activity_counts['matched_lines'] += 1
+                          for kind in kinds:
+                              activity_counts[kind] += 1
+                          if priority is not None:
+                              activity_counts['explicit_firstzip_identity_lines'] += 1
+                          activity_tail.append({'timestamp': current_time.isoformat(), 'basename': basename,
+                                                'attribution': identities[priority][0] if priority is not None else 'UNATTRIBUTED_WORKER_WARNING',
+                                                'kinds': kinds, 'text': text[:1200]})
                       is_error = bool(error.search(text))
                       line = text[:1200]
                       for window in windows:
@@ -262,6 +289,7 @@ jobs:
                               errors.add(position)
                               capture(position, min(priorities))
                       position += 1
+              activity_samples.extend(activity_tail)
               reports.append({'basename': basename, 'size_at_open': info.st_size, 'read_bytes': consumed,
                               'complete_initial_file': consumed >= info.st_size, 'read_cap_exhausted': total_read >= budget,
                               'first_timestamp': first_time.isoformat() if first_time else None,
@@ -272,7 +300,11 @@ jobs:
               window['text'] = '\n'.join(window.pop('lines'))
           windows.sort(key=lambda item: (item['priority'], item['basename'], item['start_line']))
           payload = json.dumps({'files': reports, 'read_bytes': total_read, 'read_cap_exhausted': total_read >= budget,
-                                'utc_cutoff': cutoff.isoformat(), 'windows': windows}, ensure_ascii=False)
+                                'utc_cutoff': cutoff.isoformat(), 'windows': windows,
+                                'environment': environment, 'environment_scope': 'container_exec_env; may differ from Vault-exported Celery worker environment',
+                                'recent_activity': {'utc_cutoff': activity_cutoff.isoformat(), 'counts': activity_counts,
+                                    'samples': sorted(activity_samples, key=lambda item: item['timestamp'])[-20:],
+                                    'scope': 'Worker log lines; duplicates possible; unattributed unless explicit frozen firstZIP identity. Warning activity does not prove successful provider responses.'}}, ensure_ascii=False)
           if len(payload.encode()) > 2 * 1024 * 1024:
               raise SystemExit('Scoped worker log response bound exceeded')
           print(offset_seconds)
@@ -304,6 +336,11 @@ jobs:
                       print_safe(f"WORKER_LOG_SCAN read_bytes={report['read_bytes']} cap_exhausted={report['read_cap_exhausted']} utc_cutoff={report['utc_cutoff']}")
                       for metadata in report['files']:
                           print_safe('WORKER_LOG_FILE ' + json.dumps(metadata, sort_keys=True))
+                      print_safe('WORKER_CONTEXT_ENV ' + json.dumps({'scope': report['environment_scope'], 'flags': report['environment']}, sort_keys=True))
+                      activity = report['recent_activity']
+                      print_safe('WORKER_RECENT_ACTIVITY ' + json.dumps({key: value for key, value in activity.items() if key != 'samples'}, sort_keys=True))
+                      for sample in activity['samples']:
+                          print_safe('WORKER_ACTIVITY_LINE ' + json.dumps(sample, sort_keys=True))
                       for window in report['windows']:
                           excerpts += 1
                           print_safe(f"LOG_MATCH worker_file excerpt={excerpts} basename={window['basename']} priority={window['priority']} recent_lines={window['start_line']}:{window['end_line']}")
