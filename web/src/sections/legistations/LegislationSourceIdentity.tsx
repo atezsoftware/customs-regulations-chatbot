@@ -53,9 +53,9 @@ export default function LegislationSourceIdentity({
       label: "Ek",
     })),
   ];
-  const related = [
-    ...new Map(linked.map((item) => [item.user_file_id, item])).values(),
-  ];
+  const related = Array.from(
+    new Map(linked.map((item) => [item.user_file_id, item])).values()
+  );
   if (!lineage && related.length === 0) return null;
   return (
     <div className="flex flex-col gap-1 break-words [overflow-wrap:anywhere]">
