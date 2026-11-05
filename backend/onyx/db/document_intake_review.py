@@ -11,6 +11,7 @@ from uuid import UUID, uuid4, uuid5
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, aliased
 
+from onyx.db.document_intake_source_reference import intake_source_reference
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.file_record import FileRecordNotFoundError
 from onyx.db.models import (
@@ -157,22 +158,7 @@ def _source_snapshot(
         or _blob_sha256(asset.text_file_id) != asset.text_sha256
     ):
         raise IntakeConflictError("The retained source evidence changed")
-    return {
-        "package_id": str(package.id),
-        "asset_id": str(asset.id),
-        "asset_sha256": asset.sha256,
-        "asset_file_id": asset.file_id,
-        "prepared_file_id": asset.text_file_id,
-        "prepared_sha256": asset.text_sha256,
-        "original_file_id": file.file_id,
-        "manifest_file_id": package.manifest_file_id,
-        "manifest_sha256": package.manifest_sha256,
-        "role": member.role,
-        "parent_document_id": str(member.parent_document_id)
-        if member.parent_document_id
-        else None,
-        "relationships": member.relationships,
-    }
+    return intake_source_reference(package, member, asset, file)
 
 
 def _parent_snapshot(

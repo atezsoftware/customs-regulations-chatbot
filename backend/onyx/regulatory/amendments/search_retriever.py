@@ -494,6 +494,7 @@ def build_amendment_search_retriever(
     )
     source_chunks: dict[str, list[CandidateChunk]] = {}
     source_file_cache: dict[tuple[str, str | None], list[str]] = {}
+    source_title_cache: dict[tuple[str, str | None], dict[str, str]] = {}
 
     def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
         target = instruction.target_source or ""
@@ -509,6 +510,11 @@ def build_amendment_search_retriever(
             for source in source_identities
             if source_file_identity_matches(target, source.name, source.root_heading)
         ]
+        titles = {
+            str(source.user_file_id): source.root_heading or source.name
+            for source in source_identities
+            if str(source.user_file_id) in files
+        }
         if not files:
             with get_session_with_current_tenant() as identity_session:
                 structural_titles = load_amendment_structural_source_titles(
@@ -524,6 +530,11 @@ def build_amendment_search_retriever(
                 and source_file_identity_matches(target, source.name, title)
                 and source_file_identity_matches(target, source.root_heading, title)
             ]
+            titles = {
+                str(file_id): title
+                for file_id, title in structural_titles.items()
+                if str(file_id) in files
+            }
         if files:
             with get_session_with_current_tenant() as identity_session:
                 family = resolve_amendment_source_family(
@@ -535,7 +546,11 @@ def build_amendment_search_retriever(
                 )
             if family is not None:
                 files = [str(value) for value in family.target_file_ids]
+                primary_title = titles.get(str(family.primary_file_id))
+                if primary_title is not None:
+                    titles = {file_id: primary_title for file_id in files}
         source_file_cache[cache_key] = files
+        source_title_cache[cache_key] = titles
         return files
 
     def structural_candidate_loader(
@@ -560,6 +575,9 @@ def build_amendment_search_retriever(
                 user_file_id=str(match.chunk.user_file_id),
                 text=match.chunk.text,
                 source_name=match.source_name,
+                verified_source_title=source_title_cache.get(
+                    (normalized_source, target.appendix_label), {}
+                ).get(str(match.chunk.user_file_id)),
                 metadata={
                     **match.chunk.chunk_metadata,
                     "heading_path": list(match.chunk.heading_path),

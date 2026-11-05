@@ -18,6 +18,7 @@ class CandidateChunk:
     structured_match: bool = False
     source_score: float = 0.0
     source_verified: bool = False
+    verified_source_title: str | None = None
     source_ambiguous: bool = False
     structure_conflict: str | None = None
     resolved_article_no: str | None = None
