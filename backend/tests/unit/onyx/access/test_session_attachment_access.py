@@ -10,8 +10,11 @@ from onyx.access import access
 from onyx.configs.constants import DEFAULT_PERSONA_ID, FileOrigin
 from onyx.db import regulatory_public_reads
 from onyx.db.models import ChatSession, ChatSessionSharedStatus, FileRecord, User
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.models import ChatAttachmentMetadata, ChatFileType
 from onyx.regulatory import publication_reads
+from onyx.server.features.chat_files import api as chat_files_api
 from onyx.server.query_and_chat import chat_backend
 
 
@@ -116,8 +119,10 @@ def test_unrelated_files_keep_existing_legacy_acl_path(
     db_session.query.assert_called_once()
 
 
-def test_private_original_legacy_url_uses_no_store_and_ignores_old_etag(
+@pytest.mark.parametrize("parsed", [False, True])
+def test_private_original_legacy_url_uses_no_store_without_corpus_scans(
     monkeypatch: pytest.MonkeyPatch,
+    parsed: bool,
 ) -> None:
     owner = User(id=uuid4(), email="owner@example.test")
     record = _attachment(owner, None)
@@ -127,13 +132,17 @@ def test_private_original_legacy_url_uses_no_store_and_ignores_old_etag(
     file_store.read_file_record.return_value = record
     file_store.read_file.return_value = BytesIO(b"private bytes")
     monkeypatch.setattr(chat_backend, "get_default_file_store", lambda: file_store)
-    monkeypatch.setattr(chat_backend, "get_file_id_by_user_file_id", lambda *_: None)
-    monkeypatch.setattr(
-        regulatory_public_reads, "public_file_source_owners", lambda *_: ()
+    monkeypatch.setattr(chat_files_api, "get_default_file_store", lambda: file_store)
+    forbidden_scan = Mock(
+        side_effect=AssertionError("Private attachment requested corpus scan")
     )
-    monkeypatch.setattr(regulatory_public_reads, "protected_file_ids", lambda *_: ())
-    monkeypatch.setattr(publication_reads, "observe_publication_read", Mock())
-    monkeypatch.setattr(publication_reads, "require_publication_files", lambda *_: None)
+    monkeypatch.setattr(chat_backend, "get_file_id_by_user_file_id", forbidden_scan)
+    monkeypatch.setattr(
+        regulatory_public_reads, "public_file_source_owners", forbidden_scan
+    )
+    monkeypatch.setattr(regulatory_public_reads, "protected_file_ids", forbidden_scan)
+    monkeypatch.setattr(publication_reads, "observe_publication_read", forbidden_scan)
+    monkeypatch.setattr(publication_reads, "require_publication_files", forbidden_scan)
     request = Request(
         {
             "type": "http",
@@ -142,11 +151,48 @@ def test_private_original_legacy_url_uses_no_store_and_ignores_old_etag(
     )
 
     response = chat_backend.fetch_chat_file(
-        record.file_id, request=request, parsed=False, user=owner, db_session=db_session
+        record.file_id,
+        request=request,
+        parsed=parsed,
+        user=owner,
+        db_session=db_session,
     )
 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "private, no-store"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert "ETag" not in response.headers
-    file_store.read_file.assert_called_once_with(record.file_id, mode="b")
+
+
+@pytest.mark.parametrize("target", ["foreign", "plaintext"])
+def test_legacy_private_file_denial_precedes_any_corpus_scan(
+    monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    owner = User(id=uuid4(), email="owner@example.test")
+    viewer = User(id=uuid4(), email="viewer@example.test")
+    record = _attachment(owner, None)
+    db_session = MagicMock(spec=Session)
+    db_session.get.return_value = record
+    forbidden_scan = Mock(
+        side_effect=AssertionError("Private attachment requested corpus scan")
+    )
+    monkeypatch.setattr(publication_reads, "observe_publication_read", forbidden_scan)
+    monkeypatch.setattr(chat_backend, "get_file_id_by_user_file_id", forbidden_scan)
+    monkeypatch.setattr(
+        regulatory_public_reads, "public_file_source_owners", forbidden_scan
+    )
+    file_id = (
+        f"chat_attachment_text_{record.file_id}"
+        if target == "plaintext"
+        else record.file_id
+    )
+
+    with pytest.raises(OnyxError) as caught:
+        chat_backend.fetch_chat_file(
+            file_id,
+            request=Request({"type": "http", "headers": []}),
+            parsed=False,
+            user=viewer,
+            db_session=db_session,
+        )
+    assert caught.value.error_code is OnyxErrorCode.NOT_FOUND

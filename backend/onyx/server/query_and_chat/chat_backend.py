@@ -1174,6 +1174,14 @@ def fetch_chat_file(
     user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> Response:
+    from onyx.db.chat_attachments import is_private_chat_attachment_file
+    from onyx.server.features.chat_files.api import download_chat_attachment
+
+    if is_private_chat_attachment_file(db_session, file_id):
+        return download_chat_attachment(
+            file_id=file_id, user=user, db_session=db_session
+        )
+
     from onyx.db.regulatory_public_reads import (
         protected_file_ids,
         public_file_source_owners,
