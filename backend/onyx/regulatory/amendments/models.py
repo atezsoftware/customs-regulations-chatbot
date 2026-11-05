@@ -190,7 +190,7 @@ class ChunkFieldsDraft(BaseModel):
     field verbatim.
     """
 
-    text: str = Field(description="Full amended chunk text")
+    text: str = Field(min_length=1, description="Full amended chunk text")
     chunk_type: str | None = Field(
         default=None, description="Chunk type, e.g. 'paragraph', 'article', 'table'"
     )
@@ -213,6 +213,15 @@ class ChunkFieldsDraft(BaseModel):
             "in metadata changes."
         ),
     )
+
+    @field_validator("text")
+    @classmethod
+    def _require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError(
+                "Replacement chunk text cannot be blank; preserve the unit marker and use (Mülga) for a fully repealed unit"
+            )
+        return value
 
 
 class DateResolution(BaseModel):

@@ -3,6 +3,49 @@ import type { RegulatoryIndexingProgress } from "@/lib/projects/types";
 
 export type LegistationsSearchMode = "files" | "hybrid";
 
+export interface IntakeOriginalSource {
+  asset_id: string;
+  sha256: string;
+  original_name: string;
+  original_url: string | null;
+  final_url: string | null;
+}
+
+export interface IntakeRelatedFile {
+  user_file_id: string;
+  document_id: string;
+  title: string;
+  source: IntakeOriginalSource;
+}
+
+export interface IntakeFileSourceLineage {
+  version: 1;
+  intake_id: string;
+  package_id: string;
+  document_set_id: number;
+  document_id: string;
+  role: "root" | "annex";
+  source: IntakeOriginalSource;
+  parents: IntakeRelatedFile[];
+  attachments: IntakeRelatedFile[];
+}
+
+export interface ReviewedRelatedFile {
+  user_file_id: string;
+  title: string;
+  original_name: string | null;
+  source_url: string | null;
+  document_set_id: number;
+  intake_id: string;
+  review_decision_id: string;
+  basis: "reviewed_existing_parent";
+}
+
+export interface ReviewedFileRelations {
+  parents: ReviewedRelatedFile[];
+  attachments: ReviewedRelatedFile[];
+}
+
 export interface LegislationFile {
   id: string;
   name: string;
@@ -15,6 +58,8 @@ export interface LegislationFile {
   chunk_count: number;
   document_sets: { id: number; name: string }[];
   pending_review: boolean;
+  source_lineage?: IntakeFileSourceLineage | null;
+  reviewed_relations?: ReviewedFileRelations | null;
   regulatory_indexing_progress?: RegulatoryIndexingProgress | null;
   index_request?: {
     attempt_id: string;

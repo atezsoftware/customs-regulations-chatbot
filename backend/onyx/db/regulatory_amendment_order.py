@@ -1,5 +1,6 @@
 """Validate reviewed insertion boundaries under the existing file ownership."""
 
+import re
 from datetime import date
 from typing import Any
 from uuid import UUID
@@ -78,6 +79,7 @@ def load_amendment_order(session: Session, user_file_id: UUID) -> list[OrderMemb
                 RegulatoryChunk.validity_start_date,
                 RegulatoryChunk.validity_end_date,
             ),
+            RegulatoryChunk.chunk_metadata["appendix_label"].astext,
             case(
                 (
                     and_(
@@ -91,6 +93,7 @@ def load_amendment_order(session: Session, user_file_id: UUID) -> list[OrderMemb
                 ),
                 else_=None,
             ),
+            func.left(RegulatoryChunk.text, 128),
         )
         .where(RegulatoryChunk.user_file_id == user_file_id)
         .order_by(RegulatoryChunk.position, RegulatoryChunk.id)
@@ -108,7 +111,13 @@ def load_amendment_order(session: Session, user_file_id: UUID) -> list[OrderMemb
             clause_label=row[5],
             derived=row[6] == "hierarchical_aggregate" or row[7] is not None,
             source_sha256=row[8],
-            direct_clause_parent=is_direct_article_opening(row[9], row[3]),
+            appendix_label=row[9],
+            annex_item_no=(
+                match[1]
+                if (match := re.match(r"^\s*(?:\*\*)?(\d+)\.\s", row[11]))
+                else None
+            ),
+            direct_clause_parent=is_direct_article_opening(row[10], row[3]),
         )
         for row in records
     ]
@@ -128,6 +137,7 @@ def validate_insertion_order(
         paragraph_no=order.paragraph_no,
         clause_label=order.clause_label,
         after_article_no=order.after_article_no,
+        appendix_label=order.appendix_label,
     )
     try:
         return reconcile_insertion_order(order, current)
@@ -199,6 +209,7 @@ def _approved_siblings_reconstruct_reviewed_order(
                 paragraph_no=reviewed.paragraph_no,
                 clause_label=reviewed.clause_label,
                 after_article_no=reviewed.after_article_no,
+                appendix_label=reviewed.appendix_label,
             )
             reconcile_insertion_order(reviewed, historical)
             return True
@@ -293,6 +304,7 @@ def _reverse_approved_sibling(
             or reviewed_insertion.article_no != member.article_no
             or reviewed_insertion.paragraph_no != member.paragraph_no
             or reviewed_insertion.clause_label != member.clause_label
+            or reviewed_insertion.appendix_label != member.appendix_label
         ):
             return False
         del members[applied.id]

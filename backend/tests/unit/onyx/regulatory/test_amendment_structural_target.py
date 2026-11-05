@@ -479,6 +479,60 @@ def test_new_article_identity_is_preserved_without_model_reference() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "appendix", "article", "clause"),
+    [
+        (
+            "MADDE 2- Aynı Tebliğin Ek I’inde yer alan 18 inci madde aşağıdaki şekilde değiştirilmiştir.",
+            "EK-I",
+            "18",
+            None,
+        ),
+        (
+            "MADDE 3- Aynı Tebliğin Ek II’sinde yer alan 1 inci maddenin (ğ) bendi aşağıdaki şekilde değiştirilmiştir.",
+            "EK-II",
+            "1",
+            "ğ",
+        ),
+        (
+            "MADDE 4- Aynı Tebliğin Ek IV’ünde yer alan birinci cümleden sonra gelmek üzere aşağıdaki cümle eklenmiştir.",
+            "EK-IV",
+            None,
+            None,
+        ),
+        (
+            "MADDE 4- Aynı Tebliğin Ek IV’ünde yer alan (c) bendinin birinci cümlesi aşağıdaki şekilde değiştirilmiştir.\n“Ek III’ün 1 inci maddesinin (c) bendindeki gereklilikler uygulanır.”",
+            "EK-IV",
+            None,
+            "c",
+        ),
+    ],
+)
+def test_batch_345_roman_annex_targets_keep_their_own_source_scope(
+    text: str, appendix: str, article: str | None, clause: str | None
+) -> None:
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(instruction_text=text)
+    )
+    assert target is not None
+    assert target.appendix_label == appendix
+    assert target.article_no == article
+    assert target.clause_label == clause
+
+
+@pytest.mark.parametrize("text", ["ekli liste", "Ek IC", "EK MADDE 3"])
+def test_roman_annex_detection_does_not_invent_an_annex_from_other_words(
+    text: str,
+) -> None:
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(
+            instruction_text=f"MADDE 1- {text} kapsamında 9 uncu madde değiştirilmiştir."
+        )
+    )
+    assert target is not None
+    assert target.appendix_label is None
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "12/4/1991 tarihli ve 3713 sayılı Terörle Mücadele Kanunu",

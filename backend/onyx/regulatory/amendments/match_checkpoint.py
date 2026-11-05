@@ -13,7 +13,7 @@ from onyx.regulatory.amendments.structural_target import (
     parse_amendment_structural_target,
 )
 
-MATCH_CONTRACT_VERSION = 4
+MATCH_CONTRACT_VERSION = 5
 
 
 class MatchEvidence(BaseModel):

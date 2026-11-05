@@ -204,3 +204,46 @@ def test_new_paragraph_match_cannot_replace_existing_parent(
         )
         is None
     )
+
+
+def test_verified_own_title_resolves_stale_instrument_kind_without_rewriting_metadata() -> (
+    None
+):
+    title = "Pan-Avrupa-Akdeniz Tercihli Menşe Kurallarına Dair Bölgesel Konvansiyon Ortak Komitesinin 1/2023 Sayılı Kararı Kapsamı Tercihli Menşe Kuralları Hakkında Yönetmelik"
+    instruction = AmendmentInstruction(
+        instruction_text=f"{title}in 2 nci maddesinin birinci fıkrasına aşağıdaki bent eklenmiştir. “m) Yeni hüküm,”",
+        target_source=title,
+        article_reference="Madde 2 fıkra 1",
+    )
+    parent = CandidateChunk(
+        chunk_id="parent",
+        user_file_id="published",
+        text="MADDE 2- (1) Bu Yönetmelik;",
+        metadata={
+            "document_type": "karar",
+            "document_number": "2017/10411",
+            "article_no": "2",
+            "paragraph_no": "1",
+        },
+        source_verified=True,
+        structured_match=True,
+        verified_source_title=title,
+    )
+    assert validated_addition_anchor(instruction, [parent]) == parent
+    assert parent.metadata["document_type"] == "karar"
+    assert (
+        validated_addition_anchor(
+            instruction, [replace(parent, verified_source_title=None)]
+        )
+        is None
+    )
+    assert (
+        validated_addition_anchor(instruction, [replace(parent, source_verified=False)])
+        is None
+    )
+    assert (
+        validated_addition_anchor(
+            instruction, [replace(parent, verified_source_title="Farklı Yönetmelik")]
+        )
+        is None
+    )

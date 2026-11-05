@@ -137,6 +137,16 @@ class LegalMetadataResult(BaseModel):
     warnings: list[str] = Field(default_factory=list, max_length=32)
 
 
+class MetadataTargetEndNotProven(ValueError):
+    def __init__(self, target_chunk_id: str, fact: LegalMetadataFact) -> None:
+        super().__init__(
+            "Metadata target end not proven: a repeal of another law or the "
+            "deadline of one regime cannot end the whole target provision"
+        )
+        self.target_chunk_id = target_chunk_id
+        self.fact = fact
+
+
 class MetadataEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     evidence_id: str
@@ -387,6 +397,7 @@ def retain_validated_metadata_facts(
     current = {target.chunk_id: target for target in result.chunks}
     merged: dict[str, ChunkLegalMetadata] = {}
     restored = False
+    omitted_end_warnings: list[str] = []
     for target in previous.chunks:
         fields = list(current[target.chunk_id].fields)
         present = {fact.field for fact in fields}
@@ -402,6 +413,13 @@ def retain_validated_metadata_facts(
                     chunks=chunks,
                     target_ids=[target.chunk_id],
                 )
+            except MetadataTargetEndNotProven:
+                omitted_end_warnings.append(
+                    f"Omitted unsupported validity_end_date {fact.value} for target "
+                    f"{target.chunk_id}: expiry of the whole target was not proven. "
+                    "The complete source and its continuing rules remain unchanged."
+                )
+                continue
             except ValueError:
                 continue
             fields.append(
@@ -413,10 +431,21 @@ def retain_validated_metadata_facts(
         merged[target.chunk_id] = ChunkLegalMetadata(
             chunk_id=target.chunk_id, fields=fields
         )
-    if not restored:
+    if not restored and not omitted_end_warnings:
         return result
     warning_prefix = r"^Retained metadata from request [0-9a-f]{64}: "
     warnings = list(result.warnings)
+
+    def append_warning(warning: str) -> None:
+        if any(warning == item or warning in item.splitlines() for item in warnings):
+            return
+        if len(warnings) < 32:
+            warnings.append(warning)
+        else:
+            warnings[-1] += "\n" + warning
+
+    for warning in omitted_end_warnings:
+        append_warning(warning)
     known_warnings = {re.sub(warning_prefix, "", value) for value in warnings}
     for warning in previous.warnings:
         message = re.sub(warning_prefix, "", warning)
@@ -746,6 +775,66 @@ def _unknown_evidence_feedback(
     }
 
 
+def _target_end_feedback(
+    payload: dict[str, JsonValue], previous_response: str
+) -> dict[str, object] | None:
+    try:
+        previous = _TransportResult.model_validate_json(previous_response)
+    except ValueError:
+        return None
+    raw_chunks, target_ids = (
+        payload.get("complete_document"),
+        payload.get("target_chunk_ids"),
+    )
+    if not isinstance(raw_chunks, list) or not isinstance(target_ids, list):
+        return None
+    if not _exact_metadata_targets(previous, target_ids):
+        return None
+    chunks = [MetadataChunk.model_validate(raw) for raw in raw_chunks]
+    errors: list[dict[str, object]] = []
+    for target in previous.chunks:
+        for fact in target.fields:
+            if fact.field != "validity_end_date":
+                continue
+            one = _TransportResult(
+                chunks=[_TransportChunk(chunk_id=target.chunk_id, fields=[fact])]
+            )
+            try:
+                validate_metadata_transport_response(
+                    one.model_dump_json(), chunks=chunks, target_ids=[target.chunk_id]
+                )
+            except MetadataTargetEndNotProven as error:
+                errors.append(
+                    {
+                        "error": "target_end_not_proven",
+                        "target_chunk_id": target.chunk_id,
+                        "field": fact.field,
+                        "rejected_value": fact.value,
+                        "evidence_id": fact.evidence_id,
+                        "source_chunk_id": error.fact.source_chunk_id,
+                    }
+                )
+            except ValueError:
+                continue
+    if not errors:
+        return None
+    return {
+        "version": 1,
+        "errors": errors[:8],
+        "instruction": (
+            "validity_end_date ends the WHOLE target provision. An application or "
+            "permission deadline does not prove that all its rules cease. A target "
+            "may contain a temporary permission and a continuing restriction after "
+            "that date; ending the target would wrongly expire the restriction too. "
+            "Re-evaluate each listed field using the unchanged complete source. "
+            "Omit an unsupported scalar end date and explain the omission in warnings. "
+            "Never substitute another guessed date or borrow another provision's "
+            "expiry. Preserve independently supported identity and date facts. "
+            "All original evidence, scope, coverage and validity checks still apply."
+        ),
+    }
+
+
 def build_metadata_repair_request(
     request: VertexBatchRequest,
     previous_response: str,
@@ -781,6 +870,9 @@ def build_metadata_repair_request(
         catalog_feedback = _unknown_evidence_feedback(payload, previous_response)
         if catalog_feedback is not None:
             payload["validation_feedback"]["catalog_feedback"] = catalog_feedback
+        target_end_feedback = _target_end_feedback(payload, previous_response)
+        if target_end_feedback is not None:
+            payload["validation_feedback"]["target_end_feedback"] = target_end_feedback
     repaired = VertexBatchRequest(
         prompt=json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -1585,9 +1677,7 @@ def validate_metadata_response(
                     )
                     or _local_paragraph_deadline(fact, sources, target.chunk_id)
                 ):
-                    raise ValueError(
-                        "A repeal of another law cannot end this new provision"
-                    )
+                    raise MetadataTargetEndNotProven(target.chunk_id, fact)
                 values[fact.field] = value
         if (
             "validity_start_date" in values

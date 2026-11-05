@@ -6,10 +6,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import bindparam, select, text
+from sqlalchemy import and_, bindparam, func, or_, select, text, true
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
-from onyx.db.models import RegulatoryChunk, UserFile
+from onyx.db.enums import UserFileStatus
+from onyx.db.models import (
+    DocumentSet__UserFile,
+    RegulatoryChunk,
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeFile,
+    RegulatoryDocumentIntakeReviewDecision,
+    RegulatoryFilePublication,
+    UserFile,
+)
 from onyx.db.regulatory_chunks import RegulatoryChunkStructuralMatch
 from onyx.regulatory.source_identity import source_identity_distinguishing_tokens
 
@@ -146,14 +156,114 @@ class AmendmentSourceIdentity:
     root_heading: str
 
 
+def published_amendment_source_conditions() -> tuple[ColumnElement[bool], ...]:
+    """A pending preparation or unfinished writer cannot establish target identity."""
+    member = RegulatoryDocumentIntakeFile
+    has_intake = (
+        select(member.id)
+        .where(member.user_file_id == UserFile.id)
+        .correlate(UserFile)
+        .exists()
+    )
+    unfinished_intake = (
+        select(member.id)
+        .join(RegulatoryDocumentIntake, RegulatoryDocumentIntake.id == member.intake_id)
+        .where(
+            member.user_file_id == UserFile.id,
+            or_(
+                member.status != "completed",
+                RegulatoryDocumentIntake.status != "completed",
+            ),
+        )
+        .correlate(UserFile)
+        .exists()
+    )
+    disposition = (
+        select(RegulatoryDocumentIntakeReviewDecision.disposition)
+        .join(member, member.id == RegulatoryDocumentIntakeReviewDecision.document_id)
+        .where(member.user_file_id == UserFile.id)
+        .order_by(RegulatoryDocumentIntakeReviewDecision.sequence.desc())
+        .limit(1)
+        .correlate(UserFile)
+        .scalar_subquery()
+    )
+    return (
+        UserFile.status == UserFileStatus.COMPLETED,
+        ~unfinished_intake,
+        or_(disposition.is_(None), disposition != "source_evidence"),
+        or_(
+            and_(
+                RegulatoryFilePublication.epoch > 0,
+                RegulatoryFilePublication.gate_closed.is_(False),
+                RegulatoryFilePublication.writer_manifest.is_(None),
+                RegulatoryFilePublication.writer_manifest_sha256.is_(None),
+            ),
+            and_(RegulatoryFilePublication.user_file_id.is_(None), ~has_intake),
+        ),
+    )
+
+
+def _own_communique_header_title(
+    root: str, opening: str, document_number: str | None
+) -> str:
+    """Recover identifiers adjacent to an own official opening, never a citation."""
+    if (
+        len(root) > 400
+        or not document_number
+        or len(document_number) > 40
+        or _structural_title_identity(root) is None
+    ):
+        return root
+    lines = [line.strip() for line in opening.splitlines() if line.strip()]
+    if (
+        len(lines) < 7
+        or re.fullmatch(r"\d{1,2}\s+\w+\s+(?:19|20)\d{2}\s+\w+", lines[0]) is None
+        or lines[1] not in {"Resmî Gazete", "Resmi Gazete"}
+        or re.fullmatch(r"Sayı\s*:\s*\d+", lines[2]) is None
+        or lines[3] != "TEBLİĞ"
+        or not lines[4].endswith("Bakanlığından:")
+        or not root.endswith("TEBLİĞ")
+    ):
+        return root
+    body = "\n".join(lines[5:])
+    title = re.match(r"\s+".join(re.escape(word) for word in root.split()), body)
+    if title is None:
+        return root
+    suffix = re.match(
+        r"\s*(?P<eu>\((?:19|20)\d{2}/[1-9]\d{0,4}/(?:AB|AT|AET)\))"
+        r"\s+(?P<domestic>\([A-ZÇĞİÖŞÜ]{2,12}-(?:19|20)\d{2}/[1-9]\d{0,4}\))"
+        r"(?=[ \t]*(?:\n|$))",
+        body[title.end() :],
+    )
+    if suffix is None or document_number != suffix["domestic"][1:-1]:
+        return root
+    tail = body[title.end() + suffix.end() :].strip()
+    # The next article caption may share the opening row; a continued act title may not.
+    if tail and (
+        len(tail) > 120
+        or re.fullmatch(r"[^\W\d_]+(?:[ ,/-]+[^\W\d_]+)*", tail) is None
+        or re.search(
+            r"tebliğ|yönetmelik|kanun|değişiklik|yapılmasına", tail, re.IGNORECASE
+        )
+    ):
+        return root
+    return f"{root} {suffix['eu']} {suffix['domestic']}"
+
+
 def load_amendment_source_identities(
     db_session: Session,
     user_file_ids: Sequence[UUID],
+    *,
+    document_set_id: int | None = None,
 ) -> list[AmendmentSourceIdentity]:
     if not user_file_ids:
         return []
     roots = (
-        select(RegulatoryChunk.user_file_id, RegulatoryChunk.heading_path)
+        select(
+            RegulatoryChunk.user_file_id,
+            RegulatoryChunk.id.label("chunk_id"),
+            RegulatoryChunk.heading_path,
+        )
         .where(
             RegulatoryChunk.user_file_id.in_(user_file_ids),
             RegulatoryChunk.status == "active",
@@ -165,14 +275,53 @@ def load_amendment_source_identities(
         .subquery()
     )
     rows = db_session.execute(
-        select(UserFile.id, UserFile.name, roots.c.heading_path)
+        select(
+            UserFile.id,
+            UserFile.name,
+            roots.c.heading_path,
+            RegulatoryChunk.position,
+            RegulatoryChunk.chunk_type,
+            RegulatoryChunk.superseded_by_chunk_id,
+            RegulatoryChunk.chunk_metadata["bound_to_regulatory_chunk_id"].astext.label(
+                "bound_to"
+            ),
+            RegulatoryChunk.chunk_metadata["document_number"].astext.label(
+                "document_number"
+            ),
+            func.left(RegulatoryChunk.text, 4096).label("opening"),
+        )
+        .select_from(UserFile)
+        .outerjoin(
+            RegulatoryFilePublication,
+            RegulatoryFilePublication.user_file_id == UserFile.id,
+        )
         .outerjoin(roots, roots.c.user_file_id == UserFile.id)
-        .where(UserFile.id.in_(user_file_ids))
+        .outerjoin(RegulatoryChunk, RegulatoryChunk.id == roots.c.chunk_id)
+        .where(UserFile.id.in_(user_file_ids), *published_amendment_source_conditions())
+        .where(
+            select(DocumentSet__UserFile.user_file_id)
+            .where(
+                DocumentSet__UserFile.user_file_id == UserFile.id,
+                DocumentSet__UserFile.document_set_id == document_set_id,
+            )
+            .correlate(UserFile)
+            .exists()
+            if document_set_id is not None
+            else true()
+        )
     ).all()
-    return [
-        AmendmentSourceIdentity(row[0], row[1], row[2][0] if row[2] else "")
-        for row in rows
-    ]
+    result = []
+    for row in rows:
+        root = row.heading_path[0] if row.heading_path else ""
+        if (
+            row.position == 0
+            and row.chunk_type != "hierarchical_aggregate"
+            and row.superseded_by_chunk_id is None
+            and row.bound_to is None
+        ):
+            root = _own_communique_header_title(root, row.opening, row.document_number)
+        result.append(AmendmentSourceIdentity(row.id, row.name, root))
+    return result
 
 
 def load_amendment_structural_source_titles(

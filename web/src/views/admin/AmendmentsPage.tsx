@@ -50,6 +50,7 @@ import {
 import AnnexChunkReview from "@/views/admin/AnnexChunkReview";
 import ChunkFieldsReview, {
   ReadOnlyFieldValue,
+  MetadataFieldsReview,
 } from "@/sections/cards/ChunkFieldsReview";
 import NewDocumentIntake from "@/views/admin/NewDocumentIntake";
 
@@ -225,37 +226,6 @@ function draftValidationError(draft: Record<string, unknown>): string | null {
     return "Use a YYYY-MM-DD date.";
   }
   return null;
-}
-
-interface MetadataLeaf {
-  path: string[];
-  value: unknown;
-}
-
-function metadataLeaves(
-  value: Record<string, unknown>,
-  prefix: string[] = []
-): MetadataLeaf[] {
-  return Object.entries(value).flatMap(([key, child]) => {
-    const path = [...prefix, key];
-    if (child === null || child === undefined) return [];
-    if (isRecord(child) && Object.keys(child).length > 0) {
-      return metadataLeaves(child, path);
-    }
-    return [{ path, value: child }];
-  });
-}
-
-function updateNestedValue(
-  root: Record<string, unknown>,
-  path: string[],
-  value: unknown
-): Record<string, unknown> {
-  const [head, ...tail] = path;
-  if (head === undefined) return root;
-  if (tail.length === 0) return { ...root, [head]: value };
-  const child = isRecord(root[head]) ? root[head] : {};
-  return { ...root, [head]: updateNestedValue(child, tail, value) };
 }
 
 function metadataInputValue(value: unknown): string {
@@ -493,51 +463,29 @@ function ProposalCard({
     }
     if (key === "metadata") {
       const metadata = isRecord(draft.metadata) ? draft.metadata : {};
-      const leaves = metadataLeaves(metadata);
-      if (leaves.length === 0) {
-        return <span className="text-sm text-text-03">Empty</span>;
-      }
       return (
-        <div className="flex flex-col gap-2">
-          {leaves.map((leaf) => {
-            const metadataKey = leaf.path.join(".");
-            const multiline = Array.isArray(leaf.value);
-            const sharedProps = {
-              "aria-label": `After metadata ${metadataKey}`,
-              value: metadataInputValue(leaf.value),
-              onChange: (
-                event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
-              ) => {
-                const nextMetadata = updateNestedValue(
-                  metadata,
-                  leaf.path,
-                  metadataValueFromInput(leaf.value, event.target.value)
-                );
-                updateDraftField("metadata", nextMetadata);
-              },
-              variant: readOnly ? ("readOnly" as const) : ("primary" as const),
-            };
-            return (
-              <div key={metadataKey} className="flex flex-col gap-1">
-                <span className="break-words font-mono text-xs text-text-03">
-                  {metadataKey}
-                </span>
-                {multiline ? (
-                  <InputTextArea
-                    {...sharedProps}
-                    rows={2}
-                    maxRows={6}
-                    autoResize
-                  />
-                ) : (
-                  <InputTypeIn {...sharedProps} />
-                )}
-              </div>
-            );
-          })}
-        </div>
+        <MetadataFieldsReview
+          metadata={metadata}
+          renderField={(metadataKey, fieldValue) => (
+            <InputTypeIn
+              aria-label={`After metadata ${metadataKey}`}
+              value={metadataInputValue(fieldValue)}
+              onChange={(event) =>
+                updateDraftField("metadata", {
+                  ...metadata,
+                  [metadataKey]: metadataValueFromInput(
+                    fieldValue,
+                    event.target.value
+                  ),
+                })
+              }
+              variant={readOnly ? "readOnly" : "primary"}
+            />
+          )}
+        />
       );
     }
+
     if (key === "validity_start_date" || key === "validity_end_date") {
       const draftKey =
         key === "validity_start_date"

@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 import { Text } from "@opal/components";
 import { ChunkContent } from "@/sections/cards/ChunkChangeCard";
+import { intakeLegalMetadataFields } from "@/lib/regulatory/intakeMetadata";
 
 const chunkFieldOrder = [
   "id",
@@ -29,6 +30,58 @@ const alwaysVisibleFields = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && !Array.isArray(value) && typeof value === "object";
+}
+
+interface MetadataFieldsReviewProps {
+  metadata: Record<string, unknown>;
+  renderField?: (key: string, value: unknown) => ReactNode;
+}
+
+export function MetadataFieldsReview({
+  metadata,
+  renderField,
+}: MetadataFieldsReviewProps) {
+  const legalKeys = new Set<string>(
+    intakeLegalMetadataFields.map(([key]) => key)
+  );
+  const legal = Object.entries(metadata).filter(
+    ([key, value]) =>
+      legalKeys.has(key) && value !== null && value !== undefined
+  );
+  const technical = Object.fromEntries(
+    Object.entries(metadata).filter(
+      ([key, value]) =>
+        !legalKeys.has(key) && value !== null && value !== undefined
+    )
+  );
+  return (
+    <div className="flex flex-col gap-2">
+      {legal.map(([key, value]) => (
+        <div key={key} className="flex flex-col gap-1">
+          <Text font="secondary-body" color="text-03">
+            {key}
+          </Text>
+          {renderField ? (
+            renderField(key, value)
+          ) : (
+            <ReadOnlyFieldValue value={value} />
+          )}
+        </div>
+      ))}
+      {Object.keys(technical).length > 0 && (
+        <details>
+          <summary className="cursor-pointer">
+            <Text font="secondary-action" color="text-03">
+              Technical metadata (read only)
+            </Text>
+          </summary>
+          <div className="max-h-96 overflow-auto pt-2">
+            <ReadOnlyFieldValue value={technical} />
+          </div>
+        </details>
+      )}
+    </div>
+  );
 }
 
 export function ReadOnlyFieldValue({ value }: { value: unknown }) {
@@ -126,7 +179,16 @@ function FieldTable({
                 {renderValue ? (
                   renderValue(key, fields[key])
                 ) : key === "text" && typeof fields[key] === "string" ? (
-                  <ChunkContent text={fields[key]} />
+                  <div
+                    className="max-h-96 overflow-auto"
+                    tabIndex={0}
+                    role="region"
+                    aria-label="Before source text"
+                  >
+                    <ChunkContent text={fields[key]} />
+                  </div>
+                ) : key === "metadata" && isRecord(fields[key]) ? (
+                  <MetadataFieldsReview metadata={fields[key]} />
                 ) : (
                   <ReadOnlyFieldValue value={fields[key]} />
                 )}

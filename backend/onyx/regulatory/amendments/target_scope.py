@@ -8,6 +8,7 @@ from dataclasses import replace
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -20,6 +21,7 @@ from onyx.regulatory.amendments.structural_target import (
 )
 from onyx.regulatory.article_scope import SourceFragment, article_scope_indices
 from onyx.regulatory.provision_identity import canonical_clause_label
+from onyx.regulatory.source_identity import source_file_identity_matches
 
 _UNIT_OPENING = re.compile(
     r"^(?:(?:EK|GEÇİCİ|GECICI|MÜKERRER|MUKERRER)\s+)?MADDE\s+\d+[a-z]?\s*[-–—:.]\s*",
@@ -147,6 +149,21 @@ def addition_source_identity_is_compatible(
     title = _fold_identity(instruction.target_source or "").strip()
     kind = re.search(r"\b(karar|kanun|teblig|yonetmelik)(?:i|u)?$", title)
     candidate_kind = candidate.metadata.get("document_type")
+    if (
+        candidate.source_verified
+        and candidate.verified_source_title
+        and source_file_identity_matches(
+            instruction.target_source or "",
+            candidate.verified_source_title,
+            candidate.verified_source_title,
+        )
+    ):
+        own_kind = re.search(
+            r"\b(karar|kanun|teblig|yonetmelik)(?:i|u)?$",
+            _fold_identity(candidate.verified_source_title).strip(),
+        )
+        if own_kind is not None:
+            candidate_kind = own_kind.group(1)
     known_kinds = {"karar", "kanun", "teblig", "yonetmelik"}
     if kind and isinstance(candidate_kind, str):
         normalized_kind = _fold_identity(candidate_kind).strip()
@@ -200,8 +217,11 @@ def validated_addition_anchor(
     """Require one identified source and, for a subunit, its actual parent."""
     target = parse_amendment_structural_target(instruction)
     subordinate = added_subordinate_unit_kind(instruction.instruction_text)
-    if subordinate is None and not explicitly_adds_top_level_provision(
-        instruction.instruction_text
+    annex = annex_item_addition(instruction.instruction_text)
+    if (
+        annex is None
+        and subordinate is None
+        and not explicitly_adds_top_level_provision(instruction.instruction_text)
     ):
         return None
     identified = [
@@ -220,6 +240,21 @@ def validated_addition_anchor(
     ]
     if len({candidate.user_file_id for candidate in identified}) != 1:
         return None
+    if annex is not None:
+        from onyx.regulatory.amendments.structural_target import (
+            normalize_appendix_label,
+        )
+
+        identified = [
+            candidate
+            for candidate in identified
+            if candidate.source_verified
+            and not candidate.source_ambiguous
+            and normalize_appendix_label(
+                str(candidate.metadata.get("appendix_label") or "")
+            )
+            == normalize_appendix_label(annex.appendix_label)
+        ]
     if subordinate is not None:
         if target is None or target.article_no is None:
             return None

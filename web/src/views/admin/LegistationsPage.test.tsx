@@ -56,6 +56,65 @@ let indexQueued: boolean;
 let searchChunks: RegulatoryChunk[];
 let lateChunkPage: boolean;
 
+test("shows an annex's original filename and verified parent from source metadata", async () => {
+  const original = fetchSpy.getMockImplementation()!;
+  fetchSpy.mockImplementation(async (input, init) => {
+    const url = new URL(String(input), "http://localhost:3000");
+    if (url.pathname === "/api/regulatory/catalog/files") {
+      return jsonResponse({
+        items: [
+          {
+            ...file,
+            name: "Başlık belirlenemedi",
+            source_lineage: {
+              version: 1,
+              intake_id: "intake",
+              package_id: "package",
+              document_set_id: 15,
+              document_id: "annex-member",
+              role: "annex",
+              source: {
+                asset_id: "annex-asset",
+                sha256: "a".repeat(64),
+                original_name: "20250105-2-1.pdf",
+                original_url: null,
+                final_url: null,
+              },
+              parents: [
+                {
+                  user_file_id: "parent-file",
+                  document_id: "parent-member",
+                  title: "Enerji Etiketlemesi Tebliği",
+                  source: {
+                    asset_id: "parent-asset",
+                    sha256: "b".repeat(64),
+                    original_name: "20250105-2.htm.pdf",
+                    original_url: null,
+                    final_url: null,
+                  },
+                  source_links: [],
+                },
+              ],
+              attachments: [],
+            },
+          },
+        ],
+        total: 1,
+        offset: 0,
+        limit: 25,
+      });
+    }
+    return original(input, init);
+  });
+  render(<LegistationsPage />);
+  expect(await screen.findByText("20250105-2-1.pdf")).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", {
+      name: "Ana dosyayı aç: Enerji Etiketlemesi Tebliği",
+    })
+  ).toBeInTheDocument();
+});
+
 function jsonResponse(body: unknown): Response {
   return { ok: true, json: async () => body } as Response;
 }

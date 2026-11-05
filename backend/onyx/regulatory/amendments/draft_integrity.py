@@ -36,9 +36,13 @@ def explicit_replacement_body(instruction_text: str) -> str | None:
 def explicit_added_body(instruction_text: str) -> str | None:
     from onyx.regulatory.amendments.new_provision_policy import (
         added_subordinate_unit_kind,
+        annex_item_addition,
         explicitly_adds_top_level_provision,
     )
 
+    annex_addition = annex_item_addition(instruction_text)
+    if annex_addition is not None:
+        return annex_addition.body
     if not (
         added_subordinate_unit_kind(instruction_text)
         or explicitly_adds_top_level_provision(instruction_text)
@@ -95,14 +99,53 @@ def validate_added_article_draft(
     heading_path: Sequence[str],
     old_chunk_id: str | None,
     insertion_order: Mapping[str, object] | None = None,
+    draft_text: str | None = None,
 ) -> None:
     """Reject stale drafts that confuse a new article with its neighbour."""
     from onyx.regulatory.amendments.new_provision_policy import (
+        annex_item_addition,
         explicitly_adds_top_level_provision,
     )
+    from onyx.regulatory.amendments.structural_target import normalize_appendix_label
     from onyx.regulatory.provision_identity import article_identity
 
     for instruction_text in instruction_texts:
+        annex = annex_item_addition(instruction_text)
+        if annex is not None:
+            if draft_text is None or _comparison_text(draft_text) != _comparison_text(
+                annex.body
+            ):
+                raise DraftIntegrityError(
+                    "New numbered annex item body must exactly match the supplied body"
+                )
+            ancestors = [
+                normalize_appendix_label(part)
+                for part in heading_path[:-1]
+                if re.match(r"^\s*ek(?:[\s-]|$)", part, re.IGNORECASE)
+            ]
+            if (
+                old_chunk_id is not None
+                or ancestors != [normalize_appendix_label(annex.appendix_label)]
+                or metadata.get("article_no") is not None
+                or metadata.get("paragraph_no") != annex.item_no
+                or normalize_appendix_label(str(metadata.get("appendix_label") or ""))
+                != normalize_appendix_label(annex.appendix_label)
+                or not heading_path
+                or not re.match(
+                    rf"^\s*{re.escape(annex.item_no)}\.\s", heading_path[-1]
+                )
+                or insertion_order is None
+                or normalize_appendix_label(
+                    str(insertion_order.get("appendix_label") or "")
+                )
+                != normalize_appendix_label(annex.appendix_label)
+                or insertion_order.get("paragraph_no") != annex.item_no
+                or insertion_order.get("article_no") is not None
+            ):
+                raise DraftIntegrityError(
+                    "New numbered annex item requires its own verified identity and insertion order"
+                )
+            continue
         if not explicitly_adds_top_level_provision(instruction_text):
             continue
         expected = explicit_added_article_identity(instruction_text)

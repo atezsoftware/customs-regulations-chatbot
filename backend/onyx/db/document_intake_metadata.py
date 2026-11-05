@@ -46,6 +46,28 @@ from onyx.regulatory.document_intake.metadata import (
     validate_metadata_response,
 )
 from onyx.regulatory.document_intake.metadata_checkpoint import MetadataLeaseLost
+from onyx.regulatory.source_document_identity import (
+    DocumentIdentityEvidence,
+    derive_document_identity,
+)
+
+_AUTOMATED_SOURCES = frozenset({"llm", "source_opening"})
+
+
+def _own_opening_identity(
+    rows: Sequence[RegulatoryChunk],
+) -> DocumentIdentityEvidence | None:
+    first = next(
+        (row for row in rows if not is_hierarchical_aggregate_chunk(row)), None
+    )
+    if first is None or first.position != 0 or not first.heading_path:
+        return None
+    return derive_document_identity(
+        user_file_id=str(first.user_file_id),
+        source_chunk_id=first.id,
+        text=first.text,
+        root_heading=first.heading_path[0],
+    )
 
 
 def _audit(chunk: RegulatoryChunk) -> dict[str, Any]:
@@ -160,7 +182,10 @@ def invalidate_metadata_file_context(rows: Sequence[RegulatoryChunk]) -> None:
         audit, metadata = _audit(row), deepcopy(row.chunk_metadata)
         audit["input_stale"] = True
         for key, entry in audit["fields"].items():
-            if not isinstance(entry, dict) or entry.get("source") != "llm":
+            if (
+                not isinstance(entry, dict)
+                or entry.get("source") not in _AUTOMATED_SOURCES
+            ):
                 continue
             entry["stale"] = True
             if key in VALIDITY_FIELDS:
@@ -184,7 +209,7 @@ def _stale_model_fields(row: RegulatoryChunk) -> set[str]:
         key
         for key, entry in fields.items()
         if isinstance(entry, dict)
-        and entry.get("source") == "llm"
+        and entry.get("source") in _AUTOMATED_SOURCES
         and entry.get("stale") is True
     }
 
@@ -200,7 +225,10 @@ def metadata_receipts_current(rows: Sequence[RegulatoryChunk], input_hash: str) 
         and isinstance(audit.get("fields"), dict)
         and all(
             isinstance(entry, dict)
-            and (entry.get("source") != "llm" or entry.get("stale") is False)
+            and (
+                entry.get("source") not in _AUTOMATED_SOURCES
+                or entry.get("stale") is False
+            )
             for entry in audit["fields"].values()
         )
         for row in canonical
@@ -313,6 +341,7 @@ def load_metadata_work(
 def validate_metadata_receipt_evidence(
     rows: Sequence[RegulatoryChunk], chunks: Sequence[MetadataChunk]
 ) -> None:
+    own_identity = _own_opening_identity(rows)
     for row in rows:
         if is_hierarchical_aggregate_chunk(row):
             continue
@@ -320,10 +349,26 @@ def validate_metadata_receipt_evidence(
         fields = audit.get("fields") if isinstance(audit, dict) else None
         if not isinstance(fields, dict):
             continue
+        for field, entry in fields.items():
+            if not isinstance(entry, dict) or entry.get("source") != "source_opening":
+                continue
+            if (
+                own_identity is None
+                or field not in own_identity.fields
+                or entry.get("source_chunk_id") != own_identity.source_chunk_id
+                or entry.get("source_sha256") != own_identity.source_sha256
+                or row.chunk_metadata.get(field) != own_identity.fields[field]
+            ):
+                raise ValueError(
+                    "Saved own document identity differs from its source opening"
+                )
         facts = []
         for field in ("article_no", "paragraph_no", "clause_label"):
             entry = fields.get(field)
-            if not isinstance(entry, dict) or entry.get("source") != "llm":
+            if (
+                not isinstance(entry, dict)
+                or entry.get("source") not in _AUTOMATED_SOURCES
+            ):
                 continue
             facts.append(
                 LegalMetadataFact.model_validate(
@@ -494,6 +539,7 @@ def apply_metadata_results(
     ]
     if len(set(received)) != len(received) or set(received) != set(by_id):
         raise ValueError("Metadata windows do not cover the exact document")
+    own_identity = _own_opening_identity(rows)
     for request_hash, result in results:
         validate_metadata_response(
             result.model_dump_json(),
@@ -504,7 +550,10 @@ def apply_metadata_results(
             row = by_id[target.chunk_id]
             metadata, audit = deepcopy(row.chunk_metadata), _audit(row)
             for field, entry in list(audit["fields"].items()):
-                if entry.get("source") == "llm" and entry.get("stale") is True:
+                if (
+                    entry.get("source") in _AUTOMATED_SOURCES
+                    and entry.get("stale") is True
+                ):
                     audit["fields"].pop(field)
                     if field in VALIDITY_FIELDS:
                         setattr(row, field, None)
@@ -535,6 +584,22 @@ def apply_metadata_results(
                     "reference_chunk_id": fact.reference_chunk_id,
                     "stale": False,
                 }
+            if own_identity is not None:
+                for field, value in own_identity.fields.items():
+                    if audit["fields"].get(field, {}).get("source") == "manual":
+                        continue
+                    if value is None:
+                        metadata.pop(field, None)
+                    else:
+                        metadata[field] = value
+                    audit["fields"][field] = {
+                        "source": "source_opening",
+                        "basis": "own_source_opening",
+                        "source_chunk_id": own_identity.source_chunk_id,
+                        "source_sha256": own_identity.source_sha256,
+                        "evidence_quote": value,
+                        "stale": False,
+                    }
             if (
                 row.validity_start_date
                 and row.validity_end_date

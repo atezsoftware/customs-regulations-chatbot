@@ -26,12 +26,14 @@ class OrderMember(BaseModel):
     derived: bool = False
     source_sha256: str | None = None
     direct_clause_parent: bool = False
+    appendix_label: str | None = Field(default=None, exclude=True)
+    annex_item_no: str | None = Field(default=None, exclude=True)
 
 
 class InsertionOrder(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     baseline_sha256: str
-    article_no: str
+    article_no: str | None
     paragraph_no: str | None
     clause_label: str | None
     after_article_no: str | None = None
@@ -40,6 +42,9 @@ class InsertionOrder(BaseModel):
     after_source_sha256: str | None = None
     before_source_sha256: str | None = None
     position: int = Field(ge=0)
+    appendix_label: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def reconcile_insertion_order(
@@ -53,6 +58,7 @@ def reconcile_insertion_order(
         "after_article_no",
         "after_chunk_id",
         "before_chunk_id",
+        "appendix_label",
     )
     if any(
         getattr(reviewed, field) != getattr(current, field) for field in identity_fields
@@ -72,12 +78,19 @@ def reconcile_insertion_order(
 def plan_insertion(
     rows: list[OrderMember],
     *,
-    article_no: str,
+    article_no: str | None,
     paragraph_no: str | None,
     clause_label: str | None,
     after_article_no: str | None = None,
+    appendix_label: str | None = None,
 ) -> InsertionOrder:
     ordered = sorted(rows, key=lambda row: (row.position, row.id))
+    if appendix_label is not None:
+        return _plan_annex_item_insertion(
+            ordered, appendix_label, article_no, paragraph_no, clause_label
+        )
+    if article_no is None:
+        raise InsertionOrderError("Insertion article identity is missing")
     if paragraph_no is None and clause_label is None:
         return _plan_article_insertion(ordered, article_no, after_article_no)
     scope = [
@@ -158,6 +171,84 @@ def plan_insertion(
         after_chunk_id=after.id if after else None,
         before_chunk_id=before.id if before else None,
         after_source_sha256=after.source_sha256 if after else None,
+        before_source_sha256=before.source_sha256 if before else None,
+        position=position,
+    )
+
+
+def _plan_annex_item_insertion(
+    ordered: list[OrderMember],
+    appendix_label: str,
+    article_no: str | None,
+    paragraph_no: str | None,
+    clause_label: str | None,
+) -> InsertionOrder:
+    from onyx.regulatory.amendments.structural_target import normalize_appendix_label
+
+    if (
+        article_no is not None
+        or clause_label is not None
+        or paragraph_no is None
+        or not paragraph_no.isdecimal()
+    ):
+        raise InsertionOrderError(
+            "Numbered annex item requires its own annex and numeric identity"
+        )
+    active = [r for r in ordered if r.active and not r.derived]
+    scope = [
+        r
+        for r in active
+        if r.appendix_label is not None
+        and normalize_appendix_label(r.appendix_label)
+        == normalize_appendix_label(appendix_label)
+    ]
+    if not scope or any(
+        r.article_no is not None
+        or r.clause_label is not None
+        or (r.paragraph_no is not None and not r.paragraph_no.isdecimal())
+        for r in scope
+    ):
+        raise InsertionOrderError("Numbered annex item parent could not be verified")
+    if any(
+        r not in scope and scope[0].position <= r.position <= scope[-1].position
+        for r in active
+    ):
+        raise InsertionOrderError("Annex list contains an unrelated source boundary")
+    numbered = [r for r in scope if r.paragraph_no is not None]
+    if any(r.annex_item_no != r.paragraph_no for r in numbered):
+        raise InsertionOrderError(
+            "Annex item identity differs from its own source text"
+        )
+    ranks = [int(r.paragraph_no or "0") for r in numbered]
+    target = int(paragraph_no)
+    if target in ranks:
+        raise InsertionOrderError(
+            "Insertion identity already exists; a reviewed renumbering is required"
+        )
+    if not numbered or ranks != sorted(ranks):
+        raise InsertionOrderError("Annex item order conflicts with its source metadata")
+    lower = [r for r in numbered if int(r.paragraph_no or "0") < target]
+    upper = [r for r in numbered if int(r.paragraph_no or "0") > target]
+    after = lower[-1] if lower else scope[0]
+    before = (
+        upper[0]
+        if upper
+        else next((r for r in active if r.position > scope[-1].position), None)
+    )
+    position = before.position if before else scope[-1].position + 1
+    if after.position >= position:
+        raise InsertionOrderError("Annex insertion has overlapping source positions")
+    return InsertionOrder(
+        baseline_sha256=publication_digest(
+            [r.model_dump(mode="json") for r in ordered]
+        ),
+        article_no=None,
+        paragraph_no=paragraph_no,
+        clause_label=None,
+        appendix_label=appendix_label,
+        after_chunk_id=after.id,
+        before_chunk_id=before.id if before else None,
+        after_source_sha256=after.source_sha256,
         before_source_sha256=before.source_sha256 if before else None,
         position=position,
     )

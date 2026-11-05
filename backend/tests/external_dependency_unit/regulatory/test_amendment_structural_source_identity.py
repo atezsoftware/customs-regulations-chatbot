@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -9,7 +10,13 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from onyx.db.models import DocumentSet, RegulatoryChunk, UserFile
+from onyx.db.enums import UserFileStatus
+from onyx.db.models import (
+    DocumentSet,
+    RegulatoryChunk,
+    RegulatoryFilePublication,
+    UserFile,
+)
 from onyx.db.regulatory_amendment_targets import (
     load_amendment_source_identities,
     load_amendment_structural_source_titles,
@@ -19,10 +26,32 @@ from onyx.regulatory.amendments.models import AmendmentInstruction
 from tests.external_dependency_unit.regulatory.test_amendment_sources import (
     source_session as source_session,
 )
-from tests.external_dependency_unit.regulatory.test_annex_baseline import _chunk, _file
+from tests.external_dependency_unit.regulatory.test_annex_baseline import _chunk
+from tests.external_dependency_unit.regulatory.test_annex_baseline import (
+    _file as _base_file,
+)
 
 _TITLE = "TEHLİKELİ MADDELERİN DEMİRYOLU İLE TAŞINMASI HAKKINDA YÖNETMELİK"
 _TARGET = "Tehlikeli Maddelerin Demiryolu ile Taşınması Hakkında Yönetmelik"
+
+
+def _file(session: Session, group: DocumentSet) -> UserFile:
+    file = _base_file(session, group)
+    file.status = UserFileStatus.COMPLETED
+    session.add(
+        RegulatoryFilePublication(
+            user_file_id=file.id,
+            scope_key="regulatory",
+            owner_id=uuid4(),
+            fencing_token=1,
+            lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            gate_closed=False,
+            epoch=1,
+            next_ordinal=0,
+        )
+    )
+    session.flush()
+    return file
 
 
 def _source(session: Session) -> tuple[DocumentSet, UserFile]:

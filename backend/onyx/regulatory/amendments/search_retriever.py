@@ -26,6 +26,9 @@ from onyx.context.search.retrieval.search_runner import (
 )
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.regulatory_amendment_source_families import (
+    resolve_amendment_source_family,
+)
 from onyx.db.regulatory_amendment_targets import (
     load_amendment_source_chunks,
     load_amendment_source_identities,
@@ -44,6 +47,7 @@ from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -263,6 +267,7 @@ class AmendmentSearchRetriever:
         adds_provision = bool(
             explicitly_adds_top_level_provision(instruction.instruction_text)
             or added_subordinate_unit_kind(instruction.instruction_text)
+            or annex_item_addition(instruction.instruction_text)
         )
         if source_files is not None and len(set(source_files)) > 1 and adds_provision:
             self.query_stats = []
@@ -318,7 +323,10 @@ class AmendmentSearchRetriever:
 
         if (
             not recovery
-            and added_subordinate_unit_kind(instruction.instruction_text) is not None
+            and (
+                added_subordinate_unit_kind(instruction.instruction_text) is not None
+                or annex_item_addition(instruction.instruction_text) is not None
+            )
             and source_files is not None
             and len(set(source_files)) == 1
             and validated_addition_anchor(instruction, structural) is not None
@@ -486,15 +494,20 @@ def build_amendment_search_retriever(
                 for chunk_id, row in rows.items()
             }
 
-    source_identities = load_amendment_source_identities(db_session, user_file_ids)
+    source_identities = load_amendment_source_identities(
+        db_session, user_file_ids, document_set_id=document_set_id
+    )
     source_chunks: dict[str, list[CandidateChunk]] = {}
-    source_file_cache: dict[str, list[str]] = {}
+    source_file_cache: dict[tuple[str, str | None], list[str]] = {}
+    source_title_cache: dict[tuple[str, str | None], dict[str, str]] = {}
 
     def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
         target = instruction.target_source or ""
         if not source_identity_distinguishing_tokens(target):
             return None
-        cache_key = " ".join(target.casefold().split())
+        structural_target = parse_amendment_structural_target(instruction)
+        appendix = structural_target.appendix_label if structural_target else None
+        cache_key = (" ".join(target.casefold().split()), appendix)
         if cache_key in source_file_cache:
             return source_file_cache[cache_key]
         files = [
@@ -502,6 +515,11 @@ def build_amendment_search_retriever(
             for source in source_identities
             if source_file_identity_matches(target, source.name, source.root_heading)
         ]
+        titles = {
+            str(source.user_file_id): source.root_heading or source.name
+            for source in source_identities
+            if str(source.user_file_id) in files
+        }
         if not files:
             with get_session_with_current_tenant() as identity_session:
                 structural_titles = load_amendment_structural_source_titles(
@@ -517,7 +535,27 @@ def build_amendment_search_retriever(
                 and source_file_identity_matches(target, source.name, title)
                 and source_file_identity_matches(target, source.root_heading, title)
             ]
+            titles = {
+                str(file_id): title
+                for file_id, title in structural_titles.items()
+                if str(file_id) in files
+            }
+        if files:
+            with get_session_with_current_tenant() as identity_session:
+                family = resolve_amendment_source_family(
+                    identity_session,
+                    document_set_id=document_set_id,
+                    user_file_ids=user_file_ids,
+                    matched_file_ids=[UUID(value) for value in files],
+                    appendix_label=appendix,
+                )
+            if family is not None:
+                files = [str(value) for value in family.target_file_ids]
+                primary_title = titles.get(str(family.primary_file_id))
+                if primary_title is not None:
+                    titles = {file_id: primary_title for file_id in files}
         source_file_cache[cache_key] = files
+        source_title_cache[cache_key] = titles
         return files
 
     def structural_candidate_loader(
@@ -542,6 +580,9 @@ def build_amendment_search_retriever(
                 user_file_id=str(match.chunk.user_file_id),
                 text=match.chunk.text,
                 source_name=match.source_name,
+                verified_source_title=source_title_cache.get(
+                    (normalized_source, target.appendix_label), {}
+                ).get(str(match.chunk.user_file_id)),
                 metadata={
                     **match.chunk.chunk_metadata,
                     "heading_path": list(match.chunk.heading_path),

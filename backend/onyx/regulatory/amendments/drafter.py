@@ -28,7 +28,7 @@ You will be given one or more amendment instructions, (if any) the existing chun
 The optional target_evidence describes a verified source heading when legacy metadata is stale. Use it for legal context without changing unrelated canonical metadata.
 
 For `new_chunk`:
-- `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes).
+- `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes). Never return blank text. When an entire identified article, paragraph or clause is repealed, preserve its own unit marker and use `(Mülga)` (e.g. `d) (Mülga)`); retain surrounding text for a partial repeal. Repeal takes effect on effective_start_date, which closes the previous version; do not make the repeal marker temporary unless the instruction explicitly says so.
 - `chunk_type`: usually stays the same as the old chunk; only change it if the nature of the amendment requires it.
 - `heading_path`: leave null to carry over the old chunk's heading_path unchanged. ONLY set this if there is NO old chunk (a brand-new article) — in that case you will be given a `sibling_reference` (an example chunk from the same document); base heading_path on sibling_reference's heading_path (same BÖLÜM/KISIM/top-level heading), updating only the MADDE number/title for the new article.
 - `metadata_changes`: ONLY the metadata fields that actually change (e.g. article_no if the article was renumbered). Do NOT repeat fields that stay the same — they carry over automatically from the old chunk. Leave empty ({}) if nothing in metadata changes.
@@ -50,6 +50,8 @@ Some instructions add a NEW paragraph (fıkra) or clause (bent) INSIDE an existi
 - `chunk_type`: "paragraph" for a fıkra, "clause" for a bent.
 - `metadata_changes`: carry article_no, article_title, document_type and document_number from `sibling_reference`, and set paragraph_no (for a fıkra) or clause_label (for a bent) to the marker the instruction assigns. Never invent a new article_no.
 - `heading_path`: base it on `sibling_reference`'s heading_path, keeping the same article heading and replacing only the terminal unit line.
+
+When the instruction adds a numbered item to an annex (for example Ek I with the supplied body "23. ..."), create only that new item. Preserve its exact supplied wording and numeric marker. Use chunk_type "paragraph", appendix_label from the target and paragraph_no "23". Do not invent article_no or a MADDE heading. Keep the verified source and annex heading prefix, followed by the new item heading. Never append the item into the existing annex header or rewrite existing numbered items; insertion order is determined by the server.
 
 You may also be given the full text of the amendment these instructions were taken from. Read it to interpret them — which source is being amended, what a term defined in another article means, and above all when the amendment enters into force, which is normally stated once in its own closing article and governs every instruction that does not carry a date of its own. That article is the answer for `effective_start_date` whenever the listed instruction is silent; resolve its relative phrase against the reference/publication date exactly as you would the instruction's own.
 

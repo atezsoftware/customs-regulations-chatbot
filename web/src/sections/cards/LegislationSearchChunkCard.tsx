@@ -6,6 +6,7 @@ import { SvgEdit, SvgFileText } from "@opal/icons";
 import type { LegislationSearchResult } from "@/lib/legistations/interfaces";
 import { chunkEditRestriction } from "@/lib/regulatory/chunkEditing";
 import { ChunkEditModal } from "@/sections/document-sets/RegulatoryFileDetails";
+import { legislationDisplayName } from "@/lib/legistations/sourceIdentity";
 
 interface LegislationSearchChunkCardProps {
   result: LegislationSearchResult;
@@ -34,7 +35,7 @@ export default function LegislationSearchChunkCard({
             title={`${sourceNumber ? `Kaynak [${sourceNumber}] · ` : ""}Chunk #${chunk.position}`}
           />
           <Text font="main-ui-action" as="h3">
-            {file.name}
+            {legislationDisplayName(file)}
           </Text>
           <Text
             font="secondary-body"

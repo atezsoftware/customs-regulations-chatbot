@@ -771,12 +771,15 @@ def _extract_metadata_document(
 
 
 def metadata_recipe_sha256() -> str:
+    from onyx.regulatory import source_document_identity
     from onyx.regulatory.document_intake import metadata_contract_retry
 
     return metadata_recipe_fingerprint(
         {
             "contract": inspect.getsource(metadata_contract),
             "contract_retry": inspect.getsource(metadata_contract_retry),
+            "own_identity": inspect.getsource(source_document_identity),
+            "apply_metadata": inspect.getsource(repository),
             **{
                 function.__name__: inspect.getsource(function)
                 for function in (

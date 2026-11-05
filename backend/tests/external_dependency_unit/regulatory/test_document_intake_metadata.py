@@ -35,6 +35,7 @@ from onyx.db.models import (
 )
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 from onyx.file_store.file_store import FileStore
+from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.document_intake import metadata_job
 from onyx.regulatory.document_intake.metadata import (
     METADATA_AUDIT_KEY,
@@ -853,3 +854,88 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         intake_id=batch.id, lease_token=token, tenant_id="public"
     )
     assert len(payloads) == (6 if repair_evidence else 5)
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_own_opening_identity_overrides_cited_number_and_survives_later_update(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    manual: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.db.regulatory_amendment_document_identity import load_document_identity
+
+    monkeypatch.setattr(
+        metadata, "get_default_file_store", lambda: PostgresBackedFileStore()
+    )
+    batch, members, token, article, closing = _ready_metadata(
+        intake_session, intake_owner
+    )
+    title = "ÖRNEK TERCİHLİ MENŞE KURALLARI HAKKINDA YÖNETMELİK"
+    article.text = f"**{title}**\n*Ticaret Bakanlığından:20.12.2025 tarih ve 33113 sayılı R.G.*\nMADDE 1- Amaç."
+    article.heading_path = [title, "MADDE 1"]
+    closing.text = "MADDE 2- 2017/10411 sayılı Karara atıf yapılır."
+    before = [(r.text, list(r.heading_path)) for r in (article, closing)]
+    for row in (article, closing):
+        row.chunk_metadata = {"document_type": "karar", "document_number": "2017/10411"}
+    if manual:
+        article.chunk_metadata = {
+            **article.chunk_metadata,
+            METADATA_AUDIT_KEY: {
+                "fields": {
+                    "document_number": {
+                        "source": "manual",
+                        "basis": "user_review",
+                        "stale": False,
+                    }
+                }
+            },
+        }
+    chunks = metadata.metadata_chunks([article, closing])
+    metadata.apply_metadata_results(
+        intake_session,
+        intake_id=batch.id,
+        lease_token=token,
+        document_id=members[0].id,
+        expected_input_sha256=metadata_input_hash(chunks),
+        results=[
+            (
+                "a" * 64,
+                LegalMetadataResult(
+                    chunks=[
+                        ChunkLegalMetadata(chunk_id=r.id, fields=[])
+                        for r in (article, closing)
+                    ]
+                ),
+            )
+        ],
+    )
+    assert [(r.text, list(r.heading_path)) for r in (article, closing)] == before
+    assert closing.chunk_metadata["document_type"] == "yonetmelik"
+    assert closing.chunk_metadata.get("document_number") is None
+    assert article.chunk_metadata.get("document_number") == (
+        "2017/10411" if manual else None
+    )
+    audit = closing.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_type"]
+    assert (
+        audit["source"] == "source_opening" and audit["source_chunk_id"] == article.id
+    )
+    proof = load_document_identity(intake_session, article.user_file_id)
+    assert proof is not None and proof.fields["document_type"] == "yonetmelik"
+    assert proof.fields["document_number"] is None
+    assert intake_session.get_one(UserFile, article.user_file_id).name == title
+    metadata.validate_metadata_receipt_evidence(
+        [article, closing], metadata.metadata_chunks([article, closing])
+    )
+    saved = deepcopy(closing.chunk_metadata)
+    closing.chunk_metadata = {**saved, "document_type": "karar"}
+    with pytest.raises(ValueError, match="own document identity"):
+        metadata.validate_metadata_receipt_evidence(
+            [article, closing], metadata.metadata_chunks([article, closing])
+        )
+    closing.chunk_metadata = saved
+    metadata.invalidate_metadata_file_context([article, closing])
+    assert (
+        closing.chunk_metadata[METADATA_AUDIT_KEY]["fields"]["document_type"]["stale"]
+        is True
+    )

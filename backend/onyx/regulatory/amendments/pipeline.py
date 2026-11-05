@@ -15,6 +15,10 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from onyx.db.models import RegulatoryChunk
+from onyx.db.regulatory_amendment_document_identity import (
+    IDENTITY_KEY,
+    load_document_identity,
+)
 from onyx.db.regulatory_chunks import (
     get_active_chunks_by_structural_reference,
     get_chunk_snapshot_by_id,
@@ -59,6 +63,7 @@ from onyx.regulatory.amendments.models import (
 )
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.pdf_vision import PdfBatchSource
@@ -70,6 +75,7 @@ from onyx.regulatory.amendments.structural_target import (
     parse_amendment_structural_target,
 )
 from onyx.regulatory.amendments.target_scope import validated_addition_anchor
+from onyx.regulatory.source_document_identity import DocumentIdentityEvidence
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -117,6 +123,7 @@ class InstructionDraftContext:
     expected_new_article_no: str | None = None
     heading_change_snapshots: list[dict[str, Any]] = field(default_factory=list)
     insertion_members: list["OrderMember"] | None = None
+    own_document_identity: DocumentIdentityEvidence | None = None
 
 
 def confirm_instruction_match(
@@ -151,6 +158,7 @@ def confirm_instruction_match(
     if match.old_chunk_id is not None and (
         explicitly_adds_top_level_provision(instruction.instruction_text)
         or added_subordinate_unit_kind(instruction.instruction_text)
+        or annex_item_addition(instruction.instruction_text)
     ):
         if decisions:
             decisions[-1]["rationale"] = (
@@ -188,6 +196,7 @@ def confirm_instruction_match(
         match.old_chunk_id is None
         and not explicitly_adds_top_level_provision(instruction.instruction_text)
         and added_subordinate_unit_kind(instruction.instruction_text) is None
+        and annex_item_addition(instruction.instruction_text) is None
     ):
         logger.warning(
             "Amendment matcher declined all candidates for an instruction that "
@@ -259,7 +268,15 @@ def load_instruction_draft_context(
             if instruction is not None
             else None
         )
-        expected_new_article_no = target.article_no if target is not None else None
+        expected_new_article_no = (
+            target.article_no
+            if target is not None
+            and (
+                instruction is None
+                or annex_item_addition(instruction.instruction_text) is None
+            )
+            else None
+        )
         if instruction is not None and explicitly_adds_top_level_provision(
             instruction.instruction_text
         ):
@@ -321,9 +338,18 @@ def load_instruction_draft_context(
         and (
             added_subordinate_unit_kind(instruction.instruction_text)
             or explicitly_adds_top_level_provision(instruction.instruction_text)
+            or annex_item_addition(instruction.instruction_text)
         )
         else None
     )
+    own_identity = (
+        load_document_identity(db_session, target_user_file_id)
+        if old_chunk is None
+        else None
+    )
+    if own_identity is not None and sibling_reference is not None:
+        sibling_reference["metadata"].update(own_identity.fields)
+        sibling_reference["document_identity"] = own_identity.model_dump(mode="json")
     return InstructionDraftContext(
         match=match,
         heading_change_snapshots=heading_snapshots,
@@ -336,6 +362,7 @@ def load_instruction_draft_context(
         base_heading_path=list(old_chunk.heading_path) if old_chunk else [],
         has_active_descendants=bool(descendants),
         expected_new_article_no=expected_new_article_no,
+        own_document_identity=own_identity,
         target_evidence=next(
             (
                 candidate.scope_evidence
@@ -386,6 +413,32 @@ def _added_unit_structure(
     """Use the supplied unit marker and verified parent, not model-made labels."""
     from onyx.regulatory.provision_identity import canonical_clause_label
 
+    annex = annex_item_addition(instruction.instruction_text)
+    if annex is not None:
+        from onyx.regulatory.amendments.structural_target import (
+            normalize_appendix_label,
+        )
+
+        path = list((sibling_reference or {}).get("heading_path") or [])
+        scope_index = next(
+            (
+                i
+                for i, part in enumerate(path)
+                if normalize_appendix_label(part)
+                == normalize_appendix_label(annex.appendix_label)
+            ),
+            None,
+        )
+        if scope_index is None or " ".join(text.split()) != " ".join(
+            annex.body.split()
+        ):
+            raise DraftIntegrityError(
+                "New annex item requires its complete supplied body and verified parent heading"
+            )
+        return {
+            "appendix_label": annex.appendix_label,
+            "paragraph_no": annex.item_no,
+        }, [*path[: scope_index + 1], text[:100]]
     kind = added_subordinate_unit_kind(instruction.instruction_text)
     target = parse_amendment_structural_target(instruction)
     if (
@@ -481,6 +534,11 @@ def _build_proposal_draft(
         **context.base_metadata,
         **draft.new_chunk.metadata_changes,
     }
+    if context.own_document_identity is not None:
+        merged_metadata.update(context.own_document_identity.fields)
+        merged_metadata[IDENTITY_KEY] = context.own_document_identity.model_dump(
+            mode="json"
+        )
     added_structure_verified = False
     if context.old_chunk_snapshot:
         canonical_metadata = dict(context.old_chunk_snapshot.get("metadata") or {})
@@ -500,6 +558,24 @@ def _build_proposal_draft(
         else list(draft.new_chunk.heading_path or [])
     )
     if not context.old_chunk_snapshot:
+        structure = _added_unit_structure(
+            instructions[0], draft.new_chunk.text, context.sibling_reference
+        )
+        if structure is not None:
+            added_structure_verified = True
+            unit_metadata, heading_path = structure
+            for key in ("paragraph_no", "clause_label", "subclause_label"):
+                merged_metadata.pop(key, None)
+            merged_metadata.update(unit_metadata)
+            if annex_item_addition(instructions[0].instruction_text) is not None:
+                merged_metadata.pop("article_no", None)
+                merged_metadata.pop("article_title", None)
+                chunk_type = "paragraph"
+            else:
+                chunk_type = added_subordinate_unit_kind(
+                    instructions[0].instruction_text
+                )
+
         expected_article = context.expected_new_article_no
         if (
             expected_article is None
@@ -527,16 +603,6 @@ def _build_proposal_draft(
             chunk_type = "article"
             for key in ("paragraph_no", "clause_label", "subclause_label"):
                 merged_metadata.pop(key, None)
-        structure = _added_unit_structure(
-            instructions[0], draft.new_chunk.text, context.sibling_reference
-        )
-        if structure is not None:
-            added_structure_verified = True
-            unit_metadata, heading_path = structure
-            for key in ("paragraph_no", "clause_label", "subclause_label"):
-                merged_metadata.pop(key, None)
-            merged_metadata.update(unit_metadata)
-            chunk_type = added_subordinate_unit_kind(instructions[0].instruction_text)
 
     if context.old_chunk_snapshot:
         heading_path = reconcile_existing_heading_path(
@@ -586,7 +652,8 @@ def _build_proposal_draft(
     ):
         from onyx.regulatory.amendments.insertion_order import plan_insertion
 
-        if not merged_metadata.get("article_no") or (
+        annex = annex_item_addition(instructions[0].instruction_text)
+        if (not merged_metadata.get("article_no") and annex is None) or (
             added_structure_verified
             and not (
                 merged_metadata.get("paragraph_no")
@@ -598,7 +665,10 @@ def _build_proposal_draft(
             )
         order = plan_insertion(
             context.insertion_members,
-            article_no=str(merged_metadata["article_no"]),
+            article_no=str(merged_metadata["article_no"])
+            if merged_metadata.get("article_no") is not None
+            else None,
+            appendix_label=annex.appendix_label if annex is not None else None,
             paragraph_no=str(merged_metadata["paragraph_no"])
             if merged_metadata.get("paragraph_no") is not None
             else None,
