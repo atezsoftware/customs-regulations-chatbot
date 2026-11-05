@@ -13,6 +13,7 @@ from onyx.context.search.enums import QueryType
 from onyx.context.search.models import IndexFilters, InferenceChunk
 from onyx.context.search.utils import get_query_embedding
 from onyx.db.document_intake import pending_intake_file_ids
+from onyx.db.document_intake_existing_relations import load_reviewed_file_relations
 from onyx.db.document_intake_source_lineage import load_intake_source_lineages
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission, UserFileStatus
@@ -81,6 +82,7 @@ def _file_snapshots(
     )
     pending = pending_intake_file_ids(db_session, file_ids, include_approving=True)
     lineages = load_intake_source_lineages(db_session, file_ids)
+    reviewed = load_reviewed_file_relations(db_session, file_ids)
     return {
         file.id: CatalogFile(
             id=file.id,
@@ -98,6 +100,7 @@ def _file_snapshots(
             ],
             pending_review=file.id in pending,
             source_lineage=lineages.get(file.id),
+            reviewed_relations=reviewed.get(file.id),
             regulatory_indexing_progress=(
                 RegulatoryIndexingProgressSnapshot.from_progress(progress[file.id])
                 if file.id in progress

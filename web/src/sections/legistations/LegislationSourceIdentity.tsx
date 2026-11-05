@@ -15,7 +15,6 @@ export default function LegislationSourceIdentity({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const lineage = file.source_lineage;
-  if (!lineage) return null;
 
   async function openFile(id: string) {
     setLoading(id);
@@ -32,13 +31,35 @@ export default function LegislationSourceIdentity({
     }
   }
 
-  const related = [
-    ...lineage.parents.map((item) => ({ ...item, label: "Ana dosya" })),
-    ...lineage.attachments.map((item) => ({ ...item, label: "Ek" })),
+  const linked = [
+    ...(lineage?.parents ?? []).map((item) => ({
+      user_file_id: item.user_file_id,
+      title: item.title,
+      original_name: item.source.original_name,
+      label: "Ana dosya",
+    })),
+    ...(file.reviewed_relations?.parents ?? []).map((item) => ({
+      ...item,
+      label: "Ana dosya",
+    })),
+    ...(lineage?.attachments ?? []).map((item) => ({
+      user_file_id: item.user_file_id,
+      title: item.title,
+      original_name: item.source.original_name,
+      label: "Ek",
+    })),
+    ...(file.reviewed_relations?.attachments ?? []).map((item) => ({
+      ...item,
+      label: "Ek",
+    })),
   ];
+  const related = [
+    ...new Map(linked.map((item) => [item.user_file_id, item])).values(),
+  ];
+  if (!lineage && related.length === 0) return null;
   return (
     <div className="flex flex-col gap-1 break-words [overflow-wrap:anywhere]">
-      {lineage.source.original_name !== file.name && (
+      {lineage && lineage.source.original_name !== file.name && (
         <Text font="secondary-body" color="text-03">
           {`Özgün dosya: ${lineage.source.original_name}`}
         </Text>
@@ -46,12 +67,12 @@ export default function LegislationSourceIdentity({
       {related.map((item) => {
         const title =
           !item.title.trim() || item.title === "Başlık belirlenemedi"
-            ? item.source.original_name
+            ? item.original_name || item.title
             : item.title;
         const label = `${item.label}: ${title}`;
         return onSelectFile ? (
           <div
-            key={item.document_id}
+            key={item.user_file_id}
             className="flex min-w-0 flex-col items-start gap-1"
           >
             <Text font="secondary-body" color="text-03">
@@ -72,7 +93,7 @@ export default function LegislationSourceIdentity({
             </Button>
           </div>
         ) : (
-          <Text key={item.document_id} font="secondary-body" color="text-03">
+          <Text key={item.user_file_id} font="secondary-body" color="text-03">
             {label}
           </Text>
         );

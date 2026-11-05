@@ -7,8 +7,12 @@ from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
+from onyx.db.document_intake_existing_relations import load_reviewed_file_relations
+from onyx.db.document_intake_source_reference import (
+    intake_source_reference as _source_reference,
+)
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import (
     AmendmentSourcePackage,
@@ -40,34 +44,10 @@ _SUBPROVISION = re.compile(r"^\s*\(?(?:\d{1,3}[.)]|[a-zçğıöşü]\))", re.IGN
 
 @dataclass(frozen=True)
 class AmendmentSourceFamily:
-    intake_id: UUID
+    intake_id: UUID | None
     primary_file_id: UUID
     member_file_ids: tuple[UUID, ...]
     target_file_ids: tuple[UUID, ...]
-
-
-def _source_reference(
-    package: AmendmentSourcePackage,
-    member: RegulatoryDocumentIntakeFile,
-    asset: RegulatorySourceAsset,
-    file: UserFile,
-) -> dict[str, object]:
-    return {
-        "package_id": str(package.id),
-        "asset_id": str(asset.id),
-        "asset_sha256": asset.sha256,
-        "asset_file_id": asset.file_id,
-        "prepared_file_id": asset.text_file_id,
-        "prepared_sha256": asset.text_sha256,
-        "original_file_id": file.file_id,
-        "manifest_file_id": package.manifest_file_id,
-        "manifest_sha256": package.manifest_sha256,
-        "role": member.role,
-        "parent_document_id": str(member.parent_document_id)
-        if member.parent_document_id
-        else None,
-        "relationships": member.relationships,
-    }
 
 
 def _component(
@@ -171,6 +151,122 @@ def resolve_amendment_source_family(
     appendix_label: str | None = None,
 ) -> AmendmentSourceFamily | None:
     """None preserves the caller's original ambiguity; no file/version is guessed."""
+    matched, scope = set(matched_file_ids), set(user_file_ids)
+    if not 1 <= len(matched) <= _MAX_MEMBERS or not matched <= scope:
+        return None
+    base = _resolve_intake_source_family(
+        db_session,
+        document_set_id=document_set_id,
+        user_file_ids=user_file_ids,
+        matched_file_ids=matched_file_ids,
+    )
+    reviewed = load_reviewed_file_relations(
+        db_session,
+        list(base.member_file_ids) if base else list(matched),
+        document_set_id=document_set_id,
+    )
+    parents = (
+        [base.primary_file_id]
+        if base and any(relation.attachments for relation in reviewed.values())
+        else [
+            file_id
+            for file_id in matched
+            if file_id in reviewed and reviewed[file_id].attachments
+        ]
+    )
+    if len(parents) > 1:
+        return None
+    if parents:
+        primary_id = parents[0]
+        attachments = [
+            item
+            for relation in reviewed.values()
+            for item in relation.attachments
+            if item.user_file_id in scope
+        ]
+        if attachments:
+            related: set[UUID] = set()
+            intakes: set[UUID] = set()
+            pending: list[tuple[UUID, UUID | None]] = [(primary_id, None)]
+            while pending:
+                root_id, reviewed_parent = pending.pop()
+                if root_id in related:
+                    return None
+                internal = _resolve_intake_source_family(
+                    db_session,
+                    document_set_id=document_set_id,
+                    user_file_ids=user_file_ids,
+                    matched_file_ids=[root_id],
+                    reviewed_parent_file_id=reviewed_parent,
+                )
+                if internal is None:
+                    parent_member = aliased(RegulatoryDocumentIntakeFile)
+                    child_member = aliased(RegulatoryDocumentIntakeFile)
+                    has_internal_child = db_session.scalar(
+                        select(child_member.id)
+                        .join(
+                            parent_member,
+                            child_member.parent_document_id == parent_member.id,
+                        )
+                        .where(
+                            parent_member.user_file_id == root_id,
+                            child_member.status != "source_evidence",
+                        )
+                        .limit(1)
+                    )
+                    if has_internal_child is not None:
+                        return None
+                component = set(internal.member_file_ids) if internal else {root_id}
+                if component & related:
+                    return None
+                related |= component
+                if not related <= scope or len(related) > _MAX_MEMBERS:
+                    return None
+                if internal is not None and internal.intake_id is not None:
+                    intakes.add(internal.intake_id)
+                component_relations = load_reviewed_file_relations(
+                    db_session, list(component), document_set_id=document_set_id
+                )
+                for owner_id, relations in component_relations.items():
+                    for attachment in relations.attachments:
+                        if attachment.user_file_id in scope:
+                            intakes.add(attachment.intake_id)
+                            pending.append((attachment.user_file_id, owner_id))
+                if len(pending) + len(related) > _MAX_MEMBERS:
+                    return None
+            if not matched <= related:
+                return None
+            targets = (
+                {primary_id}
+                if appendix_label is None
+                else _appendix_files(db_session, related, appendix_label)
+            )
+            if targets is None:
+                return None
+            return AmendmentSourceFamily(
+                next(iter(intakes)) if len(intakes) == 1 else None,
+                primary_id,
+                tuple(sorted(related)),
+                tuple(sorted(targets)),
+            )
+    return _resolve_intake_source_family(
+        db_session,
+        document_set_id=document_set_id,
+        user_file_ids=user_file_ids,
+        matched_file_ids=matched_file_ids,
+        appendix_label=appendix_label,
+    )
+
+
+def _resolve_intake_source_family(
+    db_session: Session,
+    *,
+    document_set_id: int,
+    user_file_ids: Sequence[UUID],
+    matched_file_ids: Sequence[UUID],
+    appendix_label: str | None = None,
+    reviewed_parent_file_id: UUID | None = None,
+) -> AmendmentSourceFamily | None:
     matched, scope = set(matched_file_ids), set(user_file_ids)
     if not 1 <= len(matched) <= _MAX_MEMBERS or not matched <= scope:
         return None
@@ -342,39 +438,46 @@ def resolve_amendment_source_family(
             or decision.disposition != "legislation"
             or decision.duplicate_of_document_id is not None
             or decision.existing_parent_file_id
-            not in {None, parent.user_file_id if parent else None}
+            not in {None, parent.user_file_id if parent else reviewed_parent_file_id}
         ):
             return None
     targets = {primary.user_file_id}
     if appendix_label is not None:
-        wanted = normalize_appendix_label(appendix_label)
-        rows = list(
-            db_session.scalars(
-                select(RegulatoryChunk)
-                .where(
-                    RegulatoryChunk.user_file_id.in_(files),
-                    RegulatoryChunk.status == "active",
-                    RegulatoryChunk.superseded_by_chunk_id.is_(None),
-                    RegulatoryChunk.chunk_type.is_distinct_from(
-                        "hierarchical_aggregate"
-                    ),
-                    RegulatoryChunk.chunk_metadata[
-                        "chunk_variant"
-                    ].astext.is_distinct_from("hierarchical_aggregate"),
-                    RegulatoryChunk.chunk_metadata[
-                        "bound_to_regulatory_chunk_id"
-                    ].astext.is_(None),
-                )
-                .limit(_MAX_STRUCTURAL_ROWS + 1)
-            )
-        )
-        if len(rows) > _MAX_STRUCTURAL_ROWS:
+        selected = _appendix_files(db_session, files, appendix_label)
+        if selected is None:
             return None
-        targets = {
-            row.user_file_id
-            for row in rows
-            if _own_appendix(list(row.heading_path), dict(row.chunk_metadata), wanted)
-        }
+        targets = selected
     return AmendmentSourceFamily(
         batch.id, primary.user_file_id, tuple(sorted(files)), tuple(sorted(targets))
     )
+
+
+def _appendix_files(
+    session: Session, files: set[UUID], appendix_label: str
+) -> set[UUID] | None:
+    wanted = normalize_appendix_label(appendix_label)
+    rows = list(
+        session.scalars(
+            select(RegulatoryChunk)
+            .where(
+                RegulatoryChunk.user_file_id.in_(files),
+                RegulatoryChunk.status == "active",
+                RegulatoryChunk.superseded_by_chunk_id.is_(None),
+                RegulatoryChunk.chunk_type.is_distinct_from("hierarchical_aggregate"),
+                RegulatoryChunk.chunk_metadata["chunk_variant"].astext.is_distinct_from(
+                    "hierarchical_aggregate"
+                ),
+                RegulatoryChunk.chunk_metadata[
+                    "bound_to_regulatory_chunk_id"
+                ].astext.is_(None),
+            )
+            .limit(_MAX_STRUCTURAL_ROWS + 1)
+        )
+    )
+    if len(rows) > _MAX_STRUCTURAL_ROWS:
+        return None
+    return {
+        row.user_file_id
+        for row in rows
+        if _own_appendix(list(row.heading_path), dict(row.chunk_metadata), wanted)
+    }

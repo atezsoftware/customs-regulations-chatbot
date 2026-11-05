@@ -36,3 +36,19 @@ class IntakeFileSourceLineage(BaseModel):
     source: IntakeOriginalSource
     parents: list[IntakeRelatedFile] = Field(default_factory=list)
     attachments: list[IntakeRelatedFile] = Field(default_factory=list)
+
+
+class ReviewedRelatedFile(BaseModel):
+    user_file_id: UUID
+    title: str
+    original_name: str | None
+    source_url: str | None
+    document_set_id: int
+    intake_id: UUID
+    review_decision_id: UUID
+    basis: Literal["reviewed_existing_parent"] = "reviewed_existing_parent"
+
+
+class ReviewedFileRelations(BaseModel):
+    parents: list[ReviewedRelatedFile] = Field(default_factory=list)
+    attachments: list[ReviewedRelatedFile] = Field(default_factory=list)

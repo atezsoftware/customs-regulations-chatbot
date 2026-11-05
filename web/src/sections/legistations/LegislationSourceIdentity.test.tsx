@@ -47,6 +47,35 @@ const file: LegislationFile = {
 
 afterEach(() => jest.restoreAllMocks());
 
+test("shows a reviewed attachment on an existing file without an intake package", () => {
+  const existing = {
+    ...file,
+    name: "Existing parent",
+    source_lineage: null,
+    reviewed_relations: {
+      parents: [],
+      attachments: [
+        {
+          user_file_id: "standalone-annex",
+          title: "Başlık belirlenemedi",
+          original_name: "standalone-annex.pdf",
+          source_url: null,
+          document_set_id: 15,
+          intake_id: "intake",
+          review_decision_id: "review",
+          basis: "reviewed_existing_parent" as const,
+        },
+      ],
+    },
+  };
+  render(
+    <LegislationSourceIdentity file={existing} onSelectFile={jest.fn()} />
+  );
+  expect(
+    screen.getByRole("button", { name: "Eki aç: standalone-annex.pdf" })
+  ).toBeVisible();
+});
+
 test("keeps long legal titles in wrapping text with a short navigation action", () => {
   const title = "Çevreye Duyarlı Tasarım Gereklilikleri Tebliği "
     .repeat(8)

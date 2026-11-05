@@ -20,6 +20,7 @@ from onyx.regulatory.amendments.structural_target import (
 )
 from onyx.regulatory.article_scope import SourceFragment, article_scope_indices
 from onyx.regulatory.provision_identity import canonical_clause_label
+from onyx.regulatory.source_identity import source_file_identity_matches
 
 _UNIT_OPENING = re.compile(
     r"^(?:(?:EK|GEÇİCİ|GECICI|MÜKERRER|MUKERRER)\s+)?MADDE\s+\d+[a-z]?\s*[-–—:.]\s*",
@@ -147,6 +148,21 @@ def addition_source_identity_is_compatible(
     title = _fold_identity(instruction.target_source or "").strip()
     kind = re.search(r"\b(karar|kanun|teblig|yonetmelik)(?:i|u)?$", title)
     candidate_kind = candidate.metadata.get("document_type")
+    if (
+        candidate.source_verified
+        and candidate.verified_source_title
+        and source_file_identity_matches(
+            instruction.target_source or "",
+            candidate.verified_source_title,
+            candidate.verified_source_title,
+        )
+    ):
+        own_kind = re.search(
+            r"\b(karar|kanun|teblig|yonetmelik)(?:i|u)?$",
+            _fold_identity(candidate.verified_source_title).strip(),
+        )
+        if own_kind is not None:
+            candidate_kind = own_kind.group(1)
     known_kinds = {"karar", "kanun", "teblig", "yonetmelik"}
     if kind and isinstance(candidate_kind, str):
         normalized_kind = _fold_identity(candidate_kind).strip()
