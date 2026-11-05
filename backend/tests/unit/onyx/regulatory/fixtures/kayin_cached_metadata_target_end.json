@@ -1,0 +1,68 @@
+{
+  "chunks": [
+    {
+      "chunk_id": "rc_150512e35ab74a5f76ba408380614be5a551131d",
+      "text": "T.C.\nTARIM VE ORMAN BAKANLIĞI\nOrman Genel Müdürlüğü\nSayı\n:\nE-23776183-310.99-20377220\nKonu\n:\nTomruk İhracatı (4403)\n16.07.2026 / 20377220\nDAĞITIM YERLERİNE\nİlgi\n:\n25.05.2022 tarihli ve 23776183-310.99-4518694 sayılı yazımız.\nBilindiği gibi, İhracı Kayda Bağlı Mallara İlişkin Tebliğde değişiklik yapılmış olup, yapılan değişiklik 22 Mart 2018 tarih ve 30368 sayılı Resmi Gazetede yayımlanmıştır. Yayımlanan bu tebliğ ile \"\nOrman Ağacı Tomrukları",
+      "heading_path": [
+        "TARIM VE ORMAN BAKANLIĞI"
+      ],
+      "chunk_type": "free_text",
+      "structural_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "article_title": null,
+        "document_date": null,
+        "document_type": "unknown",
+        "appendix_label": null,
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null
+      }
+    },
+    {
+      "chunk_id": "rc_81f533bd5df07520ce07ee35657bcce8845c1a58",
+      "text": "(GTİP No: 44.03) (19/9/1996 tarihli ve 22762 sayılı Resmî Gazetede yayımlanan İhracı Yasak ve Ön İzne Bağlı Mallara İlişkin Tebliğ (İhracat 96/31)'in ekinde yer alan İhracı Yasak Mallar Listesinde yer alan ağaçların tomrukları hariç olmak üzere)\"\nihracı kayda bağlanmıştır. Bu kapsamda;\n- Her türlü orman ağaçlarına ait tomruk ihracatına kayıt verilmemesi, yönünde Genel Müdürlüğümüzce görüş bildirilmiştir.\nAncak, kayın ürünlerinde son aylarda özellikle İran savaşına bağlı olarak tomruk\nsatışlarında sıkıntı yaşanmaya başlanılmıştır. Satış yerlerine taşınan ürünlerin satılamaması durumunda yaz sıcaklığından etkilenmekte, bu nedenle ürünlerde çatlamalar ve kalite kaybı meydana gelmektedir.",
+      "heading_path": [
+        "TARIM VE ORMAN BAKANLIĞI"
+      ],
+      "chunk_type": "free_text",
+      "structural_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "article_title": null,
+        "document_date": null,
+        "document_type": "unknown",
+        "appendix_label": null,
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null
+      }
+    },
+    {
+      "chunk_id": "rc_26e88bced7b72f5cd0bc9f325e4eb3b3ee67b7fb",
+      "text": "Bu kapsamda değerlendirildiğinde Ek-1'de de görüleceği üzere 4403 kodunda yer alan kayın tomrukların ihracatına 31.12.2026 tarihine kadar kayıt verilmesi, 01.01.2027 tarihinden sonraki süreçte kayıt verilmemesinin uygun olacağı değerlendirilmiştir.\nGereğini bilgilerinize arz ederim.\nMustafa ÖZKAYA\nGenel Müdür a.\nGenel Müdür Yardımcısı\nEk:\nGTİP 4403\nDağıtım:\nGereği:\nBilgi:\nTİCARET BAKANLIĞINA\nOrman Bölge Müdürlüklerine\n(İhracat Genel Müdürlüğü)\nSE",
+      "heading_path": [
+        "TARIM VE ORMAN BAKANLIĞI"
+      ],
+      "chunk_type": "free_text",
+      "structural_metadata": {
+        "article_no": null,
+        "table_index": null,
+        "clause_label": null,
+        "paragraph_no": null,
+        "article_title": null,
+        "document_date": null,
+        "document_type": "unknown",
+        "appendix_label": null,
+        "document_number": null,
+        "subclause_label": null,
+        "table_row_index": null
+      }
+    }
+  ],
+  "response": "{\"chunks\":[{\"chunk_id\":\"rc_150512e35ab74a5f76ba408380614be5a551131d\",\"fields\":[{\"field\":\"document_title\",\"value\":\"Tomruk İhracatı (4403)\",\"evidence_id\":\"10359c75d44b8ddb1dc5d759a6d55a1e318c6179bf749aa92158360ebadcf049\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_number\",\"value\":\"E-23776183-310.99-20377220\",\"evidence_id\":\"cbe496558fd01e6b7bff1f4fb9dfa2db9472e2eaa6e63aa3874d1a17fc090457\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_date\",\"value\":\"2026-07-16\",\"evidence_id\":\"fa9dbfbee660cea808e5a5808e59bb5fdea7411e7d57d57e7b794b7a2dab3546\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"}]},{\"chunk_id\":\"rc_81f533bd5df07520ce07ee35657bcce8845c1a58\",\"fields\":[{\"field\":\"document_title\",\"value\":\"Tomruk İhracatı (4403)\",\"evidence_id\":\"10359c75d44b8ddb1dc5d759a6d55a1e318c6179bf749aa92158360ebadcf049\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_number\",\"value\":\"E-23776183-310.99-20377220\",\"evidence_id\":\"cbe496558fd01e6b7bff1f4fb9dfa2db9472e2eaa6e63aa3874d1a17fc090457\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_date\",\"value\":\"2026-07-16\",\"evidence_id\":\"fa9dbfbee660cea808e5a5808e59bb5fdea7411e7d57d57e7b794b7a2dab3546\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"}]},{\"chunk_id\":\"rc_26e88bced7b72f5cd0bc9f325e4eb3b3ee67b7fb\",\"fields\":[{\"field\":\"document_title\",\"value\":\"Tomruk İhracatı (4403)\",\"evidence_id\":\"10359c75d44b8ddb1dc5d759a6d55a1e318c6179bf749aa92158360ebadcf049\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_number\",\"value\":\"E-23776183-310.99-20377220\",\"evidence_id\":\"cbe496558fd01e6b7bff1f4fb9dfa2db9472e2eaa6e63aa3874d1a17fc090457\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"document_date\",\"value\":\"2026-07-16\",\"evidence_id\":\"fa9dbfbee660cea808e5a5808e59bb5fdea7411e7d57d57e7b794b7a2dab3546\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"},{\"field\":\"validity_end_date\",\"value\":\"2026-12-31\",\"evidence_id\":\"d78d737007467e6adc16239b0d686858f107a7f87c64710c4f6ce7631f3dfe01\",\"basis\":\"explicit\",\"reference_evidence_id\":\"\"}]}],\"warnings\":[]}"
+}
