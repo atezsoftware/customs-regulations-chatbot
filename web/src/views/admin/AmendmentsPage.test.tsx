@@ -1322,7 +1322,16 @@ test("shows before and after field tables and approves edits without exposing JS
     text: "MADDE 15 - (2) a)",
     chunk_type: "article",
     heading_path: ["TIR İşlemleri", "MADDE 15"],
-    metadata: { article_no: "15" },
+    metadata: {
+      article_no: "15",
+      source_links: ["https://www.resmigazete.gov.tr/eskiler/source.pdf"],
+      image_file_ids: [],
+      intake_legal_metadata: {
+        model: "gemini-3.5-flash",
+        fields: { article_no: { source: "llm", stale: false } },
+      },
+      amendment_document_identity: { source_sha256: "immutable-proof" },
+    },
     effective_start_date: null,
     effective_end_date: null,
   };
@@ -1398,7 +1407,7 @@ test("shows before and after field tables and approves edits without exposing JS
     ...proposedDraft,
     text: "MADDE 15 - (2) a) (Mülga)",
     effective_start_date: "2026-08-28",
-    metadata: { article_no: "15/a" },
+    metadata: { ...proposedDraft.metadata, article_no: "15/a" },
   };
   fireEvent.change(screen.getByRole("textbox", { name: "After text" }), {
     target: { value: reviewedDraft.text },
@@ -1423,6 +1432,19 @@ test("shows before and after field tables and approves edits without exposing JS
   ).toHaveAttribute("readonly");
   expect(screen.getAllByText("Generated on approval")).not.toHaveLength(0);
   expect(screen.getByText("amendment")).toBeVisible();
+
+  expect(
+    screen.queryByRole("textbox", {
+      name: /After metadata (intake_legal_metadata|amendment_document_identity|image_file_ids|source_links)/,
+    })
+  ).not.toBeInTheDocument();
+  const technicalDetails = screen.getAllByText(
+    "Technical metadata (read only)"
+  );
+  expect(technicalDetails).toHaveLength(2);
+  expect(technicalDetails[1]?.closest("details")).not.toHaveAttribute("open");
+  await user.click(technicalDetails[1]!);
+  expect(technicalDetails[1]?.closest("details")).toHaveAttribute("open");
 
   await user.click(screen.getByRole("button", { name: "Approve" }));
 

@@ -30,6 +30,10 @@ from onyx.db.models import (
     KVStore,
     RegulatoryChunk,
 )
+from onyx.db.regulatory_amendment_document_identity import (
+    IDENTITY_KEY,
+    validate_document_identity,
+)
 from onyx.db.regulatory_chunks import (
     has_active_structural_descendants,
     is_hierarchical_aggregate_chunk,
@@ -782,6 +786,10 @@ def queue_amendment_proposal_approval(
             heading_path=reviewed_draft["heading_path"],
             old_chunk_id=stored_change.get("old_chunk_id"),
             insertion_order=reviewed_draft.get("insertion_order"),
+            draft_text=reviewed_draft["text"],
+        )
+        validate_document_identity(
+            db_session, UUID(reviewed_draft["user_file_id"]), reviewed_draft["metadata"]
         )
         reviewed_changes.append({**stored_change, "new_chunk_draft": reviewed_draft})
     reviewed_draft = reviewed_changes[0]["new_chunk_draft"]
@@ -1087,6 +1095,8 @@ def _validated_reviewed_chunk_draft(
         raise ValueError("Reviewed chunk draft cannot change user_file_id")
     if reviewed.position != stored.position:
         raise ValueError("Reviewed chunk draft cannot change position")
+    if reviewed.metadata.get(IDENTITY_KEY) != stored.metadata.get(IDENTITY_KEY):
+        raise ValueError("Reviewed draft cannot change its document identity authority")
     if reviewed.insertion_order != stored.insertion_order:
         raise ValueError("Reviewed chunk draft cannot change its insertion authority")
     if reviewed.insertion_order is not None:
@@ -1096,6 +1106,7 @@ def _validated_reviewed_chunk_draft(
             or reviewed.metadata.get("article_no") != order.article_no
             or reviewed.metadata.get("paragraph_no") != order.paragraph_no
             or reviewed.metadata.get("clause_label") != order.clause_label
+            or reviewed.metadata.get("appendix_label") != order.appendix_label
         ):
             raise ValueError(
                 "Reviewed insertion identity differs from its source authority"
@@ -1581,8 +1592,10 @@ def _approve_multi_chunk_proposal(
             heading_path=draft["heading_path"],
             old_chunk_id=change.get("old_chunk_id"),
             insertion_order=draft.get("insertion_order"),
+            draft_text=draft["text"],
         )
         user_file_id = UUID(draft["user_file_id"])
+        validate_document_identity(db_session, user_file_id, draft["metadata"])
         if user_file_id != publication_owner.user_file_id:
             raise ValueError("Atomic multi-chunk change escaped its source file")
         start_date = (
@@ -1818,11 +1831,13 @@ def approve_amendment_proposal(
         heading_path=draft["heading_path"],
         old_chunk_id=proposal.old_chunk_id,
         insertion_order=draft.get("insertion_order"),
+        draft_text=draft["text"],
     )
     from onyx.db.amendment_pdf_evidence import validate_pdf_proposal_authority
 
     validate_pdf_proposal_authority(db_session, proposal, draft)
     user_file_id = UUID(draft["user_file_id"])
+    validate_document_identity(db_session, user_file_id, draft["metadata"])
     from onyx.db.regulatory_amendment_order import (
         apply_insertion_order,
         validate_insertion_order,
