@@ -8,17 +8,22 @@ import type {
   LegislationSearchResult,
 } from "@/lib/legistations/interfaces";
 import LegislationSearchChunkCard from "@/sections/cards/LegislationSearchChunkCard";
+import { legislationDisplayName } from "@/lib/legistations/sourceIdentity";
+import LegislationSourceIdentity from "@/sections/legistations/LegislationSourceIdentity";
+import type { LegislationFile } from "@/lib/legistations/interfaces";
 
 interface LegislationSearchFileCardProps {
   group: LegislationSearchFileGroup;
   onOpenFile: (hit: LegislationSearchResult) => void;
   onSaved: () => void;
+  onSelectFile?: (file: LegislationFile) => void;
 }
 
 export default function LegislationSearchFileCard({
   group,
   onOpenFile,
   onSaved,
+  onSelectFile,
 }: LegislationSearchFileCardProps) {
   const [expanded, setExpanded] = useState(false);
   return (
@@ -26,8 +31,12 @@ export default function LegislationSearchFileCard({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
           <Text font="main-ui-action" as="h3">
-            {group.file.name}
+            {legislationDisplayName(group.file)}
           </Text>
+          <LegislationSourceIdentity
+            file={group.file}
+            onSelectFile={onSelectFile}
+          />
           <Text
             font="secondary-body"
             color="text-03"

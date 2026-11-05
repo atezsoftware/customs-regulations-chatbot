@@ -43,6 +43,13 @@ _APPENDIX_REFERENCE_RE = re.compile(
     r"(?<![\w])ek\s*[-–—:.]?\s*(?P<label>\d+[a-z]?)\b",
     flags=re.IGNORECASE,
 )
+_ROMAN_APPENDIX_REFERENCE_RE = re.compile(
+    r"(?<!\w)[Ee][Kk](?:\s*[-–—:.]\s*|\s+)"
+    r"(?P<label>[IVXLCDMivxlcdm]+)\b"
+)
+_ROMAN_NUMBER_RE = re.compile(
+    r"M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})"
+)
 _EDIT_VERB_RE = re.compile(
     r"\b(?:değiştirilmiş|degistirilmis|eklenmiş|eklenmis|"
     r"ilave\s+edilmiş|ilave\s+edilmis|kaldırılmış|kaldirilmis|"
@@ -70,8 +77,19 @@ class AmendmentStructuralTarget:
     paragraph_no: str | None = None
 
 
+def _appendix_reference(text: str) -> re.Match[str] | None:
+    matches: list[re.Match[str]] = []
+    numeric = _APPENDIX_REFERENCE_RE.search(text)
+    if numeric is not None:
+        matches.append(numeric)
+    roman = _ROMAN_APPENDIX_REFERENCE_RE.search(text)
+    if roman is not None and _ROMAN_NUMBER_RE.fullmatch(roman.group("label").upper()):
+        matches.append(roman)
+    return min(matches, key=lambda match: match.start()) if matches else None
+
+
 def normalize_appendix_label(value: str) -> str:
-    match = _APPENDIX_REFERENCE_RE.search(value)
+    match = _appendix_reference(value)
     if match is None:
         return "".join(
             character for character in value.casefold() if character.isalnum()
@@ -150,9 +168,7 @@ def parse_amendment_structural_target(
         if heading:
             article_no = article_identity(heading.group())
     clause_match = _CLAUSE_REFERENCE_RE.search(instruction_body)
-    appendix_match = _APPENDIX_REFERENCE_RE.search(
-        appendix_reference_text(instruction_body)
-    )
+    appendix_match = _appendix_reference(appendix_reference_text(instruction_body))
     target = AmendmentStructuralTarget(
         article_no=article_no,
         clause_label=(
