@@ -52,6 +52,7 @@ from onyx.regulatory.indexing_jobs.models import (
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchContractError
 from onyx.regulatory.labeling import vertex_direct
 from onyx.tracing.flows import LLMFlow
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _admitted,
     _existing_rows,
@@ -562,7 +563,7 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
     monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
     with pytest.raises(VertexBatchContractError):
         metadata_job.run_intake_metadata(
-            intake_id=batch.id, lease_token=token, tenant_id="public"
+            intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
         )
     assert METADATA_AUDIT_KEY not in article.chunk_metadata
     assert calls == 2
@@ -571,7 +572,7 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
     batch.lease_token = token
     intake_session.commit()
     metadata_job.run_intake_metadata(
-        intake_id=batch.id, lease_token=token, tenant_id="public"
+        intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
     )
     assert calls == 4
 
@@ -588,7 +589,7 @@ def test_real_cached_gateway_reuses_acknowledged_window_after_failure_and_applie
     ]
     assert article.chunk_metadata[METADATA_AUDIT_KEY]["model"] == "gemini-3.5-flash"
     metadata_job.run_intake_metadata(
-        intake_id=batch.id, lease_token=token, tenant_id="public"
+        intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
     )
     assert calls == 4
 
@@ -782,7 +783,7 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
     if invalid_evidence:
         metadata_job.run_intake_metadata(
-            intake_id=batch.id, lease_token=token, tenant_id="public"
+            intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
         )
         assert all(row.validity_start_date == datetime.date(2027, 1, 1) for row in rows)
         for row in rows:
@@ -802,7 +803,7 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         assert len({request.request_hash for request in requests}) == calls
         assert requests[0].request_hash == parent_hash
         metadata_job.run_intake_metadata(
-            intake_id=batch.id, lease_token=token, tenant_id="public"
+            intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
         )
         assert len(payloads) == calls
         return
@@ -811,7 +812,7 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
         match="single repair" if invalid_evidence else None,
     ):
         metadata_job.run_intake_metadata(
-            intake_id=batch.id, lease_token=token, tenant_id="public"
+            intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
         )
     assert len(payloads) == (4 if repair_evidence else 3)
     if repair_evidence:
@@ -829,7 +830,7 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
     assert METADATA_AUDIT_KEY not in annex.chunk_metadata
     assert _existing_rows(intake_session, [members[1].user_file_id]) == annex_before
     metadata_job.run_intake_metadata(
-        intake_id=batch.id, lease_token=token, tenant_id="public"
+        intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
     )
     assert [len(payload["target_chunk_ids"]) for payload in payloads] == (
         [4, 2, 2, 2, 2, 1] if repair_evidence else [4, 2, 2, 2, 1]
@@ -851,7 +852,7 @@ def test_adaptive_split_keeps_file_unapplied_until_all_cached_leaves_resume(
             == article.text
         )
     metadata_job.run_intake_metadata(
-        intake_id=batch.id, lease_token=token, tenant_id="public"
+        intake_id=batch.id, lease_token=token, tenant_id=get_current_tenant_id()
     )
     assert len(payloads) == (6 if repair_evidence else 5)
 

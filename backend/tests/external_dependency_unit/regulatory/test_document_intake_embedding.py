@@ -31,6 +31,7 @@ from onyx.document_index.publication_models import (
     publication_digest,
 )
 from onyx.regulatory.amendments.annexes import config
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.conftest import create_test_user
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -73,7 +74,7 @@ def test_initial_intake_embedding_policy_is_fresh_scoped_and_read_only(
     token = tokens[member.user_file_id]
     assert start_user_file_index_request(session, member.user_file_id, token)
     scope = PublicationScope(
-        tenant_id="public",
+        tenant_id=get_current_tenant_id(),
         environment=config.REGULATORY_ANNEX_ENVIRONMENT,
         database_identity=config.ANNEX_DATABASE_IDENTITY,
     )
@@ -150,7 +151,7 @@ def test_initial_intake_embedding_policy_is_fresh_scoped_and_read_only(
 
     @contextmanager
     def scoped_session(*, tenant_id: str) -> Iterator[Session]:
-        assert tenant_id == "public"
+        assert tenant_id == get_current_tenant_id()
         yield session
 
     monkeypatch.setattr(policy, "get_session_with_tenant", scoped_session)

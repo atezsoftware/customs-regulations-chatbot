@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
+from onyx.db.document_intake_indexing_retry import intake_index_attempt_is_authorized
 from onyx.db.document_intake_original_ingestion import (
     has_initial_intake_canonical_state,
 )
@@ -192,7 +193,9 @@ def request_intake_publication_recovery(
         or repair is None
         or not repair.initial_index
         or repair.status != UserFileProjectionRepairStatus.FAILED
-        or repair.attempt_id != member.approval_attempt_id
+        or not intake_index_attempt_is_authorized(
+            session, batch, member, repair.attempt_id
+        )
     ):
         raise intake.IntakeConflictError(
             "The failed initial publication is not available for recovery"
@@ -340,6 +343,9 @@ def associate_pending_recovery(
         or not repair.initial_index
         or repair.status != UserFileProjectionRepairStatus.PENDING
         or member.approval_attempt_id != previous.replacement_attempt_id
+        or not intake_index_attempt_is_authorized(
+            session, batch, member, repair.attempt_id
+        )
         or previous.intake_id != batch.id
         or previous.document_id != member.id
         or previous.approved_review_sha256 != batch.review_sha256

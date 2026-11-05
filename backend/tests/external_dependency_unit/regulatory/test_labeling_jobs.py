@@ -96,6 +96,10 @@ class LabelingData(NamedTuple):
 
 @pytest.fixture(scope="module")
 def labeling_database() -> Generator[LabelingDatabase, None, None]:
+    yield from migrated_labeling_database()
+
+
+def migrated_labeling_database() -> Generator[LabelingDatabase, None, None]:
     schema = f"tenant_labeling_tests_{uuid4().hex}"
     backend = Path(__file__).resolve().parents[3]
     SqlEngine.init_engine(pool_size=10, max_overflow=5)

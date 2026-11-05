@@ -33,6 +33,7 @@ from onyx.db.models import (
 )
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.document_intake import reprepare_job
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import _ENVIRONMENT
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -271,7 +272,7 @@ def test_postclaim_labeling_race_defers_and_resumes_only_pending_file_checkpoint
     )
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch_id, request_id=request_id, tenant_id="public"
+            intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
         )
         is None
     )
@@ -324,7 +325,7 @@ def test_postclaim_labeling_race_defers_and_resumes_only_pending_file_checkpoint
 
     monkeypatch.setattr(reprepare_job, "prepare_intake_file", resume)
     run_id = reprepare_job.run_document_intake_reprepare(
-        intake_id=batch_id, request_id=request_id, tenant_id="public"
+        intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
     )
     assert run_id is not None and run_id != previous_id
     assert set(resumed_calls) == pending_ids and len(resumed_calls) == len(pending_ids)

@@ -40,6 +40,7 @@ from onyx.regulatory import writer_publication
 from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.document_intake import job as intake_job
 from onyx.regulatory.document_intake import preparation, reprepare_job
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import _ENVIRONMENT
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -122,7 +123,9 @@ def _transition_fixture(
 
     with monkeypatch.context() as initial:
         initial.setattr(preparation, "prepare_intake_text", previous_formatter)
-        run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+        run_id = intake_job.run_document_intake(
+            intake_id=batch_id, tenant_id=get_current_tenant_id()
+        )
     assert run_id is not None
     session.expire_all()
     batch = session.get_one(RegulatoryDocumentIntake, batch_id)
@@ -159,7 +162,7 @@ def _prepared_transition(
     request = _request(session, batch)
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request.id, tenant_id="public"
+            intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
         is not None
     )
@@ -217,7 +220,7 @@ def test_changed_navigation_reprepare_seals_artifact_preserves_sources_and_survi
     request = _request(session, batch)
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request.id, tenant_id="public"
+            intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
         is not None
     )
@@ -421,7 +424,7 @@ def test_caller_forged_reprepare_text_fails_before_canonical_changes(
     monkeypatch.setattr(writer_publication, "reprepare_owned_intake_file", forged)
     with pytest.raises(ValueError, match="verified source formatter"):
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request.id, tenant_id="public"
+            intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
     session.expire_all()
     assert [
@@ -455,7 +458,7 @@ def test_plaintext_failure_after_committed_reprepare_restores_exact_artifact_wit
     monkeypatch.setattr(utils, "store_user_file_plaintext", failing)
     with pytest.raises(ValueError, match="after canonical commit"):
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request.id, tenant_id="public"
+            intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
     session.expire_all()
     request = session.get_one(RegulatoryDocumentIntakeReprepare, request.id)
@@ -478,7 +481,7 @@ def test_plaintext_failure_after_committed_reprepare_restores_exact_artifact_wit
     session.commit()
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request.id, tenant_id="public"
+            intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
         is not None
     )

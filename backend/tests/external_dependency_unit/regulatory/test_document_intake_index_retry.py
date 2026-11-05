@@ -35,6 +35,7 @@ from onyx.db.user_file import (
 )
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from tests.external_dependency_unit.conftest import create_test_user
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _admitted,
     _completed_labels,
@@ -251,7 +252,7 @@ def test_failed_initial_retry_rejects_changed_authority_before_any_mutation(
             session.get_one(DocumentSet__UserFile, (batch.document_set_id, file.id))
         )
     elif change == "owner":
-        file.user_id = None
+        file.user_id = create_test_user(session, "different-intake-owner").id
     elif change == "gate":
         publication.gate_closed = True
     elif change == "manifest":

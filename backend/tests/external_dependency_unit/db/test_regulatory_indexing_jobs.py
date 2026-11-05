@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from threading import Barrier, Event
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from onyx.db import regulatory_indexing_jobs as regulatory_indexing_job_repository
 from onyx.db.enums import (
+    IndexModelStatus,
     RegulatoryIndexingCancellationIntent,
     RegulatoryIndexingCancellationPhase,
     RegulatoryIndexingItemStatus,
@@ -70,8 +72,8 @@ from onyx.db.regulatory_indexing_jobs import (
     schedule_regulatory_indexing_retry,
     schedule_regulatory_provider_cleanup_retry,
 )
-from onyx.document_index.interfaces_new import DocumentIndex
 from onyx.regulatory.chunker import RegulatoryChunker
+from onyx.regulatory.indexing_jobs import owned_publication
 from onyx.regulatory.indexing_jobs.publisher import stage_regulatory_job_in_index
 from tests.external_dependency_unit.conftest import create_test_user
 
@@ -92,6 +94,20 @@ def regulatory_user_file(
     db_session: Session,
     tenant_context: None,  # noqa: ARG001
 ) -> Generator[UserFile, None, None]:
+    if db_session.get(SearchSettings, 17) is None:
+        db_session.add(
+            SearchSettings(
+                id=17,
+                model_name="regulatory-indexing-fixture",
+                model_dim=1536,
+                normalize=False,
+                query_prefix="",
+                passage_prefix="",
+                status=IndexModelStatus.PRESENT,
+                index_name="regulatory-indexing-fixture",
+            )
+        )
+        db_session.commit()
     user = create_test_user(db_session, "regulatory-indexing-job")
     user_file = UserFile(
         id=uuid4(),
@@ -2062,7 +2078,7 @@ def test_atomic_preparation_rolls_back_callback_writes_on_validation_failure(
             ),
         ]
 
-    with pytest.raises(ValueError, match="duplicate chunks"):
+    with pytest.raises(ValueError, match="duplicate projections"):
         regulatory_indexing_job_repository.persist_regulatory_indexing_preparation(
             db_session,
             job_id=job.id,
@@ -3165,6 +3181,7 @@ def test_required_index_cleanup_retry_survives_crash_and_blocks_successor(
 def test_stale_generation_never_calls_recording_index(
     db_session: Session,
     regulatory_user_file: UserFile,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = _create_job(db_session, regulatory_user_file.id)
     assert claim_regulatory_indexing_job(
@@ -3177,26 +3194,27 @@ def test_stale_generation_never_calls_recording_index(
     job.stage = RegulatoryIndexingStage.INDEX_WRITE.value
     regulatory_user_file.status = UserFileStatus.INDEXING
     db_session.commit()
-    calls: list[object] = []
-    recording_index = cast(
-        DocumentIndex,
-        SimpleNamespace(index=lambda *_args, **_kwargs: calls.append(object())),
-    )
+    transport = MagicMock()
+    monkeypatch.setattr(owned_publication, "ElasticsearchClient", transport)
     stale_job = cast(
         RegulatoryIndexingJob,
-        SimpleNamespace(id=job.id, lease_generation=0),
+        SimpleNamespace(
+            id=job.id,
+            user_file_id=regulatory_user_file.id,
+            search_settings_id=17,
+            lease_generation=0,
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="lease was lost"):
+    with pytest.raises(ValueError, match="lease is no longer current"):
         stage_regulatory_job_in_index(
             job=stale_job,
             user_file=regulatory_user_file,
             rows=[],
             items=[],
-            search_settings=cast(SearchSettings, SimpleNamespace()),
-            tenant_id="tenant-a",
+            search_settings=db_session.get_one(SearchSettings, 17),
+            tenant_id="public",
             db_session=db_session,
-            document_index=recording_index,
         )
 
-    assert calls == []
+    transport.assert_not_called()

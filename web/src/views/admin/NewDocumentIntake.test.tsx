@@ -2330,3 +2330,103 @@ test("refreshes rebuilt chunk content and page totals during preparation and sto
     jest.useRealTimers();
   }
 });
+
+test.each([
+  ["file", "ana.pdf", "application/pdf", `${sourceBase}/upload`],
+  [
+    "file",
+    "ana.docx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    `${sourceBase}/upload`,
+  ],
+  ["file", "belgeler.zip", "application/zip", `${base}/source-packages/zip`],
+  [
+    "markdown",
+    "mevzuat.zip",
+    "application/zip",
+    `${base}/source-packages/markdown`,
+  ],
+  ["url", "", "", sourceBase],
+])(
+  "reuses the source request after a lost response for %s %s and renews it only for changed input",
+  async (mode, name, mime, endpoint) => {
+    const fetchMock = mockApi();
+    const dispatch = fetchMock.getMockImplementation()!;
+    let attempts = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (
+        String(input) === endpoint &&
+        init?.method === "POST" &&
+        attempts++ === 0
+      )
+        throw new TypeError("Source response lost");
+      return dispatch(input, init);
+    });
+    const user = setupUser();
+    render(<NewDocumentIntake />);
+    await screen.findByText(/will be added to PC Külliyatı/);
+    if (mode !== "file")
+      await user.click(
+        screen.getByRole("button", {
+          name: mode === "url" ? "URL" : "Markdown package",
+        })
+      );
+    if (mode === "url")
+      await user.type(
+        screen.getByLabelText("New document source URL"),
+        "https://example.gov/main.html"
+      );
+    else
+      await user.upload(
+        screen.getByLabelText(
+          mode === "markdown"
+            ? "Markdown package file"
+            : "New document source file"
+        ),
+        new File(["source bytes"], name, { type: mime })
+      );
+    const prepare = screen.getByRole("button", {
+      name: "Prepare source and attachments",
+    });
+    await user.click(prepare);
+    await screen.findByText("Source response lost");
+    await user.click(prepare);
+    await screen.findByText("Source package ready · 2 documents");
+    function sourceKeys() {
+      return fetchMock.mock.calls
+        .filter(
+          ([input, init]) =>
+            String(input) === endpoint && init?.method === "POST"
+        )
+        .map(([, init]) =>
+          typeof init!.body === "string"
+            ? JSON.parse(init!.body).idempotency_key
+            : (init!.body as FormData).get("idempotency_key")
+        );
+    }
+    const retried = sourceKeys();
+    expect(retried).toHaveLength(2);
+    expect(retried[0]).toEqual(expect.any(String));
+    expect(retried[1]).toBe(retried[0]);
+    if (mode === "url") {
+      await user.clear(screen.getByLabelText("New document source URL"));
+      await user.type(
+        screen.getByLabelText("New document source URL"),
+        "https://example.gov/changed.html"
+      );
+    } else
+      await user.upload(
+        screen.getByLabelText(
+          mode === "markdown"
+            ? "Markdown package file"
+            : "New document source file"
+        ),
+        new File(["changed bytes"], `changed-${name}`, { type: mime })
+      );
+    await user.click(prepare);
+    await screen.findByText("Source package ready · 2 documents");
+    const changed = sourceKeys();
+    expect(changed).toHaveLength(3);
+    expect(changed[2]).not.toBe(changed[0]);
+  }
+);

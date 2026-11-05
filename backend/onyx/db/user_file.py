@@ -12,6 +12,8 @@ from onyx.db.models import (
     Persona,
     Project__UserFile,
     RegulatoryChunk,
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeFile,
     RegulatoryFilePublication,
     User,
     UserFile,
@@ -67,6 +69,17 @@ def claim_user_file_projection_repair(
         ):
             return None
     attempt_id = uuid4()
+    if (
+        initial_index
+        and repair is not None
+        and repair.initial_index
+        and repair.status == UserFileProjectionRepairStatus.FAILED
+    ):
+        from onyx.db.document_intake_durable_indexing import record_intake_durable_retry
+
+        record_intake_durable_retry(
+            db_session, user_file_id, repair.attempt_id, attempt_id
+        )
     if repair is None:
         repair = UserFileProjectionRepair(
             user_file_id=user_file_id,
@@ -639,6 +652,40 @@ def recover_user_file_index_requests(
             select(exists().where(RegulatoryFilePublication.user_file_id == file_id))
         ):
             continue
+        intake_id = db_session.scalar(
+            select(RegulatoryDocumentIntakeFile.intake_id).where(
+                RegulatoryDocumentIntakeFile.user_file_id == file_id
+            )
+        )
+        batch, member = None, None
+        if intake_id is not None:
+            batch = db_session.scalar(
+                select(RegulatoryDocumentIntake)
+                .where(RegulatoryDocumentIntake.id == intake_id)
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+            if batch is None or not batch.review_sha256:
+                continue
+            member = db_session.scalar(
+                select(RegulatoryDocumentIntakeFile)
+                .where(
+                    RegulatoryDocumentIntakeFile.intake_id == batch.id,
+                    RegulatoryDocumentIntakeFile.user_file_id == file_id,
+                )
+                .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
+            )
+            if member is None or member.approval_attempt_id is None:
+                continue
+        file = db_session.scalar(
+            select(UserFile)
+            .where(UserFile.id == file_id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if file is None or batch is not None and file.user_id != batch.created_by:
+            continue
         repair = db_session.scalar(
             select(UserFileProjectionRepair)
             .where(
@@ -652,7 +699,17 @@ def recover_user_file_index_requests(
         )
         if repair is None:
             continue
-        repair.attempt_id = uuid4()
+        replacement = uuid4()
+        if batch is not None and member is not None:
+            from onyx.db.document_intake_indexing_retry import (
+                record_intake_index_delivery_succession,
+            )
+
+            if not record_intake_index_delivery_succession(
+                db_session, batch, member, repair.attempt_id, replacement
+            ):
+                continue
+        repair.attempt_id = replacement
         repair.status = UserFileProjectionRepairStatus.PENDING
         repair.updated_at = now
         deliveries.append((file_id, repair.attempt_id))

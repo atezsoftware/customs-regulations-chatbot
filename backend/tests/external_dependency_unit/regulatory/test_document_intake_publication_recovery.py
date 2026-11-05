@@ -66,6 +66,7 @@ from onyx.regulatory.document_intake.temporal_context import (
     intake_temporal_context_rows,
 )
 from onyx.regulatory.writer_publication_models import WriterPublicationManifest
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
     _admitted,
@@ -178,7 +179,7 @@ def _fixture(
     session.add(aggregate)
     session.flush()
     scope = PublicationScope(
-        tenant_id="public",
+        tenant_id=get_current_tenant_id(),
         environment=_ENVIRONMENT,
         database_identity=config.ANNEX_DATABASE_IDENTITY,
     )
@@ -369,7 +370,7 @@ def test_normal_retry_rebuilds_closed_manifest_and_prepared_resume_uses_no_model
     with pytest.raises(RuntimeError, match="interrupted"):
         worker.recover_intake_publication(
             user_file_id=main.user_file_id,
-            tenant_id="public",
+            tenant_id=get_current_tenant_id(),
             attempt_id=token,
             recovery_id=recovery.id,
         )
@@ -421,7 +422,7 @@ def test_normal_retry_rebuilds_closed_manifest_and_prepared_resume_uses_no_model
     with pytest.raises(ProcessStopped):
         worker.recover_intake_publication(
             user_file_id=main.user_file_id,
-            tenant_id="public",
+            tenant_id=get_current_tenant_id(),
             attempt_id=token,
             recovery_id=recovery.id,
         )
@@ -444,7 +445,9 @@ def test_normal_retry_rebuilds_closed_manifest_and_prepared_resume_uses_no_model
             yield current
 
     monkeypatch.setattr(tasks, "get_session_with_current_tenant", current_session)
-    tasks._index_requested_user_file(str(main.user_file_id), "public", str(token))
+    tasks._index_requested_user_file(
+        str(main.user_file_id), get_current_tenant_id(), str(token)
+    )
     session.expire_all()
     assert len(prepares) == 1
     recovery = session.get_one(RegulatoryDocumentIntakePublicationRecovery, recovery.id)
