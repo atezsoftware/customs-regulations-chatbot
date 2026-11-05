@@ -76,19 +76,24 @@ def get_owned_chat_attachment(
     return record, metadata
 
 
+def is_private_chat_attachment_file(db_session: Session, file_id: str) -> bool:
+    """Classify private originals and plaintext without trusting message metadata."""
+    if file_id.startswith("chat_attachment_text_"):
+        return True
+    record = db_session.get(FileRecord, file_id)
+    if record is None or not isinstance(record.file_metadata, Mapping):
+        return False
+    metadata = cast(Mapping[str, object], record.file_metadata)
+    return metadata.get("kind") == "session_attachment"
+
+
 def get_chat_attachment_access(
     db_session: Session, file_id: str, user_id: UUID | None
 ) -> bool | None:
     """Fence private attachments before legacy public-session file access."""
-    if file_id.startswith("chat_attachment_text_"):
-        return False
-    record = db_session.get(FileRecord, file_id)
-    if record is None or not isinstance(record.file_metadata, Mapping):
+    if not is_private_chat_attachment_file(db_session, file_id):
         return None
-    metadata = cast(Mapping[str, object], record.file_metadata)
-    if metadata.get("kind") != "session_attachment":
-        return None
-    if user_id is None:
+    if file_id.startswith("chat_attachment_text_") or user_id is None:
         return False
     try:
         get_owned_chat_attachment(db_session, file_id, user_id)

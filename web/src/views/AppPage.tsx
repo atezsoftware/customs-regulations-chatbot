@@ -668,6 +668,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   }, [currentChatSessionId]);
 
   const handleResubmitLastMessage = useCallback(() => {
+    if (
+      (atezSearchV3EnabledForCurrentWorkflow ||
+        asv3ExpCroppedEnabledForCurrentWorkflow) &&
+      multiModel.isMultiModelActive
+    ) {
+      toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+      return;
+    }
     if (legalReviewEnabledForCurrentWorkflow && multiModel.isMultiModelActive) {
       toast.error(
         "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
@@ -762,6 +770,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const onChat = useCallback(
     (message: string) => {
+      if (
+        (atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow) &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+        return;
+      }
       if (
         legalReviewEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive
@@ -888,6 +904,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const handleAppInputBarSubmit = useCallback(
     async (message: string) => {
+      if (
+        (atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow) &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+        return;
+      }
       if (
         legalReviewEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive

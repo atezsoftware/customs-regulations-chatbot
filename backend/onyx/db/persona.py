@@ -478,6 +478,12 @@ def create_update_persona(
 ) -> FullPersonaSnapshot:
     """Higher level function than upsert_persona, although either is valid to use."""
     # Permission to actually use these is checked later
+    if create_persona_request.uploaded_image_id:
+        from onyx.db.chat_attachments import reject_session_attachment_in_generic_chat
+
+        reject_session_attachment_in_generic_chat(
+            db_session, create_persona_request.uploaded_image_id
+        )
 
     try:
         # Featured persona validation

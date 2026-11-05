@@ -108,6 +108,29 @@ def test_xlsx_does_not_trust_incorrectly_small_dimensions() -> None:
     assert "=SUM(B2:B2)" in text
 
 
+@pytest.mark.parametrize(
+    ("part", "valid_attribute", "invalid_attribute"),
+    [
+        ("xl/worksheets/sheet1.xml", b'workbookViewId="0"', b'workbookViewId="bad"'),
+        ("xl/workbook.xml", b'activeTab="0"', b'activeTab="bad"'),
+    ],
+)
+def test_xlsx_invalid_typed_xml_attribute_is_rejected_as_user_input(
+    part: str, valid_attribute: bytes, invalid_attribute: bytes
+) -> None:
+    content = BytesIO()
+    with ZipFile(BytesIO(_xlsx())) as original, ZipFile(content, "w") as changed:
+        for member in original.infolist():
+            payload = original.read(member.filename)
+            if member.filename == part:
+                assert valid_attribute in payload
+                payload = payload.replace(valid_attribute, invalid_attribute)
+            changed.writestr(member, payload)
+
+    with pytest.raises(ValueError, match="malformed|read safely"):
+        extract_chat_attachment_text("invalid-attribute.xlsx", content.getvalue())
+
+
 @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
 def test_csv_preserves_turkish_quoted_values_and_row_numbers(encoding: str) -> None:
     content = 'GTIP;Açıklama\n001234;"İstisna; koşul"\n'.encode(encoding)

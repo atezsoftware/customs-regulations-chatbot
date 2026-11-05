@@ -2,6 +2,7 @@
 
 import csv
 import json
+from collections.abc import Iterator
 from io import BytesIO, StringIO
 from pathlib import PurePosixPath
 from typing import cast
@@ -179,10 +180,21 @@ def _docx_text(content: bytes) -> str:
     return builder.render()
 
 
+def _xlsx_rows(sheet: ReadOnlyWorksheet) -> Iterator[tuple[object, ...]]:
+    try:
+        yield from sheet.iter_rows(values_only=True)
+    except TypeError as error:
+        # openpyxl reports invalid typed XML attributes as TypeError.
+        raise ValueError("The XLSX contains malformed worksheet XML.") from error
+
+
 def _xlsx_text(content: bytes) -> str:
-    workbook = load_workbook(
-        BytesIO(content), read_only=True, data_only=False, keep_links=False
-    )
+    try:
+        workbook = load_workbook(
+            BytesIO(content), read_only=True, data_only=False, keep_links=False
+        )
+    except TypeError as error:
+        raise ValueError("The XLSX contains malformed workbook XML.") from error
     try:
         if len(workbook.worksheets) > MAX_CHAT_ATTACHMENT_SHEETS:
             raise ValueError(
@@ -210,7 +222,9 @@ def _xlsx_text(content: bytes) -> str:
             # Producer-declared dimensions can be too small; scan actual rows
             # rather than omitting cells beyond that claimed boundary.
             cast(ReadOnlyWorksheet, sheet).reset_dimensions()
-            for number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            for number, row in enumerate(
+                _xlsx_rows(cast(ReadOnlyWorksheet, sheet)), start=1
+            ):
                 total_rows += 1
                 total_cells += len(row)
                 if (

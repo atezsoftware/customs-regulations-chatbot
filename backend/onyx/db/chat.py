@@ -170,7 +170,10 @@ def delete_orphaned_search_docs(db_session: Session) -> None:
 def delete_messages_and_files_from_chat_session(
     chat_session_id: UUID, db_session: Session
 ) -> None:
-    from onyx.db.chat_attachments import delete_chat_session_attachment_files
+    from onyx.db.chat_attachments import (
+        delete_chat_session_attachment_files,
+        is_private_chat_attachment_file,
+    )
 
     delete_answer_graphs_for_session(db_session, chat_session_id)
     # Graph cleanup commits internally; lock before deleting the feedback snapshot's messages.
@@ -197,6 +200,9 @@ def delete_messages_and_files_from_chat_session(
     for _, files in messages_with_files:
         for file_info in files or []:
             if file_info["id"] in removed_attachment_ids:
+                continue
+            if is_private_chat_attachment_file(db_session, file_info["id"]):
+                # Private attachments are deleted only through their owning session.
                 continue
             if file_info.get("user_file_id"):
                 # user files are managed by the user file lifecycle
@@ -505,6 +511,8 @@ def add_chats_to_session_from_slack_thread(
     slack_chat_session_id: UUID,
     new_chat_session_id: UUID,
 ) -> None:
+    from onyx.db.chat_attachments import is_private_chat_attachment_file
+
     new_root_message = get_or_create_root_message(
         chat_session_id=new_chat_session_id,
         db_session=db_session,
@@ -524,7 +532,15 @@ def add_chats_to_session_from_slack_thread(
             chat_session_id=new_chat_session_id,
             parent_message=new_root_message,
             message=chat_message.message,
-            files=chat_message.files,
+            files=(
+                [
+                    file
+                    for file in chat_message.files
+                    if not is_private_chat_attachment_file(db_session, file["id"])
+                ]
+                if chat_message.files is not None
+                else None
+            ),
             error=chat_message.error,
             token_count=chat_message.token_count,
             message_type=chat_message.message_type,

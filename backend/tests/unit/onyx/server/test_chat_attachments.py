@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Table, create_engine
+from sqlalchemy import Table, create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
@@ -15,11 +15,12 @@ from sqlalchemy.pool import StaticPool
 
 from onyx.auth.users import current_user
 from onyx.chat.chat_utils import load_chat_file
-from onyx.configs.constants import FileOrigin
+from onyx.configs.constants import FileOrigin, MessageType
+from onyx.db import chat as chat_db
 from onyx.db import chat_attachments
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import ChatSessionSharedStatus, Permission, UserFileStatus
-from onyx.db.models import ChatSession, FileRecord, User, UserFile
+from onyx.db.models import ChatMessage, ChatSession, FileRecord, User, UserFile
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError, register_onyx_exception_handlers
 from onyx.file_store.models import ChatFileType, FileDescriptor
@@ -488,3 +489,113 @@ def test_generic_loader_never_reads_private_session_bytes(
         load_chat_file(descriptor, env.session)
     assert caught.value.error_code is OnyxErrorCode.NOT_FOUND
     env.store.read_file.assert_not_called()
+
+
+def test_slack_seed_omits_private_files_by_stored_identity(
+    environment: AttachmentEnvironment,
+) -> None:
+    env = environment
+    cast(Table, ChatMessage.__table__).create(env.session.connection())
+    attachment = _upload(env, env.chat.id)["files"][0]
+    ordinary: FileDescriptor = {
+        "id": "legacy-message-file",
+        "type": ChatFileType.PLAIN_TEXT,
+        "is_session_attachment": True,
+    }
+    env.session.add(
+        ChatMessage(
+            chat_session_id=env.chat.id,
+            message="source message",
+            token_count=2,
+            message_type=MessageType.USER,
+            files=[
+                {"id": attachment["id"], "type": ChatFileType.PLAIN_TEXT},
+                {
+                    "id": f"chat_attachment_text_{attachment['id']}",
+                    "type": ChatFileType.PLAIN_TEXT,
+                    "is_session_attachment": False,
+                },
+                ordinary,
+            ],
+        )
+    )
+    destination = ChatSession(user_id=env.other_user_id, persona_id=0)
+    env.session.add(destination)
+    env.session.commit()
+
+    chat_db.add_chats_to_session_from_slack_thread(
+        env.session, env.chat.id, destination.id
+    )
+
+    copied_message = env.session.scalar(
+        select(ChatMessage).where(
+            ChatMessage.chat_session_id == destination.id,
+            ChatMessage.message_type == MessageType.USER,
+        )
+    )
+    assert copied_message is not None
+    assert copied_message.files == [ordinary]
+    assert attachment["id"] in env.blobs
+    assert f"chat_attachment_text_{attachment['id']}" in env.blobs
+
+
+@pytest.mark.parametrize("forged_marker", [False, True])
+def test_deleting_copied_session_preserves_source_private_files(
+    environment: AttachmentEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+    forged_marker: bool,
+) -> None:
+    env = environment
+    cast(Table, ChatMessage.__table__).create(env.session.connection())
+    attachment = _upload(env, env.chat.id)["files"][0]
+    plaintext_id = f"chat_attachment_text_{attachment['id']}"
+    ordinary_id = env.store.save_file(
+        content=io.BytesIO(b"ordinary old message upload"),
+        display_name="ordinary.txt",
+        file_origin=FileOrigin.CHAT_UPLOAD,
+        file_type="text/plain",
+        file_id="legacy-message-file",
+    )
+    destination = ChatSession(user_id=env.other_user_id, persona_id=0)
+    env.session.add(destination)
+    env.session.flush()
+    env.session.add(
+        ChatMessage(
+            chat_session_id=destination.id,
+            message="copied or forged message",
+            token_count=3,
+            message_type=MessageType.USER,
+            files=[
+                {
+                    "id": attachment["id"],
+                    "type": ChatFileType.PLAIN_TEXT,
+                    "is_session_attachment": forged_marker,
+                },
+                {"id": plaintext_id, "type": ChatFileType.PLAIN_TEXT},
+                {
+                    "id": ordinary_id,
+                    "type": ChatFileType.PLAIN_TEXT,
+                    "is_session_attachment": True,
+                },
+            ],
+        )
+    )
+    env.session.commit()
+    # Graph and orphan-search cleanup are unrelated to file ownership.
+    monkeypatch.setattr(chat_db, "delete_answer_graphs_for_session", lambda *_: None)
+    monkeypatch.setattr(chat_db, "delete_orphaned_search_docs", lambda *_: None)
+    monkeypatch.setattr(chat_db, "get_default_file_store", lambda: env.store)
+
+    chat_db.delete_messages_and_files_from_chat_session(destination.id, env.session)
+
+    assert (
+        env.session.scalar(
+            select(ChatMessage.id).where(ChatMessage.chat_session_id == destination.id)
+        )
+        is None
+    )
+    assert ordinary_id not in env.blobs
+    assert env.blobs[attachment["id"]] == b"item,amount\ncustoms,120\n"
+    assert "customs" in env.blobs[plaintext_id].decode()
+    chat_db.delete_messages_and_files_from_chat_session(env.chat.id, env.session)
+    assert env.blobs == {}

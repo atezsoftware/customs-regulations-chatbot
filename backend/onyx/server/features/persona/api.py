@@ -686,6 +686,10 @@ def get_persona_avatar(
     if not file_id:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Avatar not found")
 
+    from onyx.db.chat_attachments import reject_session_attachment_in_generic_chat
+
+    reject_session_attachment_in_generic_chat(db_session, file_id)
+
     # Defense-in-depth: reject file_ids that weren't produced by the
     # avatar upload endpoint, so a crafted PATCH cannot rebind a persona
     # to another user's USER_FILE / CHAT_IMAGE_GEN asset.
