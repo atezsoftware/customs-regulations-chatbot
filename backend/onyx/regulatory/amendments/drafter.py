@@ -28,7 +28,7 @@ You will be given one or more amendment instructions, (if any) the existing chun
 The optional target_evidence describes a verified source heading when legacy metadata is stale. Use it for legal context without changing unrelated canonical metadata.
 
 For `new_chunk`:
-- `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes).
+- `text`: the FULL amended chunk text after applying EVERY listed instruction (not just the changed parts — one complete replacement chunk containing all changes). Never return blank text. When an entire identified article, paragraph or clause is repealed, preserve its own unit marker and use `(Mülga)` (e.g. `d) (Mülga)`); retain surrounding text for a partial repeal. Repeal takes effect on effective_start_date, which closes the previous version; do not make the repeal marker temporary unless the instruction explicitly says so.
 - `chunk_type`: usually stays the same as the old chunk; only change it if the nature of the amendment requires it.
 - `heading_path`: leave null to carry over the old chunk's heading_path unchanged. ONLY set this if there is NO old chunk (a brand-new article) — in that case you will be given a `sibling_reference` (an example chunk from the same document); base heading_path on sibling_reference's heading_path (same BÖLÜM/KISIM/top-level heading), updating only the MADDE number/title for the new article.
 - `metadata_changes`: ONLY the metadata fields that actually change (e.g. article_no if the article was renumbered). Do NOT repeat fields that stay the same — they carry over automatically from the old chunk. Leave empty ({}) if nothing in metadata changes.
