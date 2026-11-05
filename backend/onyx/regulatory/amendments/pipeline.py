@@ -500,6 +500,17 @@ def _build_proposal_draft(
         else list(draft.new_chunk.heading_path or [])
     )
     if not context.old_chunk_snapshot:
+        structure = _added_unit_structure(
+            instructions[0], draft.new_chunk.text, context.sibling_reference
+        )
+        if structure is not None:
+            added_structure_verified = True
+            unit_metadata, heading_path = structure
+            for key in ("paragraph_no", "clause_label", "subclause_label"):
+                merged_metadata.pop(key, None)
+            merged_metadata.update(unit_metadata)
+            chunk_type = added_subordinate_unit_kind(instructions[0].instruction_text)
+
         expected_article = context.expected_new_article_no
         if (
             expected_article is None
@@ -527,16 +538,6 @@ def _build_proposal_draft(
             chunk_type = "article"
             for key in ("paragraph_no", "clause_label", "subclause_label"):
                 merged_metadata.pop(key, None)
-        structure = _added_unit_structure(
-            instructions[0], draft.new_chunk.text, context.sibling_reference
-        )
-        if structure is not None:
-            added_structure_verified = True
-            unit_metadata, heading_path = structure
-            for key in ("paragraph_no", "clause_label", "subclause_label"):
-                merged_metadata.pop(key, None)
-            merged_metadata.update(unit_metadata)
-            chunk_type = added_subordinate_unit_kind(instructions[0].instruction_text)
 
     if context.old_chunk_snapshot:
         heading_path = reconcile_existing_heading_path(

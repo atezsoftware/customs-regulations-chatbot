@@ -577,7 +577,10 @@ def test_unnumbered_paragraph_after_an_explicit_third_paragraph_gets_fourth_iden
 
 
 @pytest.mark.parametrize("label", ["m", "ğ", "ı"])
-def test_added_clause_uses_the_explicit_parent_and_body_identity(label: str) -> None:
+@pytest.mark.parametrize("model_article", ["8", "9", None])
+def test_added_clause_uses_the_explicit_parent_and_body_identity(
+    label: str, model_article: str | None
+) -> None:
     context = pipeline.InstructionDraftContext(
         match=MatchResult(old_chunk_id=None, confidence=1, rationale="verified parent"),
         old_chunk_snapshot={},
@@ -604,9 +607,11 @@ def test_added_clause_uses_the_explicit_parent_and_body_identity(label: str) -> 
         new_chunk=ChunkFieldsDraft(
             text=text,
             chunk_type="clause",
-            heading_path=["Kaynak", "MADDE 8", "a) Yanlış"],
+            heading_path=["Kaynak", f"MADDE {model_article}", "a) Yanlış"]
+            if model_article
+            else [],
             metadata_changes={
-                "article_no": "8",
+                **({"article_no": model_article} if model_article else {}),
                 "paragraph_no": "1",
                 "clause_label": "a",
             },
@@ -758,3 +763,18 @@ def test_direct_article_clause_proposal_keeps_unnumbered_parent() -> None:
     assert result.new_chunk_draft["metadata"].get("paragraph_no") is None
     assert result.new_chunk_draft["position"] == 3
     assert result.new_chunk_draft["insertion_order"]["paragraph_no"] is None
+
+
+def test_source_derived_clause_identity_cannot_cross_parent_articles() -> None:
+    instruction = AmendmentInstruction(
+        instruction_text="Aynı Kanunun 8 inci maddesinin ikinci fıkrasına aşağıdaki bent eklenmiştir. “m) Yeni ve tam tanım.”"
+    )
+    with pytest.raises(DraftIntegrityError, match="parent heading"):
+        pipeline._added_unit_structure(
+            instruction,
+            "m) Yeni ve tam tanım.",
+            {
+                "heading_path": ["MADDE 9", "(2) Mevcut fıkra"],
+                "metadata": {"article_no": "9", "paragraph_no": "2"},
+            },
+        )
