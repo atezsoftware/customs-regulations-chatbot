@@ -37,6 +37,7 @@ from onyx.regulatory.document_intake.source_graph import (
     ZIP_INPUT_KIND,
     IntakeGraph,
 )
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
     _admitted,
@@ -365,7 +366,10 @@ def test_initial_and_reprepare_jobs_keep_frozen_zip_parent_scope(
     monkeypatch.setattr(job, "prepare_intake_file", lambda **kw: calls.append(kw))
     monkeypatch.setattr(metadata_job, "run_intake_metadata", lambda **_kw: None)
     monkeypatch.setattr(intake, "start_intake_labeling", lambda *_a: uuid4())
-    assert job.run_document_intake(intake_id=batch.id, tenant_id="public") is not None
+    assert (
+        job.run_document_intake(intake_id=batch.id, tenant_id=get_current_tenant_id())
+        is not None
+    )
     first_ids = {m.user_file_id for m in intake.intake_files(intake_session, batch)}
     assert len(calls) == 3
     assert {kw["asset"].sha256: kw["parent_asset_hashes"] for kw in calls} == {
@@ -386,12 +390,18 @@ def test_initial_and_reprepare_jobs_keep_frozen_zip_parent_scope(
     monkeypatch.setattr(
         reprepare_job.repository,
         "latest_reprepare",
-        lambda *_a: SimpleNamespace(id=request_id, documents={}),
+        lambda *_a: SimpleNamespace(
+            id=request_id,
+            documents={
+                str(member.id): {"status": "queued"}
+                for member in intake.intake_files(intake_session, batch)
+            },
+        ),
     )
     monkeypatch.setattr(reprepare_job.repository, "finish_reprepare", lambda *_a: None)
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch.id, request_id=request_id, tenant_id="public"
+            intake_id=batch.id, request_id=request_id, tenant_id=get_current_tenant_id()
         )
         is not None
     )

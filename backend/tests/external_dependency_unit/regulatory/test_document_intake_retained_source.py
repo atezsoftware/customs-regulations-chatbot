@@ -49,6 +49,7 @@ from onyx.regulatory.document_intake.metadata import (
 )
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import clone_intake_original
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.conftest import create_test_user
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
@@ -171,7 +172,7 @@ def test_completed_approved_same_generation_reprepare_keeps_original_after_revie
     request_id = request.id
 
     def enrich(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -> None:
-        assert tenant_id == "public"
+        assert tenant_id == get_current_tenant_id()
         with reprepare_job.get_session_with_current_tenant() as current:
             _batch, work = metadata.load_metadata_work(current, intake_id, lease_token)
             for document_id, chunks in work:
@@ -208,7 +209,7 @@ def test_completed_approved_same_generation_reprepare_keeps_original_after_revie
 
     monkeypatch.setattr(reprepare_job, "run_intake_metadata", enrich)
     run_id = reprepare_job.run_document_intake_reprepare(
-        intake_id=batch.id, request_id=request_id, tenant_id="public"
+        intake_id=batch.id, request_id=request_id, tenant_id=get_current_tenant_id()
     )
     assert run_id is not None
     session.expire_all()

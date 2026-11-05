@@ -39,6 +39,7 @@ from onyx.regulatory.document_intake import reprepare_job
 from onyx.regulatory.document_intake.chunking_profile import (
     INTAKE_CHUNKING_CODE_VERSION,
 )
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import _ENVIRONMENT
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -124,7 +125,9 @@ def _fixture(
     with monkeypatch.context() as initial:
         if legacy_chunks:
             initial.setattr(writer_publication, "chunk_owned_file", legacy)
-        run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+        run_id = intake_job.run_document_intake(
+            intake_id=batch_id, tenant_id=get_current_tenant_id()
+        )
     assert run_id is not None
     session.expire_all()
     batch = session.get_one(RegulatoryDocumentIntake, batch_id)
@@ -231,7 +234,7 @@ def test_reprepare_same_files_retains_old_labels_receipts_and_canonical_revision
         for entry in request.documents.values()
     )
     new_run_id = reprepare_job.run_document_intake_reprepare(
-        intake_id=batch_id, request_id=request_id, tenant_id="public"
+        intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
     )
     assert new_run_id is not None and new_run_id != old_run_id
     session.expire_all()
@@ -296,7 +299,7 @@ def test_reprepare_same_files_retains_old_labels_receipts_and_canonical_revision
     assert all(not (row.text.startswith("##") and "\n" not in row.text) for row in rows)
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch_id, request_id=request_id, tenant_id="public"
+            intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
         )
         is None
     )
@@ -329,7 +332,9 @@ def test_failed_file_reprepare_rolls_back_atomically_and_retry_reuses_prepared_f
         failing.setattr(indexing, "documents_to_regulatory_chunks", fail_second)
         with pytest.raises(RuntimeError, match="synthetic rechunk"):
             reprepare_job.run_document_intake_reprepare(
-                intake_id=batch_id, request_id=request_id, tenant_id="public"
+                intake_id=batch_id,
+                request_id=request_id,
+                tenant_id=get_current_tenant_id(),
             )
     session.expire_all()
     request = session.get_one(RegulatoryDocumentIntakeReprepare, request_id)
@@ -353,7 +358,7 @@ def test_failed_file_reprepare_rolls_back_atomically_and_retry_reuses_prepared_f
     session.commit()
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch_id, request_id=request_id, tenant_id="public"
+            intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
         )
         is not None
     )
@@ -384,7 +389,7 @@ def test_metadata_failure_after_reprepare_retries_without_rechunking(
     monkeypatch.setattr(reprepare_job, "run_intake_metadata", metadata_failure)
     with pytest.raises(RuntimeError, match="synthetic metadata"):
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch_id, request_id=request_id, tenant_id="public"
+            intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
         )
     session.expire_all()
     request = session.get_one(RegulatoryDocumentIntakeReprepare, request_id)
@@ -401,7 +406,9 @@ def test_metadata_failure_after_reprepare_retries_without_rechunking(
     monkeypatch.setattr(writer_publication, "chunk_owned_file", forbidden)
     monkeypatch.setattr(writer_publication, "reprepare_owned_intake_file", forbidden)
     assert (
-        intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+        intake_job.run_document_intake(
+            intake_id=batch_id, tenant_id=get_current_tenant_id()
+        )
         is not None
     )
     session.expire_all()

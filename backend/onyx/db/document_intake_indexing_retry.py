@@ -1,6 +1,8 @@
 """Restore only a reviewed, unpublished intake's failed initial index request."""
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import select
@@ -14,6 +16,7 @@ from onyx.db.document_intake_reprepare import reprepared_original_receipt
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.models import (
     AmendmentSourcePackage,
+    KVStore,
     RegulatoryAnnexElementChunk,
     RegulatoryChunk,
     RegulatoryDocumentIntake,
@@ -29,6 +32,102 @@ from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
+
+_DELIVERY_SUCCESSION_PREFIX = "intake_index_delivery_succession:"
+_MAX_DELIVERY_SUCCESSIONS = 64
+
+
+def _delivery_scope(
+    batch: RegulatoryDocumentIntake, member: RegulatoryDocumentIntakeFile
+) -> dict[str, str | int]:
+    return {
+        "version": 1,
+        "intake_id": str(batch.id),
+        "document_id": str(member.id),
+        "user_file_id": str(member.user_file_id),
+        "source_package_id": str(batch.source_package_id),
+        "source_asset_id": str(member.source_asset_id),
+        "created_by": str(batch.created_by),
+        "document_set_id": batch.document_set_id,
+        "approved_review_sha256": batch.review_sha256 or "",
+        "approval_attempt_id": str(member.approval_attempt_id),
+    }
+
+
+def intake_index_attempt_chain(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    member: RegulatoryDocumentIntakeFile,
+    attempt_id: UUID,
+) -> tuple[UUID, ...] | None:
+    if not batch.review_sha256 or member.approval_attempt_id is None:
+        return None
+    scope = _delivery_scope(batch, member)
+    current, chain = attempt_id, []
+    for depth in range(_MAX_DELIVERY_SUCCESSIONS + 1):
+        if current in chain:
+            return None
+        chain.append(current)
+        if current == member.approval_attempt_id:
+            return tuple(chain)
+        if depth == _MAX_DELIVERY_SUCCESSIONS:
+            return None
+        receipt = session.get(KVStore, _DELIVERY_SUCCESSION_PREFIX + str(current))
+        if receipt is None or not isinstance(receipt.value, Mapping):
+            return None
+        value = cast(Mapping[str, object], receipt.value)
+        try:
+            previous = UUID(str(value.get("previous_attempt_id")))
+        except ValueError:
+            return None
+        if value != {
+            **scope,
+            "attempt_id": str(current),
+            "previous_attempt_id": str(previous),
+        }:
+            return None
+        current = previous
+    return None
+
+
+def intake_index_attempt_is_authorized(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    member: RegulatoryDocumentIntakeFile,
+    attempt_id: UUID,
+) -> bool:
+    """Accept only the approved attempt or its recorded, same-review successors."""
+    return intake_index_attempt_chain(session, batch, member, attempt_id) is not None
+
+
+def record_intake_index_delivery_succession(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    member: RegulatoryDocumentIntakeFile,
+    previous_attempt_id: UUID,
+    replacement_attempt_id: UUID,
+) -> bool:
+    """Caller holds publication, batch, file and intent locks before rotating."""
+    chain = intake_index_attempt_chain(session, batch, member, previous_attempt_id)
+    key = _DELIVERY_SUCCESSION_PREFIX + str(replacement_attempt_id)
+    if (
+        chain is None
+        or len(chain) > _MAX_DELIVERY_SUCCESSIONS
+        or replacement_attempt_id == previous_attempt_id
+        or session.get(KVStore, key) is not None
+    ):
+        return False
+    session.add(
+        KVStore(
+            key=key,
+            value={
+                **_delivery_scope(batch, member),
+                "attempt_id": str(replacement_attempt_id),
+                "previous_attempt_id": str(previous_attempt_id),
+            },
+        )
+    )
+    return True
 
 
 def restore_failed_intake_index_request(
@@ -60,7 +159,9 @@ def restore_failed_intake_index_request(
         or repair is None
         or not repair.initial_index
         or repair.status != UserFileProjectionRepairStatus.FAILED
-        or repair.attempt_id != member.approval_attempt_id
+        or not intake_index_attempt_is_authorized(
+            session, batch, member, repair.attempt_id
+        )
         or publication is None
         or publication.epoch != 0
         or publication.gate_closed
@@ -72,6 +173,16 @@ def restore_failed_intake_index_request(
         raise intake.IntakeConflictError(
             "Only a failed, approved initial index request can be retried"
         )
+    from onyx.db.document_intake_durable_indexing import (
+        bound_intake_durable_job,
+        require_failed_durable_cleanup,
+    )
+
+    durable = bound_intake_durable_job(
+        session, batch, member, repair.attempt_id, strict=True
+    )
+    if durable is not None:
+        require_failed_durable_cleanup(durable)
     asset = session.get(
         RegulatorySourceAsset, member.source_asset_id, populate_existing=True
     )

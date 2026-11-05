@@ -38,6 +38,7 @@ from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.amendments.annexes import source_images
 from onyx.regulatory.document_intake import job as intake_job
 from onyx.regulatory.document_intake.markdown_package import MarkdownPackageError
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
 )
@@ -249,7 +250,9 @@ def test_native_markdown_source_and_independent_intakes_skip_conversion(
         "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
         lambda **_kwargs: None,
     )
-    run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+    run_id = intake_job.run_document_intake(
+        intake_id=batch_id, tenant_id=get_current_tenant_id()
+    )
     assert run_id is not None
     intake_session.expire_all()
     batch = intake_session.get_one(type(batch), batch_id)

@@ -36,6 +36,7 @@ from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.regulatory.document_intake import job as intake_job
 from onyx.regulatory.document_intake import metadata_job, reprepare_job
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import _ENVIRONMENT
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
@@ -94,7 +95,7 @@ def test_reprepare_worker_uses_server_frozen_versions_without_rebasing_old_reque
 
     monkeypatch.setattr(reprepare_job, "prepare_intake_file", capture)
     run_id = reprepare_job.run_document_intake_reprepare(
-        intake_id=batch.id, request_id=request.id, tenant_id="public"
+        intake_id=batch.id, request_id=request.id, tenant_id=get_current_tenant_id()
     )
     assert run_id is not None and observed == [expected] * len(members)
     intake_session.expire_all()
@@ -275,7 +276,9 @@ def test_initial_retry_fills_only_virgin_annex_then_explicit_reprepare_upgrades_
             partial(prepare, formatter_version=3, chunking_version="2"),
         )
         with pytest.raises(ValueError, match="table row exceeds"):
-            intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+            intake_job.run_document_intake(
+                intake_id=batch_id, tenant_id=get_current_tenant_id()
+            )
     intake_session.expire_all()
     batch = intake_session.get_one(type(batch), batch_id)
     members = intake.intake_files(intake_session, batch)
@@ -298,7 +301,9 @@ def test_initial_retry_fills_only_virgin_annex_then_explicit_reprepare_upgrades_
     assert batch.status == "failed" and batch.stage == "chunking"
     intake.retry_intake(intake_session, batch)
     intake_session.commit()
-    run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+    run_id = intake_job.run_document_intake(
+        intake_id=batch_id, tenant_id=get_current_tenant_id()
+    )
     assert run_id is not None
     intake_session.expire_all()
     assert [
@@ -335,7 +340,7 @@ def test_initial_retry_fills_only_virgin_annex_then_explicit_reprepare_upgrades_
     request = _request(intake_session, batch)
     assert (
         reprepare_job.run_document_intake_reprepare(
-            intake_id=batch_id, request_id=request.id, tenant_id="public"
+            intake_id=batch_id, request_id=request.id, tenant_id=get_current_tenant_id()
         )
         is not None
     )

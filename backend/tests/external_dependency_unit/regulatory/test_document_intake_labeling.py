@@ -52,6 +52,7 @@ from onyx.regulatory.labeling.provider import (
     validate_labeling_response,
 )
 from onyx.tracing.flows import LLMFlow
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _admitted,
     _completed_labels,
@@ -135,7 +136,7 @@ def test_only_current_unpublished_intake_gets_direct_policy(
     assert resolver.call_args.kwargs["direct_max_concurrency"] == (
         4 if scope == "current" else 1
     )
-    orchestrator._prepare(lease, "public")
+    orchestrator._prepare(lease, get_current_tenant_id())
     assert grouping.call_args.kwargs["item_limit"] == (8 if scope == "current" else 64)
 
 
@@ -263,6 +264,7 @@ def test_cached_label_quotes_resolve_only_for_current_intake_and_preserve_receip
     for member in members:
         intake.mark_intake_file_prepared(intake_session, batch.id, token, member.id)
     run_id = intake.start_intake_labeling(intake_session, batch.id, token)
+    assert run_id is not None
     if case == "ordinary":
         batch.labeling_run_id = None
     intake_session.flush()
@@ -387,7 +389,7 @@ def test_cached_label_quotes_resolve_only_for_current_intake_and_preserve_receip
             ):
                 return
             orchestrator.run_labeling_step(
-                identifier, current.lease_generation, "public"
+                identifier, current.lease_generation, get_current_tenant_id()
             )
         pytest.fail("The local fake-provider labeling run did not finish")
 
@@ -443,6 +445,7 @@ def test_cached_label_quotes_resolve_only_for_current_intake_and_preserve_receip
         replacement_id = intake.start_intake_labeling(
             intake_session, batch.id, retry_token
         )
+        assert replacement_id is not None
         assert replacement_id != run_id
         drive(replacement_id)
         assert sdk.models.generate_content.call_count == 3

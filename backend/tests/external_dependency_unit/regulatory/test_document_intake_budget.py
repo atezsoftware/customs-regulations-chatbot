@@ -32,6 +32,7 @@ from onyx.regulatory.document_intake.chunking_profile import (
 from onyx.regulatory.indexing_jobs.configuration import (
     compute_regulatory_chunk_generation_hash,
 )
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
 )
@@ -110,7 +111,9 @@ def test_long_native_markdown_uses_real_tokenizer_without_heading_only_chunks(
         "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
         lambda **_kwargs: None,
     )
-    run_id = intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+    run_id = intake_job.run_document_intake(
+        intake_id=batch_id, tenant_id=get_current_tenant_id()
+    )
     intake_session.expire_all()
     batch = intake_session.get_one(type(batch), batch_id)
     member = repository.intake_files(intake_session, batch)[0]

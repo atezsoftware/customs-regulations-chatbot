@@ -16,6 +16,7 @@ from onyx.db.models import RegulatoryChunk, RegulatoryIndexingJob, UserFile
 from onyx.db.regulatory_chunks import get_chunks_for_file_snapshot
 from onyx.db.regulatory_indexing_jobs import (
     claim_regulatory_indexing_job,
+    create_approved_intake_indexing_successor,
     create_or_get_regulatory_indexing_job,
     get_regulatory_indexing_job,
 )
@@ -187,17 +188,47 @@ def _create_owned_regulatory_indexing_job(
             from onyx.db.user_file import validate_user_file_index_request
 
             validate_user_file_index_request(owner, index_request_attempt_id)
-        return create_or_get_regulatory_indexing_job(
-            db_session,
-            user_file_id=user_file_id,
-            content_hash=snapshot.input_content_hash,
-            search_settings_id=snapshot.search_settings_id,
-            prompt_hash=snapshot.prompt_hash,
-            chunk_generation_hash=snapshot.chunk_generation_hash,
-            config_snapshot=snapshot.model_dump(mode="json"),
-            now=now,
-            publication_owner=owner,
+        from onyx.db.document_intake_durable_indexing import (
+            bind_intake_durable_job,
+            intake_durable_retry_job,
         )
+
+        restart = (
+            intake_durable_retry_job(db_session, user_file_id, index_request_attempt_id)
+            if index_request_attempt_id is not None
+            else None
+        )
+
+        def bind_before_commit(job: RegulatoryIndexingJob) -> None:
+            if index_request_attempt_id is not None:
+                bind_intake_durable_job(
+                    db_session, user_file_id, index_request_attempt_id, job
+                )
+
+        if restart is not None:
+            previous, anchor = restart
+            job = create_approved_intake_indexing_successor(
+                db_session,
+                previous=previous,
+                restart_attempt_id=anchor,
+                publication_owner=owner,
+                now=now,
+                before_commit=bind_before_commit,
+            )
+        else:
+            job = create_or_get_regulatory_indexing_job(
+                db_session,
+                user_file_id=user_file_id,
+                content_hash=snapshot.input_content_hash,
+                search_settings_id=snapshot.search_settings_id,
+                prompt_hash=snapshot.prompt_hash,
+                chunk_generation_hash=snapshot.chunk_generation_hash,
+                config_snapshot=snapshot.model_dump(mode="json"),
+                now=now,
+                publication_owner=owner,
+                before_commit=bind_before_commit,
+            )
+        return job
     finally:
         db_session.rollback()
         authority.release(owner)
@@ -286,10 +317,21 @@ def prepare_regulatory_indexing_job_from_chunks(
         )
     rows = get_chunks_for_file_snapshot(db_session, user_file_id)
     content_hash = regulatory_chunks_content_hash(rows)
-    snapshot = resolve_regulatory_indexing_snapshot(
-        db_session,
-        input_content_hash=content_hash,
-        input_hash_version=RegulatoryInputHashVersion.CHUNK_ROWS_V3,
+    from onyx.db.document_intake_durable_indexing import intake_durable_retry_job
+
+    restart = (
+        intake_durable_retry_job(db_session, user_file_id, index_request_attempt_id)
+        if index_request_attempt_id is not None
+        else None
+    )
+    snapshot = (
+        RegulatoryIndexingConfigSnapshot.model_validate(restart[0].config_snapshot)
+        if restart is not None
+        else resolve_regulatory_indexing_snapshot(
+            db_session,
+            input_content_hash=content_hash,
+            input_hash_version=RegulatoryInputHashVersion.CHUNK_ROWS_V3,
+        )
     )
     if user_file.regulatory_chunk_generation_hash is None:
         raise ValueError("CHUNKED user file has no chunk-generation identity")

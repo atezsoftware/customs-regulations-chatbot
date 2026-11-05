@@ -1,32 +1,53 @@
 """Real ZIP requests and frozen source graphs admit separate, owned documents."""
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from io import BytesIO
 from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import MagicMock
 from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
+from google.auth.credentials import Credentials
+from google.genai import types as genai_types
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as repository
+from onyx.db import document_intake_metadata as metadata_repository
+from onyx.db import regulatory_labeling as labeling
 from onyx.db.amendment_sources import list_source_assets
 from onyx.db.document_intake_sources import create_zip_source_package
+from onyx.db.labeling_configuration import LabelingProviderBinding
 from onyx.db.models import (
     AmendmentSourcePackage,
     DocumentSet,
     ModelConfiguration,
     RegulatoryChunk,
+    RegulatoryLabelingRun,
     RegulatorySourceAsset,
     User,
     UserFile,
 )
+from onyx.file_store.file_store import FileStore
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.amendments.annexes import job as source_job
 from onyx.regulatory.document_intake import job as intake_job
+from onyx.regulatory.document_intake import metadata_job
+from onyx.regulatory.document_intake.metadata import METADATA_AUDIT_KEY
 from onyx.regulatory.document_intake.source_graph import ZIP_INPUT_KIND
+from onyx.regulatory.indexing_jobs.models import (
+    VertexAuthenticationMode,
+    VertexBatchConfig,
+)
+from onyx.regulatory.labeling import orchestrator, vertex_direct
+from onyx.regulatory.labeling.provider import LabelDefinition, TaxonomyDefinition
+from onyx.tracing.flows import LLMFlow
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
 )
@@ -39,6 +60,119 @@ from tests.external_dependency_unit.regulatory.test_document_intake import (
 from tests.external_dependency_unit.regulatory.test_document_intake_markdown import (
     native_markdown_runtime as native_markdown_runtime,
 )
+from tests.unit.onyx.regulatory.labeling.test_vertex_direct import _Store
+
+
+def _inference_runtime(
+    session: Session,
+    model: ModelConfiguration,
+    store: PostgresBackedFileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> MagicMock:
+    """Replace provider transport while running metadata and labeling coordinators."""
+    binding = LabelingProviderBinding(
+        model_configuration_id=model.id,
+        provider_id=model.llm_provider.id,
+        project="mixed-zip-test",
+        location="global",
+        authentication_mode=VertexAuthenticationMode.WORKLOAD_IDENTITY,
+        credential_identity="fixture",
+        model="gemini-3.5-flash",
+        transport="vertex_direct_v1",
+    )
+    sdk = MagicMock()
+
+    def generate(**kwargs: Any) -> genai_types.GenerateContentResponse:
+        payload = json.loads(kwargs["contents"][0].parts[0].text)
+        result = (
+            {
+                "chunks": [
+                    {"chunk_id": identifier, "fields": []}
+                    for identifier in payload["target_chunk_ids"]
+                ],
+                "warnings": [],
+            }
+            if "target_chunk_ids" in payload
+            else {
+                "labels": [
+                    {"label_id": "customs", "evidence_quote": payload["target"]["text"]}
+                ],
+                "abstained": False,
+            }
+        )
+        return genai_types.GenerateContentResponse.model_validate(
+            {
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": json.dumps(result)}],
+                        },
+                    }
+                ]
+            }
+        )
+
+    sdk.models.generate_content.side_effect = generate
+    receipts = _Store()
+
+    def gateway(flow: LLMFlow) -> vertex_direct.LabelingVertexDirectGateway:
+        return vertex_direct.LabelingVertexDirectGateway(
+            config=VertexBatchConfig(
+                model_configuration_id=model.id,
+                model_name=binding.model,
+                project=binding.project,
+                location=binding.location,
+                authentication_mode=binding.authentication_mode,
+            ),
+            binding_sha256=binding.fingerprint,
+            credential_identity=binding.credential_identity,
+            credential_json_provider=lambda: None,
+            credentials_factory=lambda: cast(Credentials, object()),
+            client_factory=lambda _credentials: sdk,
+            store=cast(FileStore, receipts),
+            flow=flow,
+        )
+
+    metadata_gateway = gateway(LLMFlow.REGULATORY_INTAKE_METADATA)
+    label_gateway = gateway(LLMFlow.REGULATORY_LABELING_BATCH)
+
+    @contextmanager
+    def session_scope() -> Iterator[Session]:
+        yield session
+
+    @contextmanager
+    def traced(**_kwargs: Any) -> Iterator[Any]:
+        yield SimpleNamespace(span_data=SimpleNamespace(usage=None))
+
+    for module in (repository, metadata_job):
+        monkeypatch.setattr(
+            module,
+            "resolve_intake_labeling_provider_binding",
+            lambda *_a, **_k: binding,
+        )
+    for module in (metadata_job, orchestrator):
+        monkeypatch.setattr(module, "get_session_with_current_tenant", session_scope)
+    monkeypatch.setattr(metadata_repository, "get_default_file_store", lambda: store)
+    monkeypatch.setattr(
+        metadata_job, "resolve_labeling_gateway", lambda *_a, **_k: metadata_gateway
+    )
+    monkeypatch.setattr(
+        orchestrator, "resolve_labeling_gateway", lambda *_a, **_k: label_gateway
+    )
+    monkeypatch.setattr(vertex_direct, "traced_llm_call", traced)
+    settings = labeling.get_label_settings(session)
+    settings.taxonomy = labeling.get_or_create_taxonomy(
+        session,
+        taxonomy=TaxonomyDefinition(
+            name="ZIP labels",
+            labels=[LabelDefinition(id="customs", name="Gümrük", description="Gümrük")],
+        ),
+        created_by_id=None,
+    )
+    session.commit()
+    return sdk
 
 
 def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
@@ -49,6 +183,7 @@ def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
 ) -> None:
     owner, target, model = intake_owner
     store = native_markdown_runtime
+    sdk = _inference_runtime(intake_session, model, store, monkeypatch)
     files = {
         "main.html": "<html><body><h1>Yeni Mevzuat</h1><p>MADDE 1 — ZIP_ROOT_KURAL beyan usulüdür.</p><p><a href='ekler/ek-1.md'>EK-1 belgeler</a></p></body></html>".encode(),
         "ekler/ek-1.md": "# EK-1\n\n1. ZIP_ANNEX_KURAL fatura ibraz edilir.\n".encode(),
@@ -112,22 +247,12 @@ def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
         user=owner,
         environment=_ENVIRONMENT,
     )
-    batch_id, model_id = batch.id, model.id
+    batch_id = batch.id
     intake_session.commit()
-    monkeypatch.setattr(
-        repository,
-        "resolve_intake_labeling_provider_binding",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            model="gemini-3.5-flash",
-            model_dump=lambda **_options: {"model_configuration_id": model_id},
-        ),
-    )
-    monkeypatch.setattr(
-        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
-        lambda **_kwargs: None,
-    )
     assert (
-        intake_job.run_document_intake(intake_id=batch_id, tenant_id="public")
+        intake_job.run_document_intake(
+            intake_id=batch_id, tenant_id=get_current_tenant_id()
+        )
         is not None
     )
     intake_session.expire_all()
@@ -156,3 +281,32 @@ def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
             assert "ZIP_ROOT_KURAL" in text and "ZIP_ANNEX_KURAL" not in text
         if member == annex:
             assert "ZIP_ANNEX_KURAL" in text
+        chunks = list(
+            intake_session.scalars(
+                select(RegulatoryChunk).where(RegulatoryChunk.user_file_id == file.id)
+            )
+        )
+        assert chunks and all(
+            METADATA_AUDIT_KEY in chunk.chunk_metadata for chunk in chunks
+        )
+
+    assert batch.labeling_run_id is not None
+    run = intake_session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
+    for _step in range(20):
+        intake_session.expire_all()
+        run = intake_session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
+        if run.status not in {"queued", "running"}:
+            break
+        orchestrator.run_labeling_step(
+            run.id, run.lease_generation, get_current_tenant_id()
+        )
+    assert run.status == "completed", run.error
+    assert set(run.file_ids) == {str(member.user_file_id) for member in members}
+    assert sdk.models.generate_content.call_count >= 6
+    repository.refresh_intake(intake_session, batch)
+    assert batch.status == "ready" and batch.review_sha256
+    deliveries = repository.approve_intake(intake_session, batch, batch.review_sha256)
+    assert {file_id for file_id, _token in deliveries} == {
+        member.user_file_id for member in members
+    }
+    intake_session.commit()

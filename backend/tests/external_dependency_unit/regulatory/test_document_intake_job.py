@@ -36,6 +36,7 @@ from onyx.indexing.embedder import DefaultIndexingEmbedder
 from onyx.natural_language_processing.utils import BaseTokenizer
 from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.document_intake import job
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
 )
@@ -225,7 +226,9 @@ def test_job_chunks_independent_originals_and_freezes_only_new_label_scope(
     monkeypatch.setattr(
         "onyx.regulatory.document_intake.metadata_job.run_intake_metadata", metadata
     )
-    run_id = job.run_document_intake(intake_id=intake_id, tenant_id="public")
+    run_id = job.run_document_intake(
+        intake_id=intake_id, tenant_id=get_current_tenant_id()
+    )
     metadata.assert_called_once()
     assert metadata.call_args.kwargs["intake_id"] == intake_id
     assert run_id is not None

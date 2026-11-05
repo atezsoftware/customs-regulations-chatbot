@@ -6516,6 +6516,19 @@ class RegulatoryIndexingJob(Base):
         default=dict,
         server_default=text("'{}'::jsonb"),
     )
+    restart_ordinal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    restart_of_job_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey(
+            "regulatory_indexing_job.id", name="fk_regulatory_index_restart_parent"
+        ),
+        nullable=True,
+    )
+    restart_attempt_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
 
     status: Mapped[str] = mapped_column(
         String(32),
@@ -6665,7 +6678,16 @@ class RegulatoryIndexingJob(Base):
             "search_settings_id",
             "prompt_hash",
             "chunk_generation_hash",
+            "restart_ordinal",
             name="uq_regulatory_indexing_job_idempotency",
+        ),
+        UniqueConstraint(
+            "restart_attempt_id", name="uq_regulatory_index_restart_attempt"
+        ),
+        CheckConstraint(
+            "(restart_ordinal = 0 AND restart_of_job_id IS NULL AND restart_attempt_id IS NULL) OR "
+            "(restart_ordinal > 0 AND restart_of_job_id IS NOT NULL AND restart_attempt_id IS NOT NULL)",
+            name="regulatory_indexing_job_restart_identity",
         ),
         Index(
             "ix_regulatory_indexing_job_recovery",

@@ -26,8 +26,10 @@ from onyx.db.enums import (
 )
 from onyx.db.models import (
     RegulatoryChunk,
+    RegulatoryFilePublication,
     RegulatoryIndexingItem,
     RegulatoryIndexingJob,
+    RegulatoryTemporalProjection,
     SearchSettings,
     UserFile,
 )
@@ -426,6 +428,7 @@ def create_or_get_regulatory_indexing_job(
     config_snapshot: RegulatoryIndexingConfigSnapshot,
     now: datetime.datetime,
     publication_owner: FileOwnership | None = None,
+    before_commit: Callable[[RegulatoryIndexingJob], None] | None = None,
 ) -> RegulatoryIndexingJob:
     """Create one active job, or reuse the file's existing active generation.
 
@@ -519,6 +522,8 @@ def create_or_get_regulatory_indexing_job(
             active_job.heartbeat_at = now
             active_job.updated_at = now
         active_job_id = active_job.id
+        if before_commit is not None:
+            before_commit(active_job)
         db_session.commit()
         persisted_active_job = db_session.get(RegulatoryIndexingJob, active_job_id)
         if persisted_active_job is None:
@@ -585,6 +590,7 @@ def create_or_get_regulatory_indexing_job(
             RegulatoryIndexingJob.search_settings_id == search_settings_id,
             RegulatoryIndexingJob.prompt_hash == prompt_hash,
             RegulatoryIndexingJob.chunk_generation_hash == chunk_generation_hash,
+            RegulatoryIndexingJob.restart_ordinal == 0,
         )
     )
     if job_id is None:
@@ -598,10 +604,115 @@ def create_or_get_regulatory_indexing_job(
         in {UserFileStatus.PROCESSING, UserFileStatus.INDEXING}
     ):
         locked_user_file.status = UserFileStatus.COMPLETED
+    if before_commit is not None:
+        before_commit(persisted_before_commit)
     db_session.commit()
     job = db_session.get(RegulatoryIndexingJob, job_id)
     if job is None:
         raise RuntimeError(f"regulatory indexing job {job_id} was not persisted")
+    return job
+
+
+def create_approved_intake_indexing_successor(
+    db_session: Session,
+    *,
+    previous: RegulatoryIndexingJob,
+    restart_attempt_id: UUID,
+    publication_owner: FileOwnership,
+    now: datetime.datetime,
+    before_commit: Callable[[RegulatoryIndexingJob], None],
+) -> RegulatoryIndexingJob:
+    """Retain the terminal attempt and create one fenced, frozen-config successor."""
+    from onyx.db.document_intake_durable_indexing import require_failed_durable_cleanup
+    from onyx.db.document_intake_original_ingestion import (
+        has_initial_intake_canonical_state,
+    )
+    from onyx.db.regulatory_index_lifecycle import lock_index_publication_clock
+
+    reservations = PublicationStore(publication_owner.scope).lock_owned_snapshot(
+        db_session, publication_owner
+    )
+    if (
+        reservations.gate_closed
+        or publication_owner.user_file_id != previous.user_file_id
+    ):
+        raise ValueError("Durable restart requires its open publication ownership")
+    lock_index_publication_clock(db_session)
+    target = db_session.get(
+        SearchSettings, previous.search_settings_id, populate_existing=True
+    )
+    if target is None or not (target.status.is_current() or target.status.is_future()):
+        raise ValueError("The frozen durable index is no longer active")
+    file = db_session.scalar(
+        select(UserFile).where(UserFile.id == previous.user_file_id).with_for_update()
+    )
+    publication = db_session.get_one(RegulatoryFilePublication, previous.user_file_id)
+    existing = db_session.scalar(
+        select(RegulatoryIndexingJob).where(
+            RegulatoryIndexingJob.restart_attempt_id == restart_attempt_id
+        )
+    )
+    if existing is not None:
+        if (
+            existing.restart_of_job_id != previous.id
+            or existing.config_snapshot != previous.config_snapshot
+            or existing.user_file_id != previous.user_file_id
+        ):
+            raise ValueError("The durable successor differs from its approved restart")
+        before_commit(existing)
+        db_session.commit()
+        return existing
+    if (
+        file is None
+        or file.status != UserFileStatus.CHUNKED
+        or previous.status != RegulatoryIndexingJobStatus.FAILED.value
+        or publication.epoch != 0
+        or publication.writer_manifest is not None
+        or publication.writer_manifest_sha256 is not None
+        or not has_initial_intake_canonical_state(db_session, [previous.user_file_id])
+        or db_session.scalar(
+            select(RegulatoryTemporalProjection.id)
+            .where(RegulatoryTemporalProjection.user_file_id == previous.user_file_id)
+            .limit(1)
+        )
+        is not None
+        or db_session.scalar(
+            select(RegulatoryIndexingJob.id)
+            .where(
+                RegulatoryIndexingJob.user_file_id == previous.user_file_id,
+                RegulatoryIndexingJob.status.in_(
+                    _ACTIVE_REGULATORY_INDEXING_JOB_STATUSES
+                ),
+            )
+            .limit(1)
+        )
+        is not None
+    ):
+        raise ValueError(
+            "Only the unchanged, unpublished failed durable attempt can restart"
+        )
+    require_failed_durable_cleanup(previous)
+    job = RegulatoryIndexingJob(
+        id=uuid4(),
+        user_file_id=previous.user_file_id,
+        content_hash=previous.content_hash,
+        chunk_generation_hash=previous.chunk_generation_hash,
+        search_settings_id=previous.search_settings_id,
+        prompt_hash=previous.prompt_hash,
+        config_snapshot=deepcopy(previous.config_snapshot),
+        restart_ordinal=previous.restart_ordinal + 1,
+        restart_of_job_id=previous.id,
+        restart_attempt_id=restart_attempt_id,
+        status=RegulatoryIndexingJobStatus.QUEUED.value,
+        stage=RegulatoryIndexingStage.PREPARING.value,
+        lease_generation=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(job)
+    db_session.flush()
+    before_commit(job)
+    db_session.commit()
     return job
 
 
@@ -2652,6 +2763,9 @@ def fail_regulatory_indexing_job(
         UserFileStatus.INDEXING,
     }:
         locked_user_file.status = UserFileStatus.FAILED
+    from onyx.db.document_intake_durable_indexing import fail_bound_intake_index_request
+
+    fail_bound_intake_index_request(db_session, job)
     db_session.commit()
     return True
 
@@ -2719,6 +2833,11 @@ def cancel_regulatory_indexing_job(
             UserFileStatus.INDEXING,
         }:
             locked_user_file.status = UserFileStatus.FAILED
+        from onyx.db.document_intake_durable_indexing import (
+            fail_bound_intake_index_request,
+        )
+
+        fail_bound_intake_index_request(db_session, job)
     elif cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
         if locked_user_file.status not in {
             UserFileStatus.CANCELED,
@@ -2984,6 +3103,11 @@ def finalize_regulatory_indexing_cancellation(
             UserFileStatus.INDEXING,
         }:
             locked_user_file.status = UserFileStatus.FAILED
+        from onyx.db.document_intake_durable_indexing import (
+            fail_bound_intake_index_request,
+        )
+
+        fail_bound_intake_index_request(db_session, job)
     elif cancellation_intent is RegulatoryIndexingCancellationIntent.SUPERSEDE:
         if locked_user_file.status not in {
             UserFileStatus.CANCELED,

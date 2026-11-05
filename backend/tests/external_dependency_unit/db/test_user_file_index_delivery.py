@@ -11,8 +11,28 @@ from onyx.db.enums import UserFileStatus
 from onyx.db.models import UserFile, UserFileProjectionRepair
 from onyx.db.regulatory_publication import PublicationStore
 from onyx.document_index.publication_models import FileOwnership
+from onyx.regulatory.amendments.annexes.models import AnnexCanonicalSnapshot
 from onyx.server.features.document_set import api
 from tests.external_dependency_unit.conftest import create_test_user
+
+
+def _canonical_snapshot(file: UserFile) -> AnnexCanonicalSnapshot:
+    return AnnexCanonicalSnapshot(
+        id=f"rc_delivery_{file.id.hex}",
+        user_file_id=str(file.id),
+        chunk_type="article",
+        status="active",
+        projection_ordinal=1,
+        supersedes_chunk_id=None,
+        superseded_by_chunk_id=None,
+        position=1,
+        text="MADDE 1 — Beyan usulü.",
+        heading_path=["MADDE 1"],
+        metadata={},
+        source="indexed",
+        validity_start_date=None,
+        validity_end_date=None,
+    )
 
 
 @pytest.mark.parametrize("bulk", [False, True])
@@ -375,7 +395,10 @@ def test_crashed_publication_lease_remains_recoverable(
     )
     token = dict(deliveries)[requested_file.id]
     inputs = SimpleNamespace(
-        file=requested_file, canonical=[object()], settings=[], bindings=[]
+        file=requested_file,
+        canonical=[_canonical_snapshot(requested_file)],
+        settings=[],
+        bindings=[],
     )
     with (
         patch.object(tasks.app_configs, "REGULATORY_BATCH_INDEXING_ENABLED", False),
@@ -595,7 +618,10 @@ def test_first_publication_acquisition_cannot_race_recovery_of_absent_authority(
             pass
 
     inputs = SimpleNamespace(
-        file=requested_file, canonical=[object()], settings=[], bindings=[]
+        file=requested_file,
+        canonical=[_canonical_snapshot(requested_file)],
+        settings=[],
+        bindings=[],
     )
     with (
         patch(

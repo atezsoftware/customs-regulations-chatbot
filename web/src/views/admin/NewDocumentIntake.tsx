@@ -603,6 +603,7 @@ export default function NewDocumentIntake() {
   const [requestError, setRequestError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const requestVersion = useRef(0);
+  const sourceRequestKey = useRef<string | null>(null);
   const intakeRequestKeys = useRef(new Map<string, string>());
   const reprepareRequestKeys = useRef(new Map<string, string>());
   const {
@@ -688,6 +689,7 @@ export default function NewDocumentIntake() {
 
   function resetSource() {
     requestVersion.current += 1;
+    sourceRequestKey.current = null;
     setInitialPackage(null);
     setInitialBatch(null);
     setNavigation(null);
@@ -716,7 +718,8 @@ export default function NewDocumentIntake() {
     if (!targetId) return;
     const version = requestVersion.current;
     await run(async () => {
-      const key = globalThis.crypto.randomUUID();
+      const key = sourceRequestKey.current ?? globalThis.crypto.randomUUID();
+      sourceRequestKey.current = key;
       const prepared =
         mode === "url"
           ? await createAmendmentSourcePackage(targetId, key, {

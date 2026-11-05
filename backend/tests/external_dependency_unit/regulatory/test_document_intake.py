@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from onyx.auth.schemas import UserRole
 from onyx.configs.constants import FileOrigin
 from onyx.db import document_intake as intake
-from onyx.db.engine.sql_engine import get_sqlalchemy_engine
 from onyx.db.enums import UserFileProjectionRepairStatus, UserFileStatus
 from onyx.db.models import (
     AmendmentBatch,
@@ -36,7 +35,11 @@ from onyx.db.models import (
 )
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
 from onyx.regulatory.amendments.annexes.models import SourceLink
+from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 from tests.external_dependency_unit.conftest import create_test_user
+from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
+    LabelingDatabase,
+)
 
 _ENVIRONMENT = "document-intake-regression"
 
@@ -63,11 +66,15 @@ def _repair_file_ids(session: Session) -> set[UUID]:
 
 @pytest.fixture
 def intake_session(
-    db_session: Session,  # noqa: ARG001
+    intake_database: LabelingDatabase,
     tenant_context: None,  # noqa: ARG001
 ) -> Generator[Session, None, None]:
-    with get_sqlalchemy_engine().connect() as connection:
+    context_token = CURRENT_TENANT_ID_CONTEXTVAR.set(intake_database.schema)
+    with intake_database.engine.connect() as connection:
         transaction = connection.begin()
+        connection.exec_driver_sql(
+            f'SET LOCAL search_path TO "{intake_database.schema}", public'
+        )
         try:
             with Session(
                 connection, join_transaction_mode="create_savepoint"
@@ -79,6 +86,7 @@ def intake_session(
                 assert _existing_rows(session, existing) == before
         finally:
             transaction.rollback()
+            CURRENT_TENANT_ID_CONTEXTVAR.reset(context_token)
 
 
 @pytest.fixture

@@ -280,10 +280,11 @@ def _labels(session: Session, batch: RegulatoryDocumentIntake) -> dict[str, list
     }
 
 
-def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
-    from onyx.db.document_lineage import lineage_review_payload
-
-    members = intake_files(session, batch)
+def _require_intake_membership(
+    session: Session,
+    batch: RegulatoryDocumentIntake,
+    members: list[RegulatoryDocumentIntakeFile],
+) -> list[UUID]:
     ids = [item.user_file_id for item in members]
     membership = set(
         session.scalars(
@@ -293,16 +294,22 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             )
         )
     )
-    from onyx.db.document_intake_review import (
-        publication_decision_payload,
-        source_evidence_file_ids,
-    )
+    from onyx.db.document_intake_review import source_evidence_file_ids
 
     expected_membership = set(ids)
     if batch.stage in {"indexing", "completed", "lineage"} and batch.review_sha256:
         expected_membership -= source_evidence_file_ids(session, ids)
     if not ids or membership != expected_membership:
         raise IntakeConflictError("The imported document membership changed")
+    return ids
+
+
+def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
+    from onyx.db.document_intake_review import publication_decision_payload
+    from onyx.db.document_lineage import lineage_review_payload
+
+    members = intake_files(session, batch)
+    ids = _require_intake_membership(session, batch, members)
     chunks = list(
         session.scalars(
             select(RegulatoryChunk)
@@ -495,6 +502,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
         from onyx.db.document_intake_metadata import validate_intake_metadata_receipts
 
         try:
+            _require_intake_membership(session, batch, intake_files(session, batch))
             validate_intake_metadata_receipts(
                 session, batch, verify_contract_ack_bytes=False
             )
@@ -808,10 +816,11 @@ def approve_intake(
     refresh_intake(session, batch)
     if batch.status in {"completed", "approving"}:
         return []
+    current_review_sha256 = review_digest(session, batch)
     if (
         batch.status != "ready"
         or batch.review_sha256 != expected_review_sha256
-        or review_digest(session, batch) != expected_review_sha256
+        or current_review_sha256 != expected_review_sha256
     ):
         raise IntakeConflictError(
             "The ready document review changed; reload before approving"
