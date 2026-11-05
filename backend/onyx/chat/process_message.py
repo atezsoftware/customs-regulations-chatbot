@@ -62,6 +62,10 @@ from onyx.chat.models import (
 from onyx.chat.prompt_utils import calculate_reserved_tokens
 from onyx.chat.response_workflow import response_workflow
 from onyx.chat.save_chat import save_chat_turn
+from onyx.chat.session_attachments import (
+    build_asv3_attachment_context,
+    supports_asv3_session_attachments,
+)
 from onyx.chat.stop_signal_checker import TurnCancellationProbe, reset_cancel_status
 from onyx.chat.stream_buffer import StreamBufferWriter
 from onyx.configs.app_configs import DISABLE_VECTOR_DB, INTEGRATION_TESTS_MODE
@@ -884,6 +888,16 @@ def build_chat_turn(
         )
 
     persona = chat_session.persona
+    session_attachments_enabled = supports_asv3_session_attachments(new_msg_req)
+    if session_attachments_enabled and new_msg_req.file_descriptors:
+        from onyx.db.chat_attachments import canonicalize_and_bind_chat_attachments
+
+        new_msg_req.file_descriptors = canonicalize_and_bind_chat_attachments(
+            db_session=db_session,
+            descriptors=new_msg_req.file_descriptors,
+            chat_session_id=chat_session.id,
+            user_id=user_id,
+        )
     if new_msg_req.legal_review and (
         persona.id != DEFAULT_PERSONA_ID or chat_session.project_id is not None
     ):
@@ -975,6 +989,7 @@ def build_chat_turn(
 
     if (
         new_msg_req.file_descriptors
+        and not session_attachments_enabled
         and Permission.FULL_ADMIN_PANEL_ACCESS not in get_effective_permissions(user)
     ):
         raise OnyxError(
@@ -982,13 +997,27 @@ def build_chat_turn(
             "Only administrators can attach files to chats.",
         )
 
-    # Verify that any admin-specified files actually belong to the user.
-    verify_user_files(
-        user_files=new_msg_req.file_descriptors,
-        user_id=user_id,
-        db_session=db_session,
-        project_id=chat_session.project_id,
-    )
+    if not session_attachments_enabled:
+        verify_user_files(
+            user_files=new_msg_req.file_descriptors,
+            user_id=user_id,
+            db_session=db_session,
+            project_id=chat_session.project_id,
+        )
+
+    session_attachment_context = ""
+    if session_attachments_enabled and chat_session.user_id == user_id:
+        from onyx.db.chat_attachments import load_chat_session_attachments
+
+        session_attachment_context = build_asv3_attachment_context(
+            load_chat_session_attachments(
+                db_session=db_session,
+                chat_session_id=chat_session.id,
+                user_id=user_id,
+            ),
+            token_counter,
+            llms[0].config.max_input_tokens,
+        )
 
     from onyx.chat.chat_utils import load_chat_history_for_turn
 
@@ -1345,6 +1374,7 @@ def build_chat_turn(
         slack_context=slack_context,
         custom_tool_additional_headers=custom_tool_additional_headers,
         mcp_headers=mcp_headers,
+        session_attachment_context=session_attachment_context,
     )
 
 
@@ -2091,6 +2121,7 @@ def _run_models(
                         allow_external=setup.new_msg_req.asv3_allow_external,
                         user_memory_context=setup.user_memory_context,
                         inject_memories_in_prompt=user.use_memories,
+                        attachment_context=setup.session_attachment_context,
                     )
                 elif n_models == 1 and setup.new_msg_req.deep_research:
                     _validate_deep_research_scope(setup.persona, model_tools)

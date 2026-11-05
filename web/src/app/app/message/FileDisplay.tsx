@@ -36,13 +36,17 @@ export default function FileDisplay({ files }: FileDisplayProps) {
   const [previewingFile, setPreviewingFile] = useState<FileDescriptor | null>(
     null
   );
-  const textFiles = files.filter(
+  const sessionFiles = files.filter((file) => file.is_session_attachment);
+  const otherFiles = files.filter((file) => !file.is_session_attachment);
+  const textFiles = otherFiles.filter(
     (file) =>
       file.type === ChatFileType.PLAIN_TEXT ||
       file.type === ChatFileType.DOCUMENT
   );
-  const imageFiles = files.filter((file) => file.type === ChatFileType.IMAGE);
-  const tabularFiles = files.filter(
+  const imageFiles = otherFiles.filter(
+    (file) => file.type === ChatFileType.IMAGE
+  );
+  const tabularFiles = otherFiles.filter(
     (file) => file.type === ChatFileType.TABULAR
   );
 
@@ -53,6 +57,17 @@ export default function FileDisplay({ files }: FileDisplayProps) {
 
   return (
     <>
+      {sessionFiles.length > 0 && (
+        <FileContainer id="onyx-session-files">
+          {sessionFiles.map((file) => (
+            <Attachment
+              key={file.id}
+              fileName={file.name || file.id}
+              downloadUrl={`/api/chat/files/${encodeURIComponent(file.id)}`}
+            />
+          ))}
+        </FileContainer>
+      )}
       {previewingFile && (
         <PreviewModal
           presentingDocument={presentingDocument}

@@ -238,6 +238,7 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
     each in turn (cheapest first, so common paths short-circuit before the
     JSONB scan in `_documents_from_file_connector_config`):
 
+    - Private session attachments and plaintext caches override all shared access.
     - Regulatory source images with an actual parent link and the parent's ACL.
     - `UserFile` owned by the user.
     - `UserFile` attached to a `Persona` the user can read (public, owned,
@@ -251,7 +252,12 @@ def user_can_access_chat_file(file_id: str, user: User, db_session: Session) -> 
     URL carries the access context and one indexed lookup suffices, instead
     of fanning out 4–5 queries across unrelated classes on every request.
     """
+    from onyx.db.chat_attachments import get_chat_attachment_access
     from onyx.db.regulatory_public_reads import regulatory_source_image_owners
+
+    attachment_access = get_chat_attachment_access(db_session, file_id, user.id)
+    if attachment_access is not None:
+        return attachment_access
 
     scoped_image = regulatory_source_image_owners(db_session, file_id)
     if scoped_image is not None:

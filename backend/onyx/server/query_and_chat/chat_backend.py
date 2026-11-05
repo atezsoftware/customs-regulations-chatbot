@@ -1,8 +1,9 @@
 import datetime
 import json
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from datetime import timedelta
+from typing import cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -42,7 +43,12 @@ from onyx.configs.chat_configs import (
     CHAT_RESUME_POLL_INTERVAL_S,
     HARD_DELETE_CHATS,
 )
-from onyx.configs.constants import PUBLIC_API_TAGS, MessageType, MilestoneRecordType
+from onyx.configs.constants import (
+    PUBLIC_API_TAGS,
+    FileOrigin,
+    MessageType,
+    MilestoneRecordType,
+)
 from onyx.configs.model_configs import LITELLM_PASS_THROUGH_HEADERS
 from onyx.db.chat import (
     RESERVED_ASSISTANT_MESSAGE,
@@ -1209,10 +1215,22 @@ def fetch_chat_file(
         "Vary": "Cookie",
     }
 
-    if protected_file_ids(db_session, source_owners):
+    session_attachment = bool(
+        file_record.file_origin == FileOrigin.CHAT_UPLOAD
+        and isinstance(file_record.file_metadata, Mapping)
+        and cast(Mapping[str, object], file_record.file_metadata).get("kind")
+        == "session_attachment"
+    )
+    if session_attachment:
+        cache_headers = {
+            "Cache-Control": "private, no-store",
+            "Vary": "Cookie",
+            "X-Content-Type-Options": "nosniff",
+        }
+    elif protected_file_ids(db_session, source_owners):
         cache_headers["Cache-Control"] = "private, no-cache"
 
-    if request.headers.get("if-none-match") == etag:
+    if not session_attachment and request.headers.get("if-none-match") == etag:
         require_publication_files(observation, source_owners)
         return Response(status_code=304, headers=cache_headers)
 

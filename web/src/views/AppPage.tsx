@@ -612,6 +612,20 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     setSelectedAgentFromId,
   });
 
+  const handleFileUpload = useCallback(
+    (files: File[]) =>
+      handleMessageSpecificFileUpload(
+        files,
+        atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow
+      ),
+    [
+      handleMessageSpecificFileUpload,
+      atezSearchV3EnabledForCurrentWorkflow,
+      asv3ExpCroppedEnabledForCurrentWorkflow,
+    ]
+  );
+
   const {
     onMessageSelection,
     currentSessionFileTokenCount,
@@ -654,6 +668,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   }, [currentChatSessionId]);
 
   const handleResubmitLastMessage = useCallback(() => {
+    if (
+      (atezSearchV3EnabledForCurrentWorkflow ||
+        asv3ExpCroppedEnabledForCurrentWorkflow) &&
+      multiModel.isMultiModelActive
+    ) {
+      toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+      return;
+    }
     if (legalReviewEnabledForCurrentWorkflow && multiModel.isMultiModelActive) {
       toast.error(
         "Hukuki İnceleme (Flash) tek modelle çalışır. Ek modelleri kaldırın."
@@ -748,6 +770,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const onChat = useCallback(
     (message: string) => {
+      if (
+        (atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow) &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+        return;
+      }
       if (
         legalReviewEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive
@@ -874,6 +904,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
 
   const handleAppInputBarSubmit = useCallback(
     async (message: string) => {
+      if (
+        (atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow) &&
+        multiModel.isMultiModelActive
+      ) {
+        toast.error("Dosyalı ASv3 sorgusu için tek model seçin.");
+        return;
+      }
       if (
         legalReviewEnabledForCurrentWorkflow &&
         multiModel.isMultiModelActive
@@ -1127,9 +1165,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
             supersearchEnabledForCurrentWorkflow ||
             legalReviewEnabledForCurrentWorkflow
           }
-          onDrop={(acceptedFiles) =>
-            handleMessageSpecificFileUpload(acceptedFiles)
-          }
+          onDrop={handleFileUpload}
           noClick
         >
           {({ getRootProps }) => (
@@ -1507,7 +1543,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         availableContextTokens={availableContextTokens}
                         selectedAgent={selectedAgent || liveAgent}
-                        handleFileUpload={handleMessageSpecificFileUpload}
+                        handleFileUpload={handleFileUpload}
                         setPresentingDocument={setPresentingDocument}
                         // Intentionally enabled during name-only onboarding (showOnboarding=false)
                         // since LLM providers are already configured and the user can chat.

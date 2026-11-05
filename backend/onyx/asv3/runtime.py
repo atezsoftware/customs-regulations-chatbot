@@ -397,6 +397,7 @@ def run_asv3_loop(
     user_memory_context: UserMemoryContext | None = None,
     user_info: str | None = None,
     inject_memories_in_prompt: bool = True,
+    attachment_context: str = "",
 ) -> None:
     start = time.monotonic()
     composition_identity: dict[str, JsonValue] | None = None
@@ -513,6 +514,16 @@ def run_asv3_loop(
         if resume_message_id is not None
         else None
     )
+    attachment_sha256 = (
+        hashlib.sha256(attachment_context.encode()).hexdigest()
+        if attachment_context
+        else None
+    )
+    if (
+        previous is not None
+        and previous.get("session_attachment_sha256") != attachment_sha256
+    ):
+        raise ValueError("ASv3 resume requires the same session attachments")
     if resume_message_id is not None and (
         previous is None
         or previous.get("scope") != context.scope
@@ -695,9 +706,12 @@ def run_asv3_loop(
         CroppedRepairState(
             context,
             "\n\n".join(
-                message.message
-                for message in simple_chat_history[-8:]
-                if message.message_type == MessageType.USER
+                [
+                    message.message
+                    for message in simple_chat_history[-8:]
+                    if message.message_type == MessageType.USER
+                ]
+                + ([attachment_context] if attachment_context else [])
             )
             or question,
         )
@@ -951,6 +965,8 @@ def run_asv3_loop(
         for m in simple_chat_history[-8:]
         if m.message_type in (MessageType.USER, MessageType.ASSISTANT)
     )
+    if attachment_context:
+        history += "\n\n" + attachment_context
     model = ResearchModel(
         llm,
         context,
@@ -1156,6 +1172,8 @@ def run_asv3_loop(
         )
 
     def persist_checkpoint(snapshot: dict[str, JsonValue]) -> None:
+        if attachment_sha256 is not None:
+            snapshot["session_attachment_sha256"] = attachment_sha256
         with graph_step(
             "asv3.checkpoint_persistence", {"sequence": snapshot.get("sequence")}
         ) as persistence:
@@ -1563,6 +1581,8 @@ def run_asv3_loop(
                         composition_identity
                     )
                 augmentation_seconds = time.monotonic() - augmentation_started
+                if attachment_sha256 is not None:
+                    snapshot["session_attachment_sha256"] = attachment_sha256
                 submit_started = time.monotonic()
                 if checkpoint_writer is not None:
                     revision = checkpoint_writer.submit(snapshot)
@@ -1697,6 +1717,11 @@ def run_asv3_loop(
                 {
                     "language": child.language,
                     "scenario": question,
+                    **(
+                        {"user_attachments": attachment_context}
+                        if attachment_context
+                        else {}
+                    ),
                     "claim": str(args.get("claim", "")),
                     "evidence": _evidence_record(
                         ledger,

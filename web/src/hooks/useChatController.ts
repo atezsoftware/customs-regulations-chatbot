@@ -71,6 +71,12 @@ import {
 } from "@/app/app/stores/useChatSessionStore";
 import { explicitASv3ExternalConsent } from "@/lib/asv3/consent";
 import { compactASv3ProgressPackets } from "@/lib/asv3/retention";
+import {
+  asv3SessionFileToProjectFile,
+  deleteASv3SessionFile,
+  uploadASv3SessionFiles,
+} from "@/lib/asv3/sessionFiles";
+import { UserFileStatus } from "@/lib/projects/types";
 import { requestSupersearchStop } from "@/lib/chat/supersearchRecovery";
 import { Packet, MessageStart } from "@/app/app/services/streamingModels";
 import { SelectedModel } from "@/sections/model-selector/MultiModelSelector";
@@ -177,6 +183,18 @@ export default function useChatController({
   const currentSessionId = useChatSessionStore(
     (state) => state.currentSessionId
   );
+  const latestUploadSessionId = useRef(
+    currentSessionId || existingChatSessionId || ""
+  );
+  latestUploadSessionId.current =
+    currentSessionId || existingChatSessionId || "";
+  const uploadOwnerMounted = useRef(true);
+  useEffect(() => {
+    uploadOwnerMounted.current = true;
+    return () => {
+      uploadOwnerMounted.current = false;
+    };
+  }, []);
   const sessions = useChatSessionStore((state) => state.sessions);
 
   // Store actions - these don't cause re-renders
@@ -1573,7 +1591,66 @@ export default function useChatController({
   );
 
   const handleMessageSpecificFileUpload = useCallback(
-    async (acceptedFiles: File[]) => {
+    async (acceptedFiles: File[], sessionAttachments = false) => {
+      if (sessionAttachments) {
+        const targetSessionId = getCurrentSessionId();
+        const placeholders = acceptedFiles.map((file) =>
+          asv3SessionFileToProjectFile(
+            {
+              id: `upload-${crypto.randomUUID()}`,
+              name: file.name,
+              type: ChatFileType.PLAIN_TEXT,
+              token_count: 0,
+              size: file.size,
+            },
+            UserFileStatus.UPLOADING
+          )
+        );
+        const placeholderIds = new Set(placeholders.map((file) => file.id));
+        setCurrentMessageFiles((previous) => [...previous, ...placeholders]);
+        updateChatStateAction(targetSessionId, "uploading");
+        try {
+          const result = await uploadASv3SessionFiles(
+            acceptedFiles,
+            targetSessionId
+          );
+          if (
+            !uploadOwnerMounted.current ||
+            latestUploadSessionId.current !== targetSessionId
+          ) {
+            setCurrentMessageFiles((previous) =>
+              previous.filter((file) => !placeholderIds.has(file.id))
+            );
+            if (!targetSessionId) {
+              await Promise.allSettled(
+                result.files.map((file) => deleteASv3SessionFile(null, file.id))
+              );
+            }
+            return;
+          }
+          setCurrentMessageFiles((previous) => [
+            ...previous.filter((file) => !placeholderIds.has(file.id)),
+            ...result.files.map((file) => asv3SessionFileToProjectFile(file)),
+          ]);
+          if (result.rejected_files.length > 0) {
+            toast.error(
+              result.rejected_files
+                .map((file) => `${file.name}: ${file.reason}`)
+                .join(" | ")
+            );
+          }
+        } catch (error) {
+          setCurrentMessageFiles((previous) =>
+            previous.filter((file) => !placeholderIds.has(file.id))
+          );
+          toast.error(
+            error instanceof Error ? error.message : "Dosyalar yüklenemedi."
+          );
+        } finally {
+          updateChatStateAction(targetSessionId, "input");
+        }
+        return;
+      }
       const [_, llmModel] = getFinalLLM(
         llmManager.llmProviders || [],
         liveAgent || null,
@@ -1602,7 +1679,16 @@ export default function useChatController({
       setCurrentMessageFiles((prev) => [...prev, ...uploadedMessageFiles]);
       updateChatStateAction(getCurrentSessionId(), "input");
     },
-    [liveAgent, llmManager, forcedToolIds]
+    [
+      liveAgent,
+      llmManager,
+      forcedToolIds,
+      currentSessionId,
+      existingChatSessionId,
+      setCurrentMessageFiles,
+      updateChatStateAction,
+      beginUpload,
+    ]
   );
 
   useEffect(() => {

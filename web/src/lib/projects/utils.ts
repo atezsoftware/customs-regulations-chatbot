@@ -8,7 +8,9 @@ export function projectsFileToFileDescriptor(
     id: file.file_id,
     type: file.chat_file_type,
     name: file.name,
-    user_file_id: file.id,
+    ...(file.is_session_attachment
+      ? { is_session_attachment: true }
+      : { user_file_id: file.id }),
   };
 }
 
