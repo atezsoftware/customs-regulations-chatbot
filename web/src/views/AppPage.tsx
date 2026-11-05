@@ -613,16 +613,32 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
   });
 
   const handleFileUpload = useCallback(
-    (files: File[]) =>
-      handleMessageSpecificFileUpload(
-        files,
-        atezSearchV3EnabledForCurrentWorkflow ||
-          asv3ExpCroppedEnabledForCurrentWorkflow
-      ),
+    (files: File[]) => {
+      const legacyImageUpload =
+        !atezSearchV3EnabledForCurrentWorkflow &&
+        !asv3ExpCroppedEnabledForCurrentWorkflow &&
+        files.every((file) => file.type.startsWith("image/"));
+      const sessionUpload =
+        currentProjectId === null &&
+        (selectedAgent ?? liveAgent)?.id === 0 &&
+        !legacyImageUpload;
+      if (
+        sessionUpload &&
+        !atezSearchV3EnabledForCurrentWorkflow &&
+        !asv3ExpCroppedEnabledForCurrentWorkflow
+      ) {
+        toggleAtezSearchV3();
+      }
+      return handleMessageSpecificFileUpload(files, sessionUpload);
+    },
     [
       handleMessageSpecificFileUpload,
       atezSearchV3EnabledForCurrentWorkflow,
       asv3ExpCroppedEnabledForCurrentWorkflow,
+      currentProjectId,
+      selectedAgent,
+      liveAgent,
+      toggleAtezSearchV3,
     ]
   );
 
@@ -991,6 +1007,14 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
       // resetInputBar is called inside onChat for chat-routed queries.
       // For search-routed queries, the input bar is intentionally kept
       // so the user can see and refine their search query.
+      if (
+        (atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow) &&
+        currentMessageFiles.some((file) => file.is_session_attachment)
+      ) {
+        onChat(message);
+        return;
+      }
       await submitQuery(message, onChat);
     },
     [

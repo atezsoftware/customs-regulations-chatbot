@@ -67,11 +67,7 @@ import {
 } from "@/app/app/stores/useChatSessionStore";
 import QueuedMessageBar from "@/sections/input/QueuedMessageBar";
 import { handleInputNavKeys } from "@/sections/input/inputBarKeys";
-import {
-  asv3SessionFileToProjectFile,
-  deleteASv3SessionFile,
-} from "@/lib/asv3/sessionFiles";
-import type { ASv3SessionFile } from "@/lib/asv3/interfaces";
+import { deleteASv3SessionFile } from "@/lib/asv3/sessionFiles";
 import { toast } from "@opal/layouts";
 import ASv3SessionAttachments from "@/sections/input/ASv3SessionAttachments";
 
@@ -208,9 +204,6 @@ const AppInputBar = React.memo(
       (state) => state.removeCurrentQueuedMessage
     );
     const { user, isAdmin } = useUser();
-    const sessionAttachmentsEnabled =
-      atezSearchV3Enabled || asv3ExpCroppedEnabled;
-    const canAttachFiles = isAdmin || sessionAttachmentsEnabled;
     const attachmentSessionId = useChatSessionStore(
       (state) => state.currentSessionId
     );
@@ -392,6 +385,9 @@ const AppInputBar = React.memo(
     const { forcedToolIds, setForcedToolIds } = useForcedTools();
     const { currentMessageFiles, setCurrentMessageFiles, currentProjectId } =
       useProjectsContext();
+    const sessionUploadAvailable =
+      currentProjectId === null && selectedAgent?.id === DEFAULT_AGENT_ID;
+    const canAttachFiles = isAdmin || sessionUploadAvailable;
 
     const currentIndexingFiles = useMemo(() => {
       return currentMessageFiles.filter(
@@ -486,7 +482,8 @@ const AppInputBar = React.memo(
     // Animate attached files wrapper to its content height so CSS transitions
     // can interpolate between concrete pixel values (0px ↔ Npx).
     const showFiles =
-      !isSearchMode &&
+      (!isSearchMode ||
+        currentMessageFiles.some((file) => file.is_session_attachment)) &&
       !supersearchEnabled &&
       !legalReviewEnabled &&
       currentMessageFiles.length > 0;
@@ -540,17 +537,6 @@ const AppInputBar = React.memo(
         setCurrentMessageFiles((prev) => prev.filter((f) => f.id !== fileId));
       },
       [currentMessageFiles, setCurrentMessageFiles]
-    );
-
-    const handleUseDraftFile = useCallback(
-      (file: ASv3SessionFile) => {
-        setCurrentMessageFiles((previous) =>
-          previous.some((existing) => existing.file_id === file.id)
-            ? previous
-            : [...previous, asv3SessionFileToProjectFile(file)]
-        );
-      },
-      [setCurrentMessageFiles]
     );
 
     const { activePromptShortcuts } = usePromptShortcuts();
@@ -739,40 +725,42 @@ const AppInputBar = React.memo(
       >
         {/* Bottom left controls */}
         <div className="flex flex-row flex-1 min-w-0 items-center">
-          {canAttachFiles && !supersearchEnabled && !legalReviewEnabled && (
-            <FilePickerPopover
-              sessionAttachmentsOnly={sessionAttachmentsEnabled}
-              onFileClick={handleFileClick}
-              onPickRecent={(file: ProjectFile) => {
-                // Check if file with same ID already exists
-                if (
-                  !currentMessageFiles.some(
-                    (existingFile) => existingFile.file_id === file.file_id
-                  )
-                ) {
-                  setCurrentMessageFiles((prev) => [...prev, file]);
-                }
-              }}
-              onUnpickRecent={(file: ProjectFile) => {
-                setCurrentMessageFiles((prev) =>
-                  prev.filter(
-                    (existingFile) => existingFile.file_id !== file.file_id
-                  )
-                );
-              }}
-              handleUploadChange={handleUploadChange}
-              trigger={(open) => (
-                <Button
-                  disabled={disabled}
-                  icon={SvgPaperclip}
-                  tooltip="Attach Files"
-                  interaction={open ? "hover" : "rest"}
-                  prominence="tertiary"
-                />
-              )}
-              selectedFileIds={currentMessageFiles.map((f) => f.id)}
-            />
-          )}
+          {isAdmin &&
+            !sessionUploadAvailable &&
+            !supersearchEnabled &&
+            !legalReviewEnabled && (
+              <FilePickerPopover
+                onFileClick={handleFileClick}
+                onPickRecent={(file: ProjectFile) => {
+                  // Check if file with same ID already exists
+                  if (
+                    !currentMessageFiles.some(
+                      (existingFile) => existingFile.file_id === file.file_id
+                    )
+                  ) {
+                    setCurrentMessageFiles((prev) => [...prev, file]);
+                  }
+                }}
+                onUnpickRecent={(file: ProjectFile) => {
+                  setCurrentMessageFiles((prev) =>
+                    prev.filter(
+                      (existingFile) => existingFile.file_id !== file.file_id
+                    )
+                  );
+                }}
+                handleUploadChange={handleUploadChange}
+                trigger={(open) => (
+                  <Button
+                    disabled={disabled}
+                    icon={SvgPaperclip}
+                    tooltip="Attach Files"
+                    interaction={open ? "hover" : "rest"}
+                    prominence="tertiary"
+                  />
+                )}
+                selectedFileIds={currentMessageFiles.map((f) => f.id)}
+              />
+            )}
 
           {/* Controls that load in when data is ready */}
           <div
@@ -1316,14 +1304,15 @@ const AppInputBar = React.memo(
               </div>
             </div>
 
-            {sessionAttachmentsEnabled && (
+            {sessionUploadAvailable && (
               <ASv3SessionAttachments
                 chatSessionId={attachmentSessionId}
                 draftFileIds={currentMessageFiles.map((file) => file.id)}
                 revision={currentMessageFiles
                   .map((file) => `${file.id}:${file.status}`)
                   .join(",")}
-                onUseDraftFile={handleUseDraftFile}
+                onUploadFiles={handleFileUpload}
+                disabled={disabled || hasUploadingFiles || hasIndexingFiles}
               />
             )}
 

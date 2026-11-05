@@ -27,11 +27,16 @@ it("loads retained session files and removes them from future context", async ()
       chatSessionId="owned-session"
       draftFileIds={[]}
       revision=""
-      onUseDraftFile={jest.fn()}
+      onUploadFiles={jest.fn()}
     />
   );
 
   await screen.findByText("inceleme.pdf");
+  expect(
+    screen.getByText(
+      "Dosyalar ASv3 Tek veya exp cropped seçildiğinde kullanılır."
+    )
+  ).toBeVisible();
   expect(fetchMock).toHaveBeenCalledWith(
     "/api/chat/sessions/owned-session/files"
   );
@@ -55,65 +60,64 @@ it("loads retained session files and removes them from future context", async ()
   );
 });
 
-it.each(["owned-session", null])(
-  "does not duplicate files already visible in draft upload chips (%s)",
-  async (sessionId) => {
-    global.fetch = jest
-      .fn()
-      .mockResolvedValue({ ok: true, json: async () => [file] });
-    const { rerender } = render(
-      <ASv3SessionAttachments
-        chatSessionId={sessionId}
-        draftFileIds={[file.id]}
-        revision=""
-        onUseDraftFile={jest.fn()}
-      />
-    );
-    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
-    expect(screen.queryByText("inceleme.pdf")).not.toBeInTheDocument();
-
-    rerender(
-      <ASv3SessionAttachments
-        chatSessionId={sessionId}
-        draftFileIds={[]}
-        revision=""
-        onUseDraftFile={jest.fn()}
-      />
-    );
-    await screen.findByText("inceleme.pdf");
-  }
-);
-
-it("recovers unbound drafts only after an explicit add action", async () => {
-  const fetchMock = jest
+it("does not duplicate files already visible in draft upload chips", async () => {
+  const sessionId = "owned-session";
+  global.fetch = jest
     .fn()
     .mockResolvedValue({ ok: true, json: async () => [file] });
-  global.fetch = fetchMock;
-  const onUseDraftFile = jest.fn();
-  render(
+  const { rerender } = render(
     <ASv3SessionAttachments
-      chatSessionId={null}
-      draftFileIds={[]}
+      chatSessionId={sessionId}
+      draftFileIds={[file.id]}
       revision=""
-      onUseDraftFile={onUseDraftFile}
+      onUploadFiles={jest.fn()}
     />
   );
+  await waitFor(() => expect(global.fetch).toHaveBeenCalled());
+  expect(screen.queryByText("inceleme.pdf")).not.toBeInTheDocument();
 
-  await screen.findByText("Gönderilmemiş dosyalar");
-  expect(fetchMock).toHaveBeenCalledWith("/api/chat/files");
-  expect(onUseDraftFile).not.toHaveBeenCalled();
-  expect(screen.getByRole("link")).toHaveAttribute(
-    "href",
-    "/api/chat/files/saved-file-id"
+  rerender(
+    <ASv3SessionAttachments
+      chatSessionId={sessionId}
+      draftFileIds={[]}
+      revision=""
+      onUploadFiles={jest.fn()}
+    />
   );
-
-  await setupUser().click(
-    screen.getByRole("button", { name: "Bu soruya ekle" })
-  );
-  expect(onUseDraftFile).toHaveBeenCalledWith(file);
+  await screen.findByText("inceleme.pdf");
 });
 
-it("deletes recovered drafts without requiring a session", async () => {
+it("offers a direct labeled device upload before a session exists", async () => {
+  const fetchMock = jest
+    .fn()
+    .mockResolvedValue({ ok: true, json: async () => [file] });
+  global.fetch = fetchMock;
+  const onUploadFiles = jest.fn();
+  const { container } = render(
+    <ASv3SessionAttachments
+      chatSessionId={null}
+      draftFileIds={[]}
+      revision=""
+      onUploadFiles={onUploadFiles}
+    />
+  );
+  const input =
+    container.querySelector<HTMLInputElement>('input[type="file"]')!;
+  const button = screen.getByRole("button", { name: "Dosya ekle" });
+  expect(button).toBeVisible();
+  expect(input).toHaveAttribute("accept", ".pdf,.docx,.xlsx,.csv,.txt,.md");
+  const openPicker = jest.spyOn(input, "click");
+  const user = setupUser();
+  await user.click(button);
+  expect(openPicker).toHaveBeenCalledTimes(1);
+  const selected = new File(["data"], "inceleme.pdf", {
+    type: "application/pdf",
+  });
+  await user.upload(input, selected);
+  expect(onUploadFiles).toHaveBeenCalledWith([selected]);
+});
+
+it("never fetches or shows a recent or abandoned draft chooser", async () => {
   const fetchMock = jest
     .fn()
     .mockResolvedValue({ ok: true, json: async () => [file] });
@@ -123,19 +127,14 @@ it("deletes recovered drafts without requiring a session", async () => {
       chatSessionId={null}
       draftFileIds={[]}
       revision=""
-      onUseDraftFile={jest.fn()}
+      onUploadFiles={jest.fn()}
     />
   );
-
-  await screen.findByText("inceleme.pdf");
-  await setupUser().click(
-    screen.getByRole("button", { name: "inceleme.pdf dosyasını sil" })
-  );
-
   await waitFor(() =>
-    expect(screen.queryByText("inceleme.pdf")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Dosya ekle" })).toBeVisible()
   );
-  expect(fetchMock).toHaveBeenCalledWith("/api/chat/files/saved-file-id", {
-    method: "DELETE",
-  });
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(screen.queryByText("inceleme.pdf")).not.toBeInTheDocument();
+  expect(screen.queryByText("Recent Files")).not.toBeInTheDocument();
+  expect(screen.queryByText("Gönderilmemiş dosyalar")).not.toBeInTheDocument();
 });

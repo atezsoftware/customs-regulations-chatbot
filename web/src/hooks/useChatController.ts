@@ -176,8 +176,12 @@ export default function useChatController({
   const { pinnedAgents, togglePinnedAgent } = usePinnedAgents();
   const { agentPreferences } = useAgentPreferences();
   const { forcedToolIds } = useForcedTools();
-  const { fetchProjects, setCurrentMessageFiles, beginUpload } =
-    useProjectsContext();
+  const {
+    fetchProjects,
+    setCurrentMessageFiles,
+    beginUpload,
+    currentMessageFiles: composerFiles = [],
+  } = useProjectsContext();
 
   // Use selectors to access only the specific fields we need
   const currentSessionId = useChatSessionStore(
@@ -189,12 +193,33 @@ export default function useChatController({
   latestUploadSessionId.current =
     currentSessionId || existingChatSessionId || "";
   const uploadOwnerMounted = useRef(true);
+  // Only this composer's drafts are tracked; true protects an ID during submission.
+  const ownedUnboundFiles = useRef(new Map<string, boolean>());
+  const releaseOwnedDrafts = useCallback(async (ids: string[]) => {
+    await Promise.allSettled(
+      ids.map(async (id) => {
+        if (ownedUnboundFiles.current.get(id) !== false) return;
+        ownedUnboundFiles.current.delete(id);
+        await fetch(`/api/chat/files/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          keepalive: true,
+        });
+      })
+    );
+  }, []);
   useEffect(() => {
     uploadOwnerMounted.current = true;
+    const cleanupDrafts = (event?: PageTransitionEvent) => {
+      if (event?.persisted) return;
+      void releaseOwnedDrafts(Array.from(ownedUnboundFiles.current.keys()));
+    };
+    window.addEventListener("pagehide", cleanupDrafts);
     return () => {
       uploadOwnerMounted.current = false;
+      window.removeEventListener("pagehide", cleanupDrafts);
+      cleanupDrafts();
     };
-  }, []);
+  }, [releaseOwnedDrafts]);
   const sessions = useChatSessionStore((state) => state.sessions);
 
   // Store actions - these don't cause re-renders
@@ -406,7 +431,7 @@ export default function useChatController({
     setLatestMessageRenderComplete(currentSession, true);
   }, [currentMessageHistory, currentMessageTree]);
 
-  const onSubmit = useCallback(
+  const submitMessage = useCallback(
     async ({
       message,
       currentMessageFiles,
@@ -1159,6 +1184,9 @@ export default function useChatController({
             }
 
             if ((packet as MessageResponseIDInfo).user_message_id) {
+              effectiveFileDescriptors.forEach((file) =>
+                ownedUnboundFiles.current.delete(file.id)
+              );
               newUserMessageId = (packet as MessageResponseIDInfo)
                 .user_message_id;
               userNodeDirty = true;
@@ -1590,9 +1618,33 @@ export default function useChatController({
     ]
   );
 
+  const onSubmit = useCallback(
+    async (request: OnSubmitProps) => {
+      const draftIds = request.currentMessageFiles
+        .map((file) => file.file_id)
+        .filter((id) => ownedUnboundFiles.current.has(id));
+      draftIds.forEach((id) => ownedUnboundFiles.current.set(id, true));
+      try {
+        await submitMessage(request);
+      } finally {
+        draftIds.forEach((id) => {
+          if (ownedUnboundFiles.current.has(id))
+            ownedUnboundFiles.current.set(id, false);
+        });
+        if (!uploadOwnerMounted.current) await releaseOwnedDrafts(draftIds);
+      }
+    },
+    [submitMessage, releaseOwnedDrafts]
+  );
+
   const handleMessageSpecificFileUpload = useCallback(
     async (acceptedFiles: File[], sessionAttachments = false) => {
       if (sessionAttachments) {
+        await releaseOwnedDrafts(
+          Array.from(ownedUnboundFiles.current.keys()).filter(
+            (id) => !composerFiles.some((file) => file.file_id === id)
+          )
+        );
         const targetSessionId = getCurrentSessionId();
         const placeholders = acceptedFiles.map((file) =>
           asv3SessionFileToProjectFile(
@@ -1628,6 +1680,10 @@ export default function useChatController({
             }
             return;
           }
+          if (!targetSessionId)
+            result.files.forEach((file) =>
+              ownedUnboundFiles.current.set(file.id, false)
+            );
           setCurrentMessageFiles((previous) => [
             ...previous.filter((file) => !placeholderIds.has(file.id)),
             ...result.files.map((file) => asv3SessionFileToProjectFile(file)),
@@ -1688,6 +1744,8 @@ export default function useChatController({
       setCurrentMessageFiles,
       updateChatStateAction,
       beginUpload,
+      composerFiles,
+      releaseOwnedDrafts,
     ]
   );
 
