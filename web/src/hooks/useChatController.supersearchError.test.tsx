@@ -214,6 +214,118 @@ afterEach(() => {
   mockProjects.setCurrentMessageFiles.mockReset();
 });
 
+async function uploadOwnedDraft() {
+  const controller = setupController([], false);
+  act(() => useChatSessionStore.getState().setCurrentSession(null));
+  controller.rerender({ sessionId: "" });
+  let files: ProjectFile[] = [];
+  mockProjects.setCurrentMessageFiles.mockImplementation(
+    (update: (previous: ProjectFile[]) => ProjectFile[]) => {
+      files = update(files);
+    }
+  );
+  fetchMock.mockImplementation(async (input) => {
+    if (String(input) === "/api/chat/files/upload")
+      return {
+        ok: true,
+        json: async () => ({
+          files: [
+            {
+              id: "own-draft",
+              type: "plain_text",
+              name: "own.txt",
+              token_count: 1,
+              size: 4,
+            },
+          ],
+          rejected_files: [],
+        }),
+      } as Response;
+    return { ok: true, status: 204, json: async () => ({}) } as Response;
+  });
+  await act(async () => {
+    await controller.result.current.handleMessageSpecificFileUpload(
+      [new File(["text"], "own.txt")],
+      true
+    );
+  });
+  return { ...controller, files };
+}
+
+it.each(["pagehide", "unmount"])(
+  "cleans only this composer's completed unbound uploads on %s",
+  async (event) => {
+    const controller = await uploadOwnedDraft();
+    await act(async () => {
+      if (event === "pagehide") window.dispatchEvent(new Event("pagehide"));
+      else controller.unmount();
+    });
+    expect(
+      fetchMock.mock.calls.filter(([, request]) => request?.method === "DELETE")
+    ).toEqual([
+      ["/api/chat/files/own-draft", { method: "DELETE", keepalive: true }],
+    ]);
+  }
+);
+
+it("keeps drafts available when pagehide preserves the composer in BFCache", async () => {
+  const controller = await uploadOwnedDraft();
+  await act(async () => {
+    window.dispatchEvent(
+      new PageTransitionEvent("pagehide", { persisted: true })
+    );
+  });
+  expect(
+    fetchMock.mock.calls.filter(([, request]) => request?.method === "DELETE")
+  ).toHaveLength(0);
+  await act(async () => {
+    controller.unmount();
+  });
+  expect(
+    fetchMock.mock.calls.filter(([, request]) => request?.method === "DELETE")
+  ).toHaveLength(1);
+});
+
+it.each([true, false])(
+  "protects submitted drafts before navigation and restores failed submissions (accepted %s)",
+  async (acceptedByServer) => {
+    const controller = await uploadOwnedDraft();
+    act(() => useChatSessionStore.getState().setCurrentSession(SESSION));
+    controller.rerender({ sessionId: SESSION });
+    const persist = deferred<Response>();
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input).includes("update-chat-session-model"))
+        return persist.promise;
+      if (String(input) === "/api/chat/send-chat-message")
+        return streamResponse([accepted], false);
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+    let submission = Promise.resolve();
+    await act(async () => {
+      submission = controller.result.current
+        .onSubmit({
+          message: "question",
+          currentMessageFiles: controller.files,
+          deepResearch: false,
+          atezSearchV3: true,
+        })
+        .catch(() => {});
+    });
+    controller.unmount();
+    expect(
+      fetchMock.mock.calls.filter(([, request]) => request?.method === "DELETE")
+    ).toHaveLength(0);
+    await act(async () => {
+      if (acceptedByServer) persist.resolve({ ok: true } as Response);
+      else persist.reject(new Error("persist failed"));
+      await submission;
+    });
+    expect(
+      fetchMock.mock.calls.filter(([, request]) => request?.method === "DELETE")
+    ).toHaveLength(acceptedByServer ? 0 : 1);
+  }
+);
+
 it.each([
   [true, false],
   [false, false],

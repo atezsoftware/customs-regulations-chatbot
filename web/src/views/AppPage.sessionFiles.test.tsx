@@ -31,8 +31,95 @@ function loadSubmitHandler(name: string, context: Record<string, unknown>) {
   ).outputText;
   return new Function(...Object.keys(context), `${compiled}\nreturn handler;`)(
     ...Object.values(context)
-  ) as (message: string) => Promise<void> | void;
+  ) as (message: string | File[]) => Promise<void> | void;
 }
+
+describe("device upload workflow", () => {
+  function uploadContext(
+    tek = false,
+    cropped = false,
+    agentId = 0,
+    projectId: number | null = null
+  ) {
+    return {
+      currentProjectId: projectId,
+      selectedAgent: { id: agentId },
+      liveAgent: { id: agentId },
+      atezSearchV3EnabledForCurrentWorkflow: tek,
+      asv3ExpCroppedEnabledForCurrentWorkflow: cropped,
+      toggleAtezSearchV3: jest.fn(),
+      handleMessageSpecificFileUpload: jest.fn(),
+    };
+  }
+
+  it("selects Tek and uses private upload for a fresh default assistant", async () => {
+    const context = uploadContext();
+    const files = [new File(["text"], "inceleme.txt")];
+    await loadSubmitHandler("handleFileUpload", context)(files);
+    expect(context.toggleAtezSearchV3).toHaveBeenCalledTimes(1);
+    expect(context.handleMessageSpecificFileUpload).toHaveBeenCalledWith(
+      files,
+      true
+    );
+  });
+
+  it("preserves the existing vision upload path for image-only default input", async () => {
+    const context = uploadContext();
+    const files = [new File(["image"], "image.png", { type: "image/png" })];
+    await loadSubmitHandler("handleFileUpload", context)(files);
+    expect(context.toggleAtezSearchV3).not.toHaveBeenCalled();
+    expect(context.handleMessageSpecificFileUpload).toHaveBeenCalledWith(
+      files,
+      false
+    );
+  });
+
+  it.each([
+    [true, false],
+    [false, true],
+  ])(
+    "preserves the selected ASv3 mode (Tek %s, Cropped %s)",
+    async (tek, cropped) => {
+      const context = uploadContext(tek, cropped);
+      const files = [new File(["text"], "inceleme.txt")];
+      await loadSubmitHandler("handleFileUpload", context)(files);
+      expect(context.toggleAtezSearchV3).not.toHaveBeenCalled();
+      expect(context.handleMessageSpecificFileUpload).toHaveBeenCalledWith(
+        files,
+        true
+      );
+    }
+  );
+
+  it.each([
+    [1, null],
+    [0, 1],
+  ])(
+    "preserves other assistant/project upload behavior (%s, %s)",
+    async (agentId, projectId) => {
+      const context = uploadContext(false, false, agentId!, projectId);
+      const files = [new File(["text"], "inceleme.txt")];
+      await loadSubmitHandler("handleFileUpload", context)(files);
+      expect(context.toggleAtezSearchV3).not.toHaveBeenCalled();
+      expect(context.handleMessageSpecificFileUpload).toHaveBeenCalledWith(
+        files,
+        false
+      );
+    }
+  );
+});
+
+it("routes a new question with private ASv3 files to chat even if query mode prefers search", async () => {
+  const context = {
+    ...submitContext("atezSearchV3", false),
+    currentChatSessionId: null,
+    onChat: jest.fn(),
+    submitQuery: jest.fn(),
+  };
+  await loadSubmitHandler("handleAppInputBarSubmit", context)("question");
+  expect(context.onChat).toHaveBeenCalledWith("question");
+  expect(context.submitQuery).not.toHaveBeenCalled();
+});
 
 function submitContext(workflow: string, multiModelActive = true) {
   const flags = Object.fromEntries(

@@ -1,35 +1,41 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import useSWR from "swr";
 import { Button, Text } from "@opal/components";
-import { SvgDownload, SvgX } from "@opal/icons";
+import { SvgDownload, SvgPaperclip, SvgX } from "@opal/icons";
 import { toast } from "@opal/layouts";
 import type { ASv3SessionFile } from "@/lib/asv3/interfaces";
-import { deleteASv3SessionFile } from "@/lib/asv3/sessionFiles";
+import {
+  ASV3_SESSION_FILE_ACCEPT,
+  deleteASv3SessionFile,
+} from "@/lib/asv3/sessionFiles";
 import { errorHandlingFetcher } from "@/lib/fetcher";
 
 interface ASv3SessionAttachmentsProps {
   chatSessionId: string | null;
   draftFileIds: string[];
   revision: string;
-  onUseDraftFile: (file: ASv3SessionFile) => void;
+  onUploadFiles: (files: File[]) => void;
+  disabled?: boolean;
 }
 
 export default function ASv3SessionAttachments({
   chatSessionId,
   draftFileIds,
   revision,
-  onUseDraftFile,
+  onUploadFiles,
+  disabled = false,
 }: ASv3SessionAttachmentsProps) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const { data, error, mutate } = useSWR<ASv3SessionFile[]>(
-    [
-      chatSessionId
-        ? `/api/chat/sessions/${encodeURIComponent(chatSessionId)}/files`
-        : "/api/chat/files",
-      revision,
-    ],
+    chatSessionId
+      ? [
+          `/api/chat/sessions/${encodeURIComponent(chatSessionId)}/files`,
+          revision,
+        ]
+      : null,
     ([url]: [string, string]) => errorHandlingFetcher<ASv3SessionFile[]>(url)
   );
   const files = data?.filter((file) => !draftFileIds.includes(file.id)) ?? [];
@@ -51,24 +57,40 @@ export default function ASv3SessionAttachments({
     }
   }
 
-  if (error) {
-    return (
-      <Text font="secondary-body" color="text-03">
-        {chatSessionId
-          ? "Oturum dosyaları yüklenemedi."
-          : "Gönderilmemiş dosyalar yüklenemedi."}
-      </Text>
-    );
-  }
-  if (files.length === 0) return null;
-
   return (
     <div className="flex flex-col gap-1 p-1">
-      <Text font="secondary-body" color="text-03">
-        {chatSessionId
-          ? "Bu oturumda kullanılan dosyalar"
-          : "Gönderilmemiş dosyalar"}
-      </Text>
+      <input
+        ref={fileInputRef}
+        type="file"
+        className="hidden"
+        multiple
+        accept={ASV3_SESSION_FILE_ACCEPT}
+        disabled={disabled}
+        onChange={(event) => {
+          const selected = Array.from(event.currentTarget.files ?? []);
+          if (selected.length > 0) onUploadFiles(selected);
+          event.currentTarget.value = "";
+        }}
+      />
+      <Button
+        icon={SvgPaperclip}
+        prominence="secondary"
+        size="sm"
+        disabled={disabled}
+        onClick={() => fileInputRef.current?.click()}
+      >
+        Dosya ekle
+      </Button>
+      {error && (
+        <Text font="secondary-body" color="text-03">
+          Oturum dosyaları yüklenemedi.
+        </Text>
+      )}
+      {files.length > 0 && (
+        <Text font="secondary-body" color="text-03">
+          Bu oturumda kullanılan dosyalar
+        </Text>
+      )}
       <div className="flex flex-wrap gap-1">
         {files.map((file) => (
           <div
@@ -76,16 +98,6 @@ export default function ASv3SessionAttachments({
             className="flex items-center gap-1 rounded-08 border border-border-01 p-1"
           >
             <Text font="secondary-body">{file.name || file.id}</Text>
-            {!chatSessionId && (
-              <Button
-                prominence="secondary"
-                size="sm"
-                disabled={removingId !== null}
-                onClick={() => onUseDraftFile(file)}
-              >
-                Bu soruya ekle
-              </Button>
-            )}
             <Button
               href={`/api/chat/files/${encodeURIComponent(file.id)}`}
               icon={SvgDownload}
@@ -95,10 +107,8 @@ export default function ASv3SessionAttachments({
             />
             <Button
               icon={SvgX}
-              tooltip={
-                chatSessionId ? "Oturumdan kaldır" : "Taslak dosyayı sil"
-              }
-              aria-label={`${file.name || file.id} dosyasını ${chatSessionId ? "oturumdan kaldır" : "sil"}`}
+              tooltip="Oturumdan kaldır"
+              aria-label={`${file.name || file.id} dosyasını oturumdan kaldır`}
               prominence="tertiary"
               size="sm"
               disabled={removingId !== null}
@@ -107,6 +117,11 @@ export default function ASv3SessionAttachments({
           </div>
         ))}
       </div>
+      {files.length > 0 && (
+        <Text font="secondary-body" color="text-03">
+          Dosyalar ASv3 Tek veya exp cropped seçildiğinde kullanılır.
+        </Text>
+      )}
     </div>
   );
 }

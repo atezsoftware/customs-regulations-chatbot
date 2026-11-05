@@ -5,6 +5,11 @@ Document set, mevzuat kataloğu, Elasticsearch veya embedding indeksine eklenmez
 Yerel parser dosyadan metin çıkarır; yükleme LLM çağrısı veya importer/Celery işi
 başlatmaz. Yükleme başarılı döndüğünde metin kullanıma hazırdır.
 
+Web'de varsayılan sohbet ekranındaki **Dosya ekle** düğmesi doğrudan cihazın
+dosya seçicisini açar; Recent Files listesi gösterilmez. Dosya seçildiğinde ASv3
+Tek etkinleşir. ASv3 Tek veya Exp Cropped zaten seçiliyse bu seçim korunur.
+Yüklenen dosyalar mesaj kutusunda, gönderildikten sonra ilgili session'da görünür.
+
 Bu doküman bu değişikliğin API sözleşmesidir; kurulu bir ortamda kullanılabilmesi
 için bu sürümün backend ve web bileşenlerinin yayımlanması gerekir.
 
