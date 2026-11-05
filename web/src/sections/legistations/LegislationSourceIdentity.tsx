@@ -60,7 +60,7 @@ export default function LegislationSourceIdentity({
             <Button
               size="sm"
               prominence="tertiary"
-              aria-label={label}
+              aria-label={`${item.label === "Ana dosya" ? "Ana dosyayı aç" : "Eki aç"}: ${title}`}
               disabled={loading !== null}
               onClick={() => void openFile(item.user_file_id)}
             >
