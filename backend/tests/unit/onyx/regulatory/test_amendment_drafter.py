@@ -778,3 +778,60 @@ def test_source_derived_clause_identity_cannot_cross_parent_articles() -> None:
                 "metadata": {"article_no": "9", "paragraph_no": "2"},
             },
         )
+
+
+@pytest.mark.parametrize("empty_text", ["", " \n\t"])
+def test_multi_chunk_repeal_corrects_blank_provider_output_before_persisting(
+    monkeypatch: pytest.MonkeyPatch, empty_text: str
+) -> None:
+    import json
+    from contextlib import nullcontext
+
+    from onyx.llm.model_response import Choice, Message, ModelResponse
+    from onyx.regulatory import structured_llm
+
+    valid = MultiChunkDraftResult(
+        changes=[
+            MultiChunkFieldsDraft(
+                old_chunk_id="repealed-clause",
+                instruction_indexes=[0],
+                new_chunk=ChunkFieldsDraft(text="d) (Mülga)", chunk_type="clause"),
+            )
+        ],
+        dates=DateResolution(
+            effective_start_date="2026-10-16", rationale="Publication date"
+        ),
+    )
+    invalid = valid.model_dump(mode="json")
+    invalid["changes"][0]["new_chunk"]["text"] = empty_text
+    llm = MagicMock()
+    llm.invoke.side_effect = [
+        ModelResponse(
+            id=f"repeal-{index}",
+            created="2026-11-05T00:00:00Z",
+            choice=Choice(message=Message(content=body)),
+        )
+        for index, body in enumerate([json.dumps(invalid), valid.model_dump_json()])
+    ]
+    monkeypatch.setattr(
+        structured_llm, "llm_generation_span", lambda **_: nullcontext(MagicMock())
+    )
+    monkeypatch.setattr(structured_llm, "record_llm_response", lambda *_: None)
+    draft = drafter.draft_multi_chunk_scope(
+        llm,
+        instructions=[
+            AmendmentInstruction(
+                instruction_text="MADDE 4- Aynı Tebliğin Ek IV’ünde yer alan (d) bendi yürürlükten kaldırılmıştır."
+            )
+        ],
+        old_chunks=[
+            {"id": "header", "text": "Ölçüm Yöntemleri"},
+            {
+                "id": "repealed-clause",
+                "text": "d) Eski hüküm.",
+                "metadata": {"appendix_label": "EK IV", "clause_label": "d"},
+            },
+        ],
+        reference_date="2026-10-16",
+    )
+    assert draft == valid and llm.invoke.call_count == 2
