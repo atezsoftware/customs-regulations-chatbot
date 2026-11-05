@@ -23,7 +23,7 @@ from shared_configs.contextvars import (
 )
 from tests.unit.onyx.regulatory.test_intake_metadata import _sources
 
-_RECIPE = "60905f1081e5af6f9939d33b85829f3b8588ba1d463ec7278850ad24906f2f83"
+_RECIPE = "32b197d7d598e7557561f107afae914ca10bfabe7b44ccc5ad31a6c658daf506"
 
 
 @pytest.mark.parametrize(

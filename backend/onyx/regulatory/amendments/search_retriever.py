@@ -47,6 +47,7 @@ from onyx.llm.interfaces import LLM
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -266,6 +267,7 @@ class AmendmentSearchRetriever:
         adds_provision = bool(
             explicitly_adds_top_level_provision(instruction.instruction_text)
             or added_subordinate_unit_kind(instruction.instruction_text)
+            or annex_item_addition(instruction.instruction_text)
         )
         if source_files is not None and len(set(source_files)) > 1 and adds_provision:
             self.query_stats = []
@@ -321,7 +323,10 @@ class AmendmentSearchRetriever:
 
         if (
             not recovery
-            and added_subordinate_unit_kind(instruction.instruction_text) is not None
+            and (
+                added_subordinate_unit_kind(instruction.instruction_text) is not None
+                or annex_item_addition(instruction.instruction_text) is not None
+            )
             and source_files is not None
             and len(set(source_files)) == 1
             and validated_addition_anchor(instruction, structural) is not None

@@ -1,6 +1,7 @@
 """Deterministic safety policy for brand-new top-level provisions."""
 
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 from onyx.regulatory.amendments.structural_target import amendment_operation_text
@@ -38,6 +39,43 @@ _ADDED_CLAUSE_RE = re.compile(
 SubordinateUnitKind = Literal["paragraph", "clause"]
 
 
+@dataclass(frozen=True)
+class AnnexItemAddition:
+    appendix_label: str
+    item_no: str
+    body: str
+
+
+def annex_item_addition(instruction_text: str) -> AnnexItemAddition | None:
+    from onyx.regulatory.amendments.models import AmendmentInstruction
+    from onyx.regulatory.amendments.structural_target import (
+        parse_amendment_structural_target,
+    )
+
+    command = amendment_operation_text(instruction_text)
+    if not re.search(
+        rf"aşağıdaki\s+(?:yeni\s+)?(?:madde|tanım|paragraf)\b.*?{_ADDITION_VERB}",
+        command,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        return None
+    target = parse_amendment_structural_target(
+        AmendmentInstruction(instruction_text=instruction_text)
+    )
+    if target is None or target.appendix_label is None or target.article_no is not None:
+        return None
+    quoted = re.search(
+        r'[“"](?P<body>\d{1,4}\.\s+.+)[”"]\s*[.!]?\s*$', instruction_text, re.DOTALL
+    )
+    if quoted is None:
+        return None
+    body = quoted["body"].strip()
+    markers = re.findall(r"(?m)^\s*(\d{1,4})\.\s+", body)
+    if len(markers) != 1:
+        return None
+    return AnnexItemAddition(target.appendix_label, str(int(markers[0])), body)
+
+
 def explicitly_adds_top_level_provision(instruction_text: str) -> bool:
     """Return true only when the text itself adds a top-level article.
 
@@ -47,6 +85,8 @@ def explicitly_adds_top_level_provision(instruction_text: str) -> bool:
 
     # The instruction's own "MADDE N-" designator is not a provision it adds.
     normalized = " ".join(amendment_operation_text(instruction_text).split())
+    if annex_item_addition(instruction_text) is not None:
+        return False
     if _SUBORDINATE_ADDITION_RE.search(normalized):
         return False
     return any(pattern.search(normalized) for pattern in _TOP_LEVEL_ADDITION_PATTERNS)

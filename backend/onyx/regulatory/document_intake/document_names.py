@@ -36,7 +36,7 @@ def intake_document_name(
                 manually_reviewed = True
                 destination = manual
             elif (
-                source == "llm"
+                source in {"llm", "source_opening"}
                 and not entry.get("stale")
                 and isinstance(value, str)
                 and _normalized(value) in _normalized(source_text)

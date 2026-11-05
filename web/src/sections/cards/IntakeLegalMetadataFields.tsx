@@ -37,28 +37,34 @@ export function IntakeMetadataOrigin({
       ? pendingManual
         ? "Manual · unsaved"
         : "Manual review"
-      : source === "llm"
-        ? `Gemini · ${typeof audit.model === "string" ? audit.model : "model extraction"}`
-        : source === "structural"
-          ? "Chunker"
-          : "Source not recorded";
+      : source === "source_opening"
+        ? "Document opening"
+        : source === "llm"
+          ? `Gemini · ${typeof audit.model === "string" ? audit.model : "model extraction"}`
+          : source === "structural"
+            ? "Chunker"
+            : "Source not recorded";
   const rationale =
-    basis === "relative_publication"
-      ? "Calculated relative to publication date."
-      : basis === "explicit"
-        ? "Explicit wording in the source."
-        : basis === "chunker"
-          ? "Extracted from document structure."
-          : basis === "user_review"
-            ? "Entered during user review."
-            : null;
+    basis === "own_source_opening"
+      ? "Verified against the document’s own opening title."
+      : basis === "relative_publication"
+        ? "Calculated relative to publication date."
+        : basis === "explicit"
+          ? "Explicit wording in the source."
+          : basis === "chunker"
+            ? "Extracted from document structure."
+            : basis === "user_review"
+              ? "Entered during user review."
+              : null;
   return (
     <div className="flex flex-col gap-1">
       <div className="flex flex-wrap gap-1">
         <Tag title={label} />
-        {!pendingManual && source === "llm" && review.stale === true && (
-          <Tag title="Source changed · review needed" />
-        )}
+        {!pendingManual &&
+          (source === "llm" || source === "source_opening") &&
+          review.stale === true && (
+            <Tag title="Source changed · review needed" />
+          )}
       </div>
       {rationale && (
         <Text font="secondary-body" color="text-03">

@@ -43,6 +43,7 @@ from onyx.regulatory.amendments.match_checkpoint import (
 from onyx.regulatory.amendments.models import AmendmentInstruction, MatchResult
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.pipeline import (
@@ -178,6 +179,17 @@ def retrieve_and_confirm_instruction(
     if appendix_note is not None:
         trace.note = "This annex target needs its replacement body supplied."
         return candidates, None
+    if annex_item_addition(instruction.instruction_text) is not None:
+        from onyx.regulatory.amendments.target_scope import validated_addition_anchor
+
+        if validated_addition_anchor(instruction, candidates) is not None:
+            trace.confirmations += 1
+            return candidates, MatchResult(
+                outcome="new_provision",
+                old_chunk_id=None,
+                confidence=1.0,
+                rationale="Explicit numbered annex addition anchored in one verified source; list identity and boundaries require full-source validation before drafting",
+            )
 
     def exact_match(items: list[CandidateChunk]) -> MatchResult | None:
         structural_candidate = (
@@ -185,6 +197,7 @@ def retrieve_and_confirm_instruction(
             if not (
                 explicitly_adds_top_level_provision(instruction.instruction_text)
                 or added_subordinate_unit_kind(instruction.instruction_text)
+                or annex_item_addition(instruction.instruction_text)
             )
             else None
         )
@@ -732,6 +745,8 @@ def run_amendment_batch(
             else []
         )
         appendix_candidate_ids = list(dict.fromkeys(appendix_candidate_ids))
+        if ordered_group[0].match.old_chunk_id is None:
+            appendix_candidate_ids = []
         contexts = []
         heading_group = any(
             article_heading_title(item.instruction.instruction_text)

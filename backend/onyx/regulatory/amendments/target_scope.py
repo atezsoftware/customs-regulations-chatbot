@@ -8,6 +8,7 @@ from dataclasses import replace
 from onyx.regulatory.amendments.models import AmendmentInstruction
 from onyx.regulatory.amendments.new_provision_policy import (
     added_subordinate_unit_kind,
+    annex_item_addition,
     explicitly_adds_top_level_provision,
 )
 from onyx.regulatory.amendments.ranker import CandidateChunk
@@ -216,8 +217,11 @@ def validated_addition_anchor(
     """Require one identified source and, for a subunit, its actual parent."""
     target = parse_amendment_structural_target(instruction)
     subordinate = added_subordinate_unit_kind(instruction.instruction_text)
-    if subordinate is None and not explicitly_adds_top_level_provision(
-        instruction.instruction_text
+    annex = annex_item_addition(instruction.instruction_text)
+    if (
+        annex is None
+        and subordinate is None
+        and not explicitly_adds_top_level_provision(instruction.instruction_text)
     ):
         return None
     identified = [
@@ -236,6 +240,21 @@ def validated_addition_anchor(
     ]
     if len({candidate.user_file_id for candidate in identified}) != 1:
         return None
+    if annex is not None:
+        from onyx.regulatory.amendments.structural_target import (
+            normalize_appendix_label,
+        )
+
+        identified = [
+            candidate
+            for candidate in identified
+            if candidate.source_verified
+            and not candidate.source_ambiguous
+            and normalize_appendix_label(
+                str(candidate.metadata.get("appendix_label") or "")
+            )
+            == normalize_appendix_label(annex.appendix_label)
+        ]
     if subordinate is not None:
         if target is None or target.article_no is None:
             return None
