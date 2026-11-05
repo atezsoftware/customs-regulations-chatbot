@@ -381,6 +381,7 @@ def verify_user_files(
     Raises:
         ValueError: If any file does not belong to the user or is not found
     """
+    from onyx.db.chat_attachments import reject_session_attachment_in_generic_chat
     from onyx.db.models import Project__UserFile
     from onyx.db.projects import check_project_ownership
 
@@ -389,6 +390,9 @@ def verify_user_files(
     project_file_ids = []
 
     for file_descriptor in user_files:
+        reject_session_attachment_in_generic_chat(
+            db_session, file_descriptor["id"], user_id
+        )
         # Check if this file descriptor has a user_file_id
         if file_descriptor.get("user_file_id"):
             try:

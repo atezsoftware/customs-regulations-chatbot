@@ -170,6 +170,8 @@ def delete_orphaned_search_docs(db_session: Session) -> None:
 def delete_messages_and_files_from_chat_session(
     chat_session_id: UUID, db_session: Session
 ) -> None:
+    from onyx.db.chat_attachments import delete_chat_session_attachment_files
+
     delete_answer_graphs_for_session(db_session, chat_session_id)
     # Graph cleanup commits internally; lock before deleting the feedback snapshot's messages.
     db_session.scalar(
@@ -189,8 +191,13 @@ def delete_messages_and_files_from_chat_session(
     )
 
     file_store = get_default_file_store()
+    removed_attachment_ids = delete_chat_session_attachment_files(
+        db_session, chat_session_id
+    )
     for _, files in messages_with_files:
         for file_info in files or []:
+            if file_info["id"] in removed_attachment_ids:
+                continue
             if file_info.get("user_file_id"):
                 # user files are managed by the user file lifecycle
                 continue

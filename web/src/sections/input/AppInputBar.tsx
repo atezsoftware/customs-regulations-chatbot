@@ -48,6 +48,7 @@ import {
   SvgX,
   SvgSimpleLoader,
   SvgSparkle,
+  SvgDownload,
 } from "@opal/icons";
 import { DEFAULT_AGENT_ID } from "@/lib/constants";
 import { Button, SelectButton, Text } from "@opal/components";
@@ -66,6 +67,13 @@ import {
 } from "@/app/app/stores/useChatSessionStore";
 import QueuedMessageBar from "@/sections/input/QueuedMessageBar";
 import { handleInputNavKeys } from "@/sections/input/inputBarKeys";
+import {
+  asv3SessionFileToProjectFile,
+  deleteASv3SessionFile,
+} from "@/lib/asv3/sessionFiles";
+import type { ASv3SessionFile } from "@/lib/asv3/interfaces";
+import { toast } from "@opal/layouts";
+import ASv3SessionAttachments from "@/sections/input/ASv3SessionAttachments";
 
 export interface AppInputBarHandle {
   reset: () => void;
@@ -200,6 +208,12 @@ const AppInputBar = React.memo(
       (state) => state.removeCurrentQueuedMessage
     );
     const { user, isAdmin } = useUser();
+    const sessionAttachmentsEnabled =
+      atezSearchV3Enabled || asv3ExpCroppedEnabled;
+    const canAttachFiles = isAdmin || sessionAttachmentsEnabled;
+    const attachmentSessionId = useChatSessionStore(
+      (state) => state.currentSessionId
+    );
     const isAutoSending = useRef(false);
     const inputWrapperRef = useRef<HTMLDivElement>(null);
     const {
@@ -418,13 +432,13 @@ const AppInputBar = React.memo(
 
     const handleUploadChange = useCallback(
       async (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (!isAdmin) return;
+        if (!canAttachFiles) return;
         const files = e.target.files;
         if (!files || files.length === 0) return;
         handleFileUpload(Array.from(files));
         e.target.value = "";
       },
-      [handleFileUpload, isAdmin]
+      [handleFileUpload, canAttachFiles]
     );
 
     const combinedSettingsData = useSettings();
@@ -493,7 +507,7 @@ const AppInputBar = React.memo(
     function handlePaste(event: React.ClipboardEvent) {
       if (disabled) return;
       const pastedFiles =
-        isAdmin && !supersearchEnabled && !legalReviewEnabled
+        canAttachFiles && !supersearchEnabled && !legalReviewEnabled
           ? getPastedFilesIfNoText(event.clipboardData)
           : [];
       if (pastedFiles.length > 0) {
@@ -510,8 +524,31 @@ const AppInputBar = React.memo(
     }
 
     const handleRemoveMessageFile = useCallback(
-      (fileId: string) => {
+      async (fileId: string) => {
+        const file = currentMessageFiles.find((entry) => entry.id === fileId);
+        const sessionId = useChatSessionStore.getState().currentSessionId;
+        if (file?.is_session_attachment) {
+          try {
+            await deleteASv3SessionFile(sessionId, fileId);
+          } catch (error) {
+            toast.error(
+              error instanceof Error ? error.message : "Dosya kaldırılamadı."
+            );
+            return;
+          }
+        }
         setCurrentMessageFiles((prev) => prev.filter((f) => f.id !== fileId));
+      },
+      [currentMessageFiles, setCurrentMessageFiles]
+    );
+
+    const handleUseDraftFile = useCallback(
+      (file: ASv3SessionFile) => {
+        setCurrentMessageFiles((previous) =>
+          previous.some((existing) => existing.file_id === file.id)
+            ? previous
+            : [...previous, asv3SessionFileToProjectFile(file)]
+        );
       },
       [setCurrentMessageFiles]
     );
@@ -702,8 +739,9 @@ const AppInputBar = React.memo(
       >
         {/* Bottom left controls */}
         <div className="flex flex-row flex-1 min-w-0 items-center">
-          {isAdmin && !supersearchEnabled && !legalReviewEnabled && (
+          {canAttachFiles && !supersearchEnabled && !legalReviewEnabled && (
             <FilePickerPopover
+              sessionAttachmentsOnly={sessionAttachmentsEnabled}
               onFileClick={handleFileClick}
               onPickRecent={(file: ProjectFile) => {
                 // Check if file with same ID already exists
@@ -1255,17 +1293,39 @@ const AppInputBar = React.memo(
             >
               <div ref={filesContentRef} className="flex flex-wrap gap-1">
                 {currentMessageFiles.map((file) => (
-                  <FileCard
-                    key={file.id}
-                    file={file}
-                    removeFile={handleRemoveMessageFile}
-                    hideProcessingState={hideProcessingState}
-                    onFileClick={handleFileClick}
-                    compactImages={shouldCompactImages}
-                  />
+                  <div key={file.id} className="flex items-center gap-1">
+                    <FileCard
+                      file={file}
+                      removeFile={handleRemoveMessageFile}
+                      hideProcessingState={hideProcessingState}
+                      onFileClick={handleFileClick}
+                      compactImages={shouldCompactImages}
+                    />
+                    {file.is_session_attachment &&
+                      file.status === UserFileStatus.COMPLETED && (
+                        <Button
+                          icon={SvgDownload}
+                          href={`/api/chat/files/${encodeURIComponent(file.file_id)}`}
+                          tooltip="Dosyayı indir"
+                          prominence="tertiary"
+                          size="sm"
+                        />
+                      )}
+                  </div>
                 ))}
               </div>
             </div>
+
+            {sessionAttachmentsEnabled && (
+              <ASv3SessionAttachments
+                chatSessionId={attachmentSessionId}
+                draftFileIds={currentMessageFiles.map((file) => file.id)}
+                revision={currentMessageFiles
+                  .map((file) => `${file.id}:${file.status}`)
+                  .join(",")}
+                onUseDraftFile={handleUseDraftFile}
+              />
+            )}
 
             <div className="flex flex-row items-center w-full">
               <Popover

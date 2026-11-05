@@ -1,6 +1,7 @@
 import {
   act,
   cleanup,
+  deferred,
   render,
   renderHook,
   screen,
@@ -13,6 +14,7 @@ import { useChatSessionStore } from "@/app/app/stores/useChatSessionStore";
 import useChatController from "@/hooks/useChatController";
 import { MinimalAgent } from "@/lib/agents/types";
 import { FilterManager, LlmManager } from "@/lib/hooks";
+import type { ProjectFile } from "@/lib/projects/types";
 
 const SESSION = "owned-supersearch-session";
 const RUN_ID = 4503;
@@ -209,7 +211,77 @@ afterEach(() => {
   cleanup();
   global.fetch = originalFetch;
   useChatSessionStore.setState({ sessions: new Map(), currentSessionId: null });
+  mockProjects.setCurrentMessageFiles.mockReset();
 });
+
+it.each([
+  [true, false],
+  [false, false],
+  [true, true],
+  [false, true],
+])(
+  "does not insert completed uploads into a different chat (draft %s, unmount %s)",
+  async (draft, leavePage) => {
+    const { result, rerender, unmount } = setupController([]);
+    if (draft) {
+      act(() => useChatSessionStore.getState().setCurrentSession(null));
+      rerender({ sessionId: "" });
+    }
+    let files: ProjectFile[] = [];
+    mockProjects.setCurrentMessageFiles.mockImplementation(
+      (update: (previous: ProjectFile[]) => ProjectFile[]) => {
+        files = update(files);
+      }
+    );
+    const uploadResponse = deferred<Response>();
+    fetchMock.mockImplementation(async (input) => {
+      if (String(input) === "/api/chat/files/upload")
+        return uploadResponse.promise;
+      return { ok: true, json: async () => ({}) } as Response;
+    });
+    let upload = Promise.resolve();
+    await act(async () => {
+      upload = result.current.handleMessageSpecificFileUpload(
+        [new File(["text"], "inceleme.txt")],
+        true
+      );
+    });
+    expect(files).toHaveLength(1);
+    expect(files[0]?.status).toBe("UPLOADING");
+
+    act(() => {
+      useChatSessionStore.getState().createSession("other-session");
+      useChatSessionStore.getState().setCurrentSession("other-session");
+    });
+    if (leavePage) unmount();
+    else rerender({ sessionId: "other-session" });
+    await act(async () => {
+      uploadResponse.resolve({
+        ok: true,
+        json: async () => ({
+          files: [
+            {
+              id: "uploaded-file",
+              type: "plain_text",
+              name: "inceleme.txt",
+              token_count: 1,
+              size: 4,
+            },
+          ],
+          rejected_files: [],
+        }),
+      } as Response);
+      await upload;
+    });
+
+    expect(files).toHaveLength(0);
+    const deletes = fetchMock.mock.calls.filter(
+      ([, request]) => request?.method === "DELETE"
+    );
+    expect(deletes).toHaveLength(draft ? 1 : 0);
+    if (draft) expect(deletes[0]?.[0]).toBe("/api/chat/files/uploaded-file");
+  }
+);
 
 it.each([true, false])(
   "fences an accepted Supersearch run after transport failure or premature EOF (disconnect %s)",

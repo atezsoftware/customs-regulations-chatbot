@@ -59,6 +59,7 @@ export interface ProjectFile {
   token_count: number | null;
   chunk_count: number | null;
   temp_id?: string | null;
+  is_session_attachment?: boolean;
   regulatory_indexing_progress?: RegulatoryIndexingProgress | null;
 }
 

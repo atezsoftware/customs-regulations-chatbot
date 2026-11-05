@@ -15,6 +15,7 @@ import Text from "@/refresh-components/texts/Text";
 import { MAX_FILES_TO_SHOW } from "@/lib/constants";
 import { useSettings } from "@/lib/settings/hooks";
 import { isImageFile } from "@/lib/utils";
+import { ASV3_SESSION_FILE_ACCEPT } from "@/lib/asv3/sessionFiles";
 import {
   SvgExternalLink,
   SvgFileText,
@@ -179,6 +180,7 @@ export interface FilePickerPopoverProps {
   handleUploadChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   trigger?: React.ReactNode | ((open: boolean) => React.ReactNode);
   selectedFileIds?: string[];
+  sessionAttachmentsOnly?: boolean;
 }
 
 export default function FilePickerPopover({
@@ -188,9 +190,12 @@ export default function FilePickerPopover({
   handleUploadChange,
   trigger,
   selectedFileIds,
+  sessionAttachmentsOnly = false,
 }: FilePickerPopoverProps) {
   const { allRecentFiles } = useProjectsContext();
-  const { document_import_enabled: uploadsEnabled = true } = useSettings();
+  const { document_import_enabled: documentImportEnabled = true } =
+    useSettings();
+  const uploadsEnabled = sessionAttachmentsOnly || documentImportEnabled;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const recentFilesModal = useCreateModal();
   const [open, setOpen] = useState(false);
@@ -205,9 +210,11 @@ export default function FilePickerPopover({
 
   useEffect(() => {
     setRecentFilesSnapshot(
-      allRecentFiles.slice().filter((f) => !deletedFileIds.includes(f.id))
+      sessionAttachmentsOnly
+        ? []
+        : allRecentFiles.slice().filter((f) => !deletedFileIds.includes(f.id))
     );
-  }, [allRecentFiles]);
+  }, [allRecentFiles, sessionAttachmentsOnly]);
 
   const handleDeleteFile = (file: ProjectFile) => {
     const lastStatus = file.status;
@@ -270,7 +277,7 @@ export default function FilePickerPopover({
           className="hidden"
           multiple
           onChange={handleUploadChange}
-          accept={"*/*"}
+          accept={sessionAttachmentsOnly ? ASV3_SESSION_FILE_ACCEPT : "*/*"}
         />
       )}
 

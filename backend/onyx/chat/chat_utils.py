@@ -523,6 +523,7 @@ def load_chat_file(
     is a single DB lookup.
     """
     from onyx.configs.app_configs import DISABLE_VECTOR_DB
+    from onyx.db.chat_attachments import reject_session_attachment_in_generic_chat
     from onyx.db.regulatory_public_reads import current_file_read_owners
     from onyx.error_handling.error_codes import OnyxErrorCode
     from onyx.error_handling.exceptions import OnyxError
@@ -532,8 +533,9 @@ def load_chat_file(
         require_publication_files,
     )
 
-    observation = observe_publication_read()
     file_id = file_descriptor["id"]
+    reject_session_attachment_in_generic_chat(db_session, file_id)
+    observation = observe_publication_read()
     # `FileDescriptor` is often JSON-roundtripped (e.g. JSONB / API), so `type`
     # may arrive as a raw string value instead of a `ChatFileType`.
     file_type = ChatFileType(file_descriptor["type"])

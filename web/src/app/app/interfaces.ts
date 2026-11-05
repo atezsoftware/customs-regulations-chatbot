@@ -111,6 +111,7 @@ export interface FileDescriptor {
   name?: string | null;
 
   user_file_id?: string | null;
+  is_session_attachment?: boolean;
   // FE only
   isUploading?: boolean;
 }

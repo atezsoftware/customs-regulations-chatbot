@@ -221,3 +221,4 @@ class ChatTurnSetup:
     slack_context: SlackContext | None
     custom_tool_additional_headers: dict[str, str] | None
     mcp_headers: dict[str, str] | None
+    session_attachment_context: str = ""

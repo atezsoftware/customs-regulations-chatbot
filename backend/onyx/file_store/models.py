@@ -1,7 +1,8 @@
 import base64
 import threading
 from enum import Enum
-from typing import Callable, NotRequired
+from typing import Callable, Literal, NotRequired
+from uuid import UUID
 
 from pydantic import BaseModel
 from typing_extensions import TypedDict  # noreorder
@@ -104,6 +105,20 @@ class FileDescriptor(TypedDict):
     type: ChatFileType
     name: NotRequired[str | None]
     user_file_id: NotRequired[str | None]
+    is_session_attachment: NotRequired[bool]
+
+
+class ChatAttachmentMetadata(BaseModel):
+    kind: Literal["session_attachment"] = "session_attachment"
+    user_id: UUID
+    chat_session_id: UUID | None = None
+    plaintext_file_id: str
+    chat_file_type: ChatFileType
+    token_count: int
+    size: int
+    text_chars: int
+    sha256: str
+    active: bool = True
 
 
 class InMemoryChatFile(BaseModel):

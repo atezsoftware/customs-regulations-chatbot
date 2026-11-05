@@ -612,6 +612,20 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
     setSelectedAgentFromId,
   });
 
+  const handleFileUpload = useCallback(
+    (files: File[]) =>
+      handleMessageSpecificFileUpload(
+        files,
+        atezSearchV3EnabledForCurrentWorkflow ||
+          asv3ExpCroppedEnabledForCurrentWorkflow
+      ),
+    [
+      handleMessageSpecificFileUpload,
+      atezSearchV3EnabledForCurrentWorkflow,
+      asv3ExpCroppedEnabledForCurrentWorkflow,
+    ]
+  );
+
   const {
     onMessageSelection,
     currentSessionFileTokenCount,
@@ -1127,9 +1141,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
             supersearchEnabledForCurrentWorkflow ||
             legalReviewEnabledForCurrentWorkflow
           }
-          onDrop={(acceptedFiles) =>
-            handleMessageSpecificFileUpload(acceptedFiles)
-          }
+          onDrop={handleFileUpload}
           noClick
         >
           {({ getRootProps }) => (
@@ -1507,7 +1519,7 @@ export default function AppPage({ firstMessage }: ChatPageProps) {
                         }
                         availableContextTokens={availableContextTokens}
                         selectedAgent={selectedAgent || liveAgent}
-                        handleFileUpload={handleMessageSpecificFileUpload}
+                        handleFileUpload={handleFileUpload}
                         setPresentingDocument={setPresentingDocument}
                         // Intentionally enabled during name-only onboarding (showOnboarding=false)
                         // since LLM providers are already configured and the user can chat.

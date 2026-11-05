@@ -80,6 +80,7 @@ from onyx.server.features.admin_banner.api import admin_router as admin_banner_r
 from onyx.server.features.build.api import admin_router as build_admin_router
 from onyx.server.features.build.api import router as build_router
 from onyx.server.features.build.webapp_proxy import public_build_router
+from onyx.server.features.chat_files.api import router as chat_files_router
 from onyx.server.features.default_assistant.api import (
     router as default_assistant_router,
 )
@@ -599,6 +600,7 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, admin_agents_router)
     include_router_with_global_prefix_prepended(application, default_assistant_router)
     include_router_with_global_prefix_prepended(application, asv3_citation_router)
+    include_router_with_global_prefix_prepended(application, chat_files_router)
     include_router_with_global_prefix_prepended(application, notification_router)
     include_router_with_global_prefix_prepended(application, admin_banner_router)
     include_router_with_global_prefix_prepended(application, tool_router)
