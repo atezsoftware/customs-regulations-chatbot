@@ -47,6 +47,26 @@ const file: LegislationFile = {
 
 afterEach(() => jest.restoreAllMocks());
 
+test("keeps long legal titles in wrapping text with a short navigation action", () => {
+  const title = "Çevreye Duyarlı Tasarım Gereklilikleri Tebliği "
+    .repeat(8)
+    .trim();
+  const longTitleFile = {
+    ...file,
+    source_lineage: {
+      ...file.source_lineage!,
+      parents: [{ ...file.source_lineage!.parents[0]!, title }],
+    },
+  };
+  render(
+    <LegislationSourceIdentity file={longTitleFile} onSelectFile={jest.fn()} />
+  );
+  expect(
+    screen.getByRole("button", { name: `Ana dosyayı aç: ${title}` })
+  ).toHaveTextContent("Ana dosyayı aç");
+  expect(screen.getByText(`Ana dosya: ${title}`)).toBeVisible();
+});
+
 test("opens the parent returned by the catalog API", async () => {
   const parent = {
     ...file,
@@ -60,24 +80,22 @@ test("opens the parent returned by the catalog API", async () => {
   const select = jest.fn();
   render(<LegislationSourceIdentity file={file} onSelectFile={select} />);
   await setupUser().click(
-    screen.getByRole("button", { name: "Ana dosya: Parent title" })
+    screen.getByRole("button", { name: "Ana dosyayı aç: Parent title" })
   );
   await waitFor(() => expect(select).toHaveBeenCalledWith(parent));
   expect(fetcher).toHaveBeenCalledWith("/api/regulatory/catalog/files/parent");
 });
 
 test("keeps a denied parent navigation visible without switching files", async () => {
-  jest
-    .spyOn(global, "fetch")
-    .mockResolvedValue({
-      ok: false,
-      status: 403,
-      json: async () => ({ detail: "Parent access denied" }),
-    } as Response);
+  jest.spyOn(global, "fetch").mockResolvedValue({
+    ok: false,
+    status: 403,
+    json: async () => ({ detail: "Parent access denied" }),
+  } as Response);
   const select = jest.fn();
   render(<LegislationSourceIdentity file={file} onSelectFile={select} />);
   await setupUser().click(
-    screen.getByRole("button", { name: "Ana dosya: Parent title" })
+    screen.getByRole("button", { name: "Ana dosyayı aç: Parent title" })
   );
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Parent access denied"

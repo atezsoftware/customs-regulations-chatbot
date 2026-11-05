@@ -110,7 +110,7 @@ test("shows an annex's original filename and verified parent from source metadat
   expect(await screen.findByText("20250105-2-1.pdf")).toBeInTheDocument();
   expect(
     screen.getByRole("button", {
-      name: "Ana dosya: Enerji Etiketlemesi Tebliği",
+      name: "Ana dosyayı aç: Enerji Etiketlemesi Tebliği",
     })
   ).toBeInTheDocument();
 });

@@ -50,16 +50,27 @@ export default function LegislationSourceIdentity({
             : item.title;
         const label = `${item.label}: ${title}`;
         return onSelectFile ? (
-          <Button
+          <div
             key={item.document_id}
-            size="sm"
-            prominence="tertiary"
-            aria-label={label}
-            disabled={loading !== null}
-            onClick={() => void openFile(item.user_file_id)}
+            className="flex min-w-0 flex-col items-start gap-1"
           >
-            {loading === item.user_file_id ? "Açılıyor…" : label}
-          </Button>
+            <Text font="secondary-body" color="text-03">
+              {label}
+            </Text>
+            <Button
+              size="sm"
+              prominence="tertiary"
+              aria-label={`${item.label === "Ana dosya" ? "Ana dosyayı aç" : "Eki aç"}: ${title}`}
+              disabled={loading !== null}
+              onClick={() => void openFile(item.user_file_id)}
+            >
+              {loading === item.user_file_id
+                ? "Açılıyor…"
+                : item.label === "Ana dosya"
+                  ? "Ana dosyayı aç"
+                  : "Eki aç"}
+            </Button>
+          </div>
         ) : (
           <Text key={item.document_id} font="secondary-body" color="text-03">
             {label}
