@@ -26,6 +26,9 @@ from onyx.context.search.retrieval.search_runner import (
 )
 from onyx.db.document_set import get_document_set_by_id
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.regulatory_amendment_source_families import (
+    resolve_amendment_source_family,
+)
 from onyx.db.regulatory_amendment_targets import (
     load_amendment_source_chunks,
     load_amendment_source_identities,
@@ -486,15 +489,19 @@ def build_amendment_search_retriever(
                 for chunk_id, row in rows.items()
             }
 
-    source_identities = load_amendment_source_identities(db_session, user_file_ids)
+    source_identities = load_amendment_source_identities(
+        db_session, user_file_ids, document_set_id=document_set_id
+    )
     source_chunks: dict[str, list[CandidateChunk]] = {}
-    source_file_cache: dict[str, list[str]] = {}
+    source_file_cache: dict[tuple[str, str | None], list[str]] = {}
 
     def source_file_loader(instruction: AmendmentInstruction) -> Sequence[str] | None:
         target = instruction.target_source or ""
         if not source_identity_distinguishing_tokens(target):
             return None
-        cache_key = " ".join(target.casefold().split())
+        structural_target = parse_amendment_structural_target(instruction)
+        appendix = structural_target.appendix_label if structural_target else None
+        cache_key = (" ".join(target.casefold().split()), appendix)
         if cache_key in source_file_cache:
             return source_file_cache[cache_key]
         files = [
@@ -517,6 +524,17 @@ def build_amendment_search_retriever(
                 and source_file_identity_matches(target, source.name, title)
                 and source_file_identity_matches(target, source.root_heading, title)
             ]
+        if files:
+            with get_session_with_current_tenant() as identity_session:
+                family = resolve_amendment_source_family(
+                    identity_session,
+                    document_set_id=document_set_id,
+                    user_file_ids=user_file_ids,
+                    matched_file_ids=[UUID(value) for value in files],
+                    appendix_label=appendix,
+                )
+            if family is not None:
+                files = [str(value) for value in family.target_file_ids]
         source_file_cache[cache_key] = files
         return files
 

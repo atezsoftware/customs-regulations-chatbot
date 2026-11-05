@@ -1,0 +1,106 @@
+{
+  "provenance": {
+    "source_pack_key": "main-12",
+    "source_pdf_sha256": "6d4f1e4a32de3a727eec3aefe18ed4bff954a3819c4b92b994172566bbdfb1d3",
+    "canonical_header_text_sha256": "d50186b7bbb70f03ad00f3630b52dd70076fc6ce267b7e12a2399f3ec9cf5324",
+    "note": "Public source header and stale metadata preserved literally; production logic uses no IDs."
+  },
+  "filename": "resmigazete.gov.tr_eskiler_2025_01_20250105-3.htm.pdf",
+  "target": "Ev ve Büro Tipi Elektrik-Elektronik Cihazların Hazırda Bekleme, Kapalı ve Ağ Bağlantılı Hazırda Bekleme Konumlarının Elektrik Enerjisi Tüketimi ile İlgili Çevreye Duyarlı Tasarım Gerekliliklerine Dair Tebliğ (2023/826/AB) (SGM-2024/5)",
+  "text": "5 Ocak 2025 PAZAR\nResmî Gazete\nSayı : 32773\nTEBLİĞ\nSanayi ve Teknoloji Bakanlığından:\nEV VE BÜRO TİPİ ELEKTRİK-ELEKTRONİK CİHAZLARIN HAZIRDA\nBEKLEME, KAPALI VE AĞ BAĞLANTILI HAZIRDA BEKLEME\nKONUMLARININ ELEKTRİK ENERJİSİ TÜKETİMİ İLE\nİLGİLİ ÇEVREYE DUYARLI TASARIM\nGEREKLİLİKLERİNE DAİR TEBLİĞ\n(2023/826/AB) (SGM-2024/5)\nAmaç, kapsam ve dayanak",
+  "heading_path": [
+    "EV VE BÜRO TİPİ ELEKTRİK-ELEKTRONİK CİHAZLARIN HAZIRDA BEKLEME, KAPALI VE AĞ BAĞLANTILI HAZIRDA BEKLEME KONUMLARININ ELEKTRİK ENERJİSİ TÜKETİMİ İLE İLGİLİ ÇEVREYE DUYARLI TASARIM GEREKLİLİKLERİNE DAİR TEBLİĞ"
+  ],
+  "metadata": {
+    "article_no": null,
+    "table_index": null,
+    "clause_label": null,
+    "heading_path": [
+      "EV VE BÜRO TİPİ ELEKTRİK-ELEKTRONİK CİHAZLARIN HAZIRDA BEKLEME, KAPALI VE AĞ BAĞLANTILI HAZIRDA BEKLEME KONUMLARININ ELEKTRİK ENERJİSİ TÜKETİMİ İLE İLGİLİ ÇEVREYE DUYARLI TASARIM GEREKLİLİKLERİNE DAİR TEBLİĞ"
+    ],
+    "paragraph_no": null,
+    "source_links": {
+      "0": ""
+    },
+    "article_title": null,
+    "chunk_variant": "atomic",
+    "document_date": null,
+    "document_type": "TEBLİĞ",
+    "image_file_id": null,
+    "appendix_label": null,
+    "document_title": "EV VE BÜRO TİPİ ELEKTRİK-ELEKTRONİK CİHAZLARIN HAZIRDA BEKLEME, KAPALI VE AĞ BAĞLANTILI HAZIRDA BEKLEME KONUMLARININ ELEKTRİK ENERJİSİ TÜKETİMİ İLE İLGİLİ ÇEVREYE DUYARLI TASARIM GEREKLİLİKLERİNE DAİR TEBLİĞ",
+    "image_file_ids": [],
+    "document_number": "SGM-2024/5",
+    "subclause_label": null,
+    "table_row_index": null,
+    "publication_date": "2025-01-05",
+    "source_asset_ids": [],
+    "annex_element_ids": [],
+    "hierarchy_root_id": null,
+    "publication_number": "32773",
+    "hierarchy_root_path": [],
+    "source_chunk_orders": [],
+    "intake_edit_revision": "8186c1a4-c77c-4905-86df-075c71369ff9",
+    "intake_legal_metadata": {
+      "model": "gemini-3.5-flash",
+      "fields": {
+        "document_type": {
+          "basis": "explicit",
+          "stale": true,
+          "source": "llm",
+          "evidence_quote": "TEBLİĞ",
+          "evidence_scope": "body",
+          "reference_quote": null,
+          "source_chunk_id": "rc_f951a87a2c3e4107d0291dcca7a67dc9c9e5c2f4",
+          "reference_chunk_id": null
+        },
+        "document_title": {
+          "basis": "explicit",
+          "stale": true,
+          "source": "llm",
+          "evidence_quote": "EV VE BÜRO TİPİ ELEKTRİK-ELEKTRONİK CİHAZLARIN HAZIRDA BEKLEME, KAPALI VE AĞ BAĞLANTILI HAZIRDA BEKLEME KONUMLARININ ELEKTRİK ENERJİSİ TÜKETİMİ İLE İLGİLİ ÇEVREYE DUYARLI TASARIM GEREKLİLİKLERİNE DAİR TEBLİĞ",
+          "evidence_scope": "heading",
+          "reference_quote": null,
+          "source_chunk_id": "rc_f951a87a2c3e4107d0291dcca7a67dc9c9e5c2f4",
+          "reference_chunk_id": null
+        },
+        "document_number": {
+          "basis": "explicit",
+          "stale": true,
+          "source": "llm",
+          "evidence_quote": "(2023/826/AB) (SGM-2024/5)",
+          "evidence_scope": "body",
+          "reference_quote": null,
+          "source_chunk_id": "rc_f951a87a2c3e4107d0291dcca7a67dc9c9e5c2f4",
+          "reference_chunk_id": null
+        },
+        "publication_date": {
+          "basis": "user_review",
+          "stale": false,
+          "source": "manual",
+          "evidence_quote": null,
+          "source_chunk_id": "rc_f951a87a2c3e4107d0291dcca7a67dc9c9e5c2f4"
+        },
+        "publication_number": {
+          "basis": "explicit",
+          "stale": true,
+          "source": "llm",
+          "evidence_quote": "Sayı : 32773",
+          "evidence_scope": "body",
+          "reference_quote": null,
+          "source_chunk_id": "rc_f951a87a2c3e4107d0291dcca7a67dc9c9e5c2f4",
+          "reference_chunk_id": null
+        }
+      },
+      "version": 2,
+      "warnings": [
+        "Document context changed after metadata extraction; model evidence is stale and inferred dates were cleared. Manually reviewed values are retained."
+      ],
+      "input_stale": true,
+      "input_sha256": "3e0f4a8a22f12fc070aa9c41f310e6b6c25d25da32222177286786c6ff8f8612",
+      "request_hash": "e9aea358fb0384ab37773b04fe1075a1f0fd735908accff04b469fe27de3fc6a"
+    },
+    "intake_chunking_version": "2",
+    "source_regulatory_chunk_ids": []
+  }
+}

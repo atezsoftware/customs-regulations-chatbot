@@ -15,10 +15,12 @@ import {
 } from "@/lib/legistations/svc";
 import type { RegulatoryChunk } from "@/lib/regulatory/interfaces";
 import RegulatoryFileDetails from "@/sections/document-sets/RegulatoryFileDetails";
+import LegislationSourceIdentity from "@/sections/legistations/LegislationSourceIdentity";
 
 interface SelectedLegislationFileProps {
   file: LegislationFile;
   onRenamed: (name: string) => void;
+  onSelectFile?: (file: LegislationFile) => void;
   matchingChunks?: RegulatoryChunk[];
   focusedChunkId?: string;
 }
@@ -26,6 +28,7 @@ interface SelectedLegislationFileProps {
 export default function SelectedLegislationFile({
   file,
   onRenamed,
+  onSelectFile,
   matchingChunks = [],
   focusedChunkId,
 }: SelectedLegislationFileProps) {
@@ -64,6 +67,10 @@ export default function SelectedLegislationFile({
 
   return (
     <div className="flex flex-col gap-4">
+      <LegislationSourceIdentity
+        file={currentFile}
+        onSelectFile={onSelectFile}
+      />
       {currentFile.pending_review && (
         <Text font="main-ui-body">
           Bu dosya inceleme bekliyor. Düzenlemeleri Updates → New document

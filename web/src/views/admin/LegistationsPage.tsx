@@ -20,6 +20,8 @@ import { CATALOG_PAGE_SIZE } from "@/lib/legistations/svc";
 import FolderTree from "@/sections/legistations/FolderTree";
 import SelectedLegislationFile from "@/sections/legistations/SelectedLegislationFile";
 import LegislationSearchFileCard from "@/sections/cards/LegislationSearchFileCard";
+import LegislationSourceIdentity from "@/sections/legistations/LegislationSourceIdentity";
+import { legislationDisplayName } from "@/lib/legistations/sourceIdentity";
 
 const SEARCH_MODES: { mode: LegistationsSearchMode; label: string }[] = [
   { mode: "files", label: "Dosya adı" },
@@ -86,6 +88,11 @@ export default function LegistationsPage() {
   const files = useCatalogFiles(state, selectedFile === null);
   const search = useCatalogSearch(state, true);
   const response = state.mode === "files" ? files : search;
+
+  function openRelatedFile(file: LegislationFile) {
+    setFocusedHit(null);
+    setSelectedFile(file);
+  }
 
   function openSearchFile(hit: LegislationSearchResult) {
     setFocusedHit(hit);
@@ -217,6 +224,7 @@ export default function LegistationsPage() {
                 <SelectedLegislationFile
                   key={selectedFile.id}
                   file={selectedFile}
+                  onSelectFile={openRelatedFile}
                   matchingChunks={
                     search.data?.items
                       .filter((hit) => hit.file.id === selectedFile.id)
@@ -271,8 +279,12 @@ export default function LegistationsPage() {
                       >
                         <div className="flex-1 min-w-0 flex flex-col gap-1 break-words [overflow-wrap:anywhere]">
                           <Text font="main-ui-action" as="h3">
-                            {file.name}
+                            {legislationDisplayName(file)}
                           </Text>
+                          <LegislationSourceIdentity
+                            file={file}
+                            onSelectFile={openRelatedFile}
+                          />
                           <Text
                             font="secondary-body"
                             color="text-03"
@@ -328,6 +340,7 @@ export default function LegistationsPage() {
                         key={group.file.id}
                         group={group}
                         onOpenFile={openSearchFile}
+                        onSelectFile={openRelatedFile}
                         onSaved={() => void search.mutate()}
                       />
                     ))}

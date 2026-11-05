@@ -4,11 +4,89 @@ import re
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
-from onyx.db.models import RegulatoryChunk, UserFile, UserFileProjectionRepair
+from onyx.db.models import (
+    AmendmentSourcePackage,
+    DocumentSet__UserFile,
+    RegulatoryChunk,
+    RegulatoryDocumentIntake,
+    RegulatoryDocumentIntakeFile,
+    RegulatoryRetainedPdfEvidence,
+    RegulatorySourceAsset,
+    UserFile,
+    UserFileProjectionRepair,
+)
+
+
+def _name_matches(q: str) -> ColumnElement[bool]:
+    source = (
+        select(RegulatoryDocumentIntakeFile.id)
+        .join(
+            RegulatoryDocumentIntake,
+            RegulatoryDocumentIntake.id == RegulatoryDocumentIntakeFile.intake_id,
+        )
+        .join(
+            RegulatorySourceAsset,
+            RegulatorySourceAsset.id == RegulatoryDocumentIntakeFile.source_asset_id,
+        )
+        .join(
+            AmendmentSourcePackage,
+            AmendmentSourcePackage.id == RegulatoryDocumentIntake.source_package_id,
+        )
+        .join(
+            DocumentSet__UserFile,
+            (
+                DocumentSet__UserFile.user_file_id
+                == RegulatoryDocumentIntakeFile.user_file_id
+            )
+            & (
+                DocumentSet__UserFile.document_set_id
+                == RegulatoryDocumentIntake.document_set_id
+            ),
+        )
+        .where(
+            RegulatoryDocumentIntakeFile.user_file_id == UserFile.id,
+            RegulatorySourceAsset.package_id
+            == RegulatoryDocumentIntake.source_package_id,
+            AmendmentSourcePackage.document_set_id
+            == RegulatoryDocumentIntake.document_set_id,
+            AmendmentSourcePackage.created_by == RegulatoryDocumentIntake.created_by,
+            RegulatoryDocumentIntake.created_by == UserFile.user_id,
+            or_(
+                RegulatorySourceAsset.display_name.icontains(q, autoescape=True),
+                RegulatorySourceAsset.original_url.icontains(q, autoescape=True),
+                RegulatorySourceAsset.final_url.icontains(q, autoescape=True),
+            ),
+        )
+        .correlate(UserFile)
+        .exists()
+    )
+    retained = (
+        select(RegulatoryRetainedPdfEvidence.id)
+        .join(
+            DocumentSet__UserFile,
+            (
+                DocumentSet__UserFile.user_file_id
+                == RegulatoryRetainedPdfEvidence.user_file_id
+            )
+            & (
+                DocumentSet__UserFile.document_set_id
+                == RegulatoryRetainedPdfEvidence.document_set_id
+            ),
+        )
+        .where(
+            RegulatoryRetainedPdfEvidence.user_file_id == UserFile.id,
+            RegulatoryRetainedPdfEvidence.original_filename.icontains(
+                q, autoescape=True
+            ),
+        )
+        .correlate(UserFile)
+        .exists()
+    )
+    return or_(UserFile.name.icontains(q, autoescape=True), source, retained)
 
 
 def normalize_catalog_path(value: str) -> str:
@@ -33,7 +111,7 @@ def _file_query(
 ) -> Select[tuple[UserFile]]:
     query = select(UserFile)
     if q:
-        query = query.where(UserFile.name.icontains(q, autoescape=True))
+        query = query.where(_name_matches(q))
     if folder is not None:
         parent = normalize_catalog_path(folder)
         prefix = f"{parent}/" if parent else ""
@@ -120,7 +198,7 @@ def list_catalog_folders(
     if prefix:
         query = query.where(path.startswith(prefix, autoescape=True))
     if q:
-        query = query.where(UserFile.name.icontains(q, autoescape=True))
+        query = query.where(_name_matches(q))
     total = db_session.scalar(select(func.count()).select_from(query.subquery())) or 0
     rows = db_session.execute(
         query.order_by(func.lower(child), child).offset(offset).limit(limit)

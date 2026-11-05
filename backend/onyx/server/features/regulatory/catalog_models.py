@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from onyx.regulatory.document_intake.source_lineage import IntakeFileSourceLineage
 from onyx.server.features.document_set.file_models import (
     RegulatoryIndexingProgressSnapshot,
 )
@@ -40,6 +41,7 @@ class CatalogFile(BaseModel):
     chunk_count: int
     document_sets: list[CatalogDocumentSet]
     pending_review: bool
+    source_lineage: IntakeFileSourceLineage | None = None
     regulatory_indexing_progress: RegulatoryIndexingProgressSnapshot | None = None
     index_request: CatalogIndexRequest | None = None
 
