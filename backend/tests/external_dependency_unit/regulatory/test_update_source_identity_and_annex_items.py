@@ -83,7 +83,9 @@ def setup_list(
     rows.append(next_annex)
     session.flush()
     instruction = AmendmentInstruction(
-        instruction_text=TEXT, target_source="Örnek Ürünler Tebliği"
+        instruction_text=TEXT,
+        target_source="Örnek Ürünler Tebliği",
+        article_reference="Ek I Madde 23",
     )
     candidate = CandidateChunk(
         chunk_id=header.id,
@@ -102,7 +104,7 @@ def setup_list(
     context = load_instruction_draft_context(
         session, candidates=[candidate], match=match, instruction=instruction
     )
-    assert context is not None
+    assert context is not None and context.expected_new_article_no is None
     result = _build_proposal_draft(
         instruction_indices=[2],
         instructions=[instruction],

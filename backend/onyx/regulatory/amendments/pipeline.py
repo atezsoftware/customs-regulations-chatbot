@@ -268,7 +268,15 @@ def load_instruction_draft_context(
             if instruction is not None
             else None
         )
-        expected_new_article_no = target.article_no if target is not None else None
+        expected_new_article_no = (
+            target.article_no
+            if target is not None
+            and (
+                instruction is None
+                or annex_item_addition(instruction.instruction_text) is None
+            )
+            else None
+        )
         if instruction is not None and explicitly_adds_top_level_provision(
             instruction.instruction_text
         ):
