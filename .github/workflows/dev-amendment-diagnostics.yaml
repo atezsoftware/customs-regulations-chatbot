@@ -30,6 +30,7 @@ jobs:
           IFS=$'\t' read -r pod container <<<"$selected"
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=30000"; exec python -' <<'PYCODE'
+          import hashlib
           import json
           from datetime import date
           from uuid import UUID
@@ -39,7 +40,8 @@ jobs:
           from onyx.context.search.models import IndexFilters
           from onyx.db.asv3_corpus import resolve_pc_corpus_scope
           from onyx.db.chat import get_chat_session_by_id
-          from onyx.db.engine.sql_engine import get_session_with_current_tenant
+          from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
+          SqlEngine.init_engine(pool_size=2, max_overflow=0)
           with get_session_with_current_tenant() as session:
               chat = get_chat_session_by_id(UUID("ebff456a-16b1-49f9-a244-133328bf54d5"), None, session, include_deleted=True)
               user = chat.user
@@ -55,7 +57,7 @@ jobs:
                       print(json.dumps({"query": title, "source_ids": [str(source.id) for source in sources], "has_more": more}, ensure_ascii=False))
                   source, chunks, more = broker.page(identifier, context, start=0, limit=1)
                   assert chunks and chunks[0].text.strip()
-                  print(json.dumps({"source_id": str(source.id), "original_chunks_read": len(chunks), "text_hash": chunks[0].text_hash if hasattr(chunks[0], "text_hash") else None, "original_characters": len(chunks[0].text), "has_more": more}))
+                  print(json.dumps({"source_id": str(source.id), "original_chunks_read": len(chunks), "text_hash": hashlib.sha256(chunks[0].text.encode()).hexdigest(), "original_characters": len(chunks[0].text), "has_more": more}))
               for title in ("952/2013", "2015/2446", "2016/1036", "71/97", "88/97"):
                   sources, more = broker.sources(title, context)
                   print(json.dumps({"unresolved_eu_query": title, "source_ids": [str(source.id) for source in sources], "has_more": more, "absence_proven": False}))
