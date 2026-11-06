@@ -34,7 +34,7 @@ from onyx.regulatory.amendments.annexes.evidence import read_source_graph
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import load_verified_intake_documents
 from onyx.regulatory.document_intake.source_graph import (
-    ZIP_INPUT_KIND,
+    OWNERSHIP_INPUT_KINDS,
     parse_intake_graph,
 )
 
@@ -140,10 +140,10 @@ def _read_frozen_source(
         ]:
             raise ValueError("The frozen normalization source relationships changed")
     graph = None
-    if package.input_spec.get("kind") == ZIP_INPUT_KIND:
+    if package.input_spec.get("kind") in OWNERSHIP_INPUT_KINDS:
         graph = parse_intake_graph(
             manifest,
-            input_kind=ZIP_INPUT_KIND,
+            input_kind=package.input_spec.get("kind"),
             asset_hashes=[asset.sha256 for asset in assets],
             links=links,
         )

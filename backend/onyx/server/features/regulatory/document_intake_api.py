@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from onyx.auth.permissions import require_permission
 from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.db import document_intake as repository
+from onyx.db import markdown_drafts as markdown_draft_repository
 from onyx.db import regulatory_labeling as labeling_repository
 from onyx.db.document_intake_sources import (
     create_markdown_source_package,
@@ -22,7 +23,7 @@ from onyx.db.labeling_configuration import (
     INTAKE_LABELING_MODEL,
     get_intake_labeling_provider_options,
 )
-from onyx.db.models import RegulatoryDocumentIntake, User
+from onyx.db.models import RegulatoryDocumentIntake, RegulatoryMarkdownDraft, User
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.regulatory.amendments.annexes import config
@@ -42,6 +43,12 @@ from onyx.regulatory.document_intake.api_models import (
     IntakeReprepareRequest,
     IntakeReprepareSnapshot,
 )
+from onyx.regulatory.document_intake.markdown_draft_models import (
+    MarkdownDraftCreateRequest,
+    MarkdownDraftPrepareRequest,
+    MarkdownDraftSnapshot,
+)
+from onyx.regulatory.document_intake.markdown_package import MarkdownPackageError
 from onyx.regulatory.labeling.api_models import (
     LabelingCounts,
     LabelingProviderSummary,
@@ -827,3 +834,187 @@ def get_document_lineage(
         return snapshot
     except ValueError as exc:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, str(exc)) from exc
+
+
+# Draft routes never dispatch source processing, chunking, labeling, or indexing.
+
+
+def _draft_error(
+    session: Session, error: ValueError | repository.IntakeConflictError
+) -> OnyxError:
+    session.rollback()
+    if isinstance(error, repository.IntakeConflictError):
+        return OnyxError(OnyxErrorCode.CONFLICT, str(error))
+    if isinstance(error, MarkdownPackageError) and "byte_limit" in error.code:
+        return OnyxError(OnyxErrorCode.PAYLOAD_TOO_LARGE, error.public_message)
+    detail = (
+        error.public_message if isinstance(error, MarkdownPackageError) else str(error)
+    )
+    return OnyxError(OnyxErrorCode.INVALID_INPUT, detail)
+
+
+def _cleanup_markdown_draft(session: Session, draft: RegulatoryMarkdownDraft) -> None:
+    draft_id = draft.id
+    try:
+        markdown_draft_repository.cleanup_removed_documents(session, draft)
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Draft original cleanup will be retried on resume: %s", draft_id
+        )
+
+
+@router.post("/markdown-drafts")
+def create_markdown_draft(
+    request: MarkdownDraftCreateRequest,
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> MarkdownDraftSnapshot:
+    _require_enabled()
+    try:
+        draft = markdown_draft_repository.create_draft(
+            db_session,
+            user=user,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+            idempotency_key=request.idempotency_key,
+        )
+        db_session.commit()
+        return markdown_draft_repository.draft_snapshot(db_session, draft)
+    except (ValueError, repository.IntakeConflictError) as error:
+        raise _draft_error(db_session, error) from error
+
+
+@router.get("/markdown-drafts")
+def list_markdown_drafts(
+    user: User = Depends(_admin), db_session: Session = Depends(get_session)
+) -> list[MarkdownDraftSnapshot]:
+    _require_enabled()
+    try:
+        drafts = markdown_draft_repository.list_drafts(
+            db_session, user=user, environment=config.REGULATORY_ANNEX_ENVIRONMENT
+        )
+        snapshots = []
+        for draft in drafts:
+            _cleanup_markdown_draft(db_session, draft)
+            snapshots.append(
+                markdown_draft_repository.draft_snapshot(db_session, draft)
+            )
+        return snapshots
+    except (ValueError, repository.IntakeConflictError) as error:
+        raise _draft_error(db_session, error) from error
+
+
+def _owned_markdown_draft(
+    db_session: Session, draft_id: UUID, user: User
+) -> RegulatoryMarkdownDraft:
+    _require_enabled()
+    try:
+        return markdown_draft_repository.get_draft(
+            db_session,
+            draft_id,
+            user=user,
+            environment=config.REGULATORY_ANNEX_ENVIRONMENT,
+        )
+    except ValueError as error:
+        raise OnyxError(OnyxErrorCode.NOT_FOUND, str(error)) from error
+
+
+@router.get("/markdown-drafts/{draft_id}")
+def get_markdown_draft(
+    draft_id: UUID,
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> MarkdownDraftSnapshot:
+    draft = _owned_markdown_draft(db_session, draft_id, user)
+    _cleanup_markdown_draft(db_session, draft)
+    return markdown_draft_repository.draft_snapshot(db_session, draft)
+
+
+@router.post("/markdown-drafts/{draft_id}/documents")
+def upload_markdown_draft_documents(
+    draft_id: UUID,
+    files: list[UploadFile] = File(...),
+    idempotency_key: UUID = Form(...),
+    expected_revision: int = Form(..., ge=0),
+    parent_document_id: UUID | None = Form(None),
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> MarkdownDraftSnapshot:
+    from onyx.regulatory.document_intake.markdown_package import (
+        MAX_MARKDOWN_DOCUMENT_BYTES,
+        MAX_MARKDOWN_DOCUMENTS,
+    )
+
+    draft = _owned_markdown_draft(db_session, draft_id, user)
+    if not files or len(files) > MAX_MARKDOWN_DOCUMENTS:
+        raise OnyxError(
+            OnyxErrorCode.INVALID_INPUT,
+            f"En fazla {MAX_MARKDOWN_DOCUMENTS} Markdown belgesi yüklenebilir.",
+        )
+    payload = []
+    for file in files:
+        raw = file.file.read(MAX_MARKDOWN_DOCUMENT_BYTES + 1)
+        if len(raw) > MAX_MARKDOWN_DOCUMENT_BYTES:
+            raise OnyxError(
+                OnyxErrorCode.PAYLOAD_TOO_LARGE,
+                "Her Markdown belgesi en fazla 2 MiB olabilir.",
+            )
+        payload.append((file.filename or "", raw))
+    try:
+        markdown_draft_repository.add_documents(
+            db_session,
+            draft,
+            files=payload,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            parent_document_id=parent_document_id,
+        )
+        db_session.commit()
+        return markdown_draft_repository.draft_snapshot(db_session, draft)
+    except (ValueError, repository.IntakeConflictError) as error:
+        raise _draft_error(db_session, error) from error
+    except Exception:
+        db_session.rollback()
+        raise
+
+
+@router.delete("/markdown-drafts/{draft_id}/documents/{document_id}")
+def delete_markdown_draft_document(
+    draft_id: UUID,
+    document_id: UUID,
+    expected_revision: int = Query(..., ge=0),
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> MarkdownDraftSnapshot:
+    draft = _owned_markdown_draft(db_session, draft_id, user)
+    try:
+        markdown_draft_repository.remove_document(
+            db_session, draft, document_id, expected_revision=expected_revision
+        )
+        db_session.commit()
+        _cleanup_markdown_draft(db_session, draft)
+        return markdown_draft_repository.draft_snapshot(db_session, draft)
+    except (ValueError, repository.IntakeConflictError) as error:
+        raise _draft_error(db_session, error) from error
+
+
+@router.post("/markdown-drafts/{draft_id}/prepare")
+def prepare_markdown_draft(
+    draft_id: UUID,
+    request: MarkdownDraftPrepareRequest,
+    user: User = Depends(_admin),
+    db_session: Session = Depends(get_session),
+) -> AmendmentSourcePackageSnapshot:
+    draft = _owned_markdown_draft(db_session, draft_id, user)
+    try:
+        package = markdown_draft_repository.prepare_draft(
+            db_session, draft, expected_revision=request.expected_revision
+        )
+        db_session.commit()
+        return markdown_source_snapshot(db_session, package)
+    except (ValueError, repository.IntakeConflictError) as error:
+        raise _draft_error(db_session, error) from error
+    except Exception:
+        db_session.rollback()
+        raise

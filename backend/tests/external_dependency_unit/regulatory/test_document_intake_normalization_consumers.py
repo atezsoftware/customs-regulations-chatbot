@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from onyx.db import document_intake as intake
 from onyx.db import document_intake_edit as editing
 from onyx.db import document_intake_publication_recovery as recovery
-from onyx.db import regulatory_labeling as labeling
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import (
     DocumentSet,
@@ -33,7 +32,10 @@ from onyx.db.user_file import (
     start_user_file_index_request,
 )
 from onyx.file_store.postgres_file_store import PostgresBackedFileStore
+from onyx.regulatory.document_intake import job as intake_job
 from onyx.regulatory.document_intake.metadata import METADATA_AUDIT_KEY
+from onyx.regulatory.labeling import orchestrator
+from shared_configs.contextvars import get_current_tenant_id
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     intake_owner as intake_owner,
 )
@@ -50,28 +52,17 @@ from tests.external_dependency_unit.regulatory.test_document_intake_normalizatio
 
 def _complete_labels(session: Session, batch: RegulatoryDocumentIntake) -> None:
     assert batch.labeling_run_id is not None
+    for _step in range(20):
+        session.expire_all()
+        run = session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
+        if run.status not in {"queued", "running"}:
+            break
+        orchestrator.run_labeling_step(
+            run.id, run.lease_generation, get_current_tenant_id()
+        )
+    session.expire_all()
     run = session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
-    lease = labeling.claim_run(
-        session,
-        run_id=run.id,
-        expected_generation=run.lease_generation,
-        lease_seconds=300,
-    )
-    assert lease is not None
-    while page := labeling.prepare_next_item_page(session, lease, limit=128):
-        for item in page:
-            item.status, item.labels = "completed", ["Gümrük"]
-            assignments: list[dict[str, object]] = [
-                {"label_id": "Gümrük", "evidence_quote": item.text_snapshot}
-            ]
-            item.assignments = assignments
-    run.completed_chunks = run.total_chunks
-    while labeling.has_pending_derived_projections(session, lease):
-        labeling.project_derived_labels(session, lease, limit=128)
-    labeling.release_run(
-        session, lease, status="completed", stage="finished", finished=True
-    )
-    session.flush()
+    assert run.status == "completed", run.error
     intake.refresh_intake(session, batch)
     assert batch.status == "ready" and batch.review_sha256
     session.commit()
@@ -89,7 +80,9 @@ def _reviewed_transition(
     dict[UUID, UUID],
     dict[UUID, dict[str, Any]],
 ]:
-    batch, request = _prepared_transition(session, owner, store, monkeypatch)
+    batch, request = _prepared_transition(
+        session, owner, store, monkeypatch, with_metadata=True
+    )
     _complete_labels(session, batch)
     main_id = next(
         UUID(entry["user_file_id"])
@@ -113,17 +106,27 @@ def _reviewed_transition(
         "resolve_intake_labeling_provider_binding",
         intake.resolve_intake_labeling_provider_binding,
     )
-    assert editing.edit_intake_chunk(
-        session,
-        batch,
-        document_id=main.id,
-        chunk_id=chunk.id,
-        expected_review_sha256=batch.review_sha256,
-        updates={
-            "text": chunk.text.replace("Başvuru sırasında", "Başvuru  sırasında"),
-            "chunk_metadata": {"article_title": "Başvuru için belgeler"},
-            "validity_start_date": date(2027, 1, 1),
-        },
+    assert (
+        editing.edit_intake_chunk(
+            session,
+            batch,
+            document_id=main.id,
+            chunk_id=chunk.id,
+            expected_review_sha256=batch.review_sha256,
+            updates={
+                "text": chunk.text.replace("Başvuru sırasında", "Başvuru  sırasında"),
+                "chunk_metadata": {"article_title": "Başvuru için belgeler"},
+                "validity_start_date": date(2027, 1, 1),
+            },
+        )
+        is None
+    )
+    session.commit()
+    assert (
+        intake_job.run_document_intake(
+            intake_id=batch.id, tenant_id=get_current_tenant_id()
+        )
+        is not None
     )
     _complete_labels(session, batch)
     assert (

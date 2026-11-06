@@ -15,7 +15,8 @@ from onyx.db.models import (
 )
 from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.document_intake.source_graph import (
-    ZIP_INPUT_KIND,
+    MARKDOWN_DRAFT_INPUT_KIND,
+    OWNERSHIP_INPUT_KINDS,
     IntakeGraph,
     parse_intake_graph,
 )
@@ -30,7 +31,7 @@ def require_frozen_zip_intake_graph(
     intake_graph: IntakeGraph | None,
     manifest_bytes: bytes | None,
 ) -> IntakeGraph | None:
-    if package.input_spec.get("kind") != ZIP_INPUT_KIND:
+    if package.input_spec.get("kind") not in OWNERSHIP_INPUT_KINDS:
         if intake_graph is not None:
             raise ValueError("An intake ownership graph requires the ZIP input route")
         return None
@@ -53,6 +54,38 @@ def require_frozen_zip_intake_graph(
         or manifest.get("input_sha256") != input_sha256
     ):
         raise ValueError("The ZIP source manifest does not match its original archive")
+    if package.input_spec.get("kind") == MARKDOWN_DRAFT_INPUT_KIND:
+        frozen_upload = manifest.get("markdown_draft")
+        if (
+            not isinstance(frozen_upload, dict)
+            or hashlib.sha256(
+                json.dumps(frozen_upload, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+            != input_sha256
+            or frozen_upload.get("draft_id") != package.input_spec.get("draft_id")
+            or frozen_upload.get("revision") != package.input_spec.get("draft_revision")
+            or frozen_upload.get("created_by") != str(package.created_by)
+            or frozen_upload.get("document_set_id") != package.document_set_id
+            or frozen_upload.get("environment") != package.environment
+        ):
+            raise ValueError(
+                "The staged Markdown source differs from its immutable input"
+            )
+        frozen_documents = frozen_upload.get("documents")
+        if not isinstance(frozen_documents, list) or {
+            (
+                row.get("sha256"),
+                row.get("file_id"),
+                row.get("byte_count"),
+                row.get("display_name"),
+            )
+            for row in frozen_documents
+            if isinstance(row, dict)
+        } != {
+            (asset.sha256, asset.file_id, asset.byte_count, asset.display_name)
+            for asset in assets
+        }:
+            raise ValueError("The staged Markdown original storage identity changed")
     raw_assets = manifest.get("assets")
     if (
         manifest.get("status") != "ready"

@@ -51,6 +51,7 @@ logger = setup_logger()
 
 class S3PutKwargs(TypedDict):
     ChecksumSHA256: NotRequired[str]
+    IfNoneMatch: NotRequired[str]
 
 
 class FileStore(ABC):
@@ -341,7 +342,10 @@ class S3BackedFileStore(FileStore):
         file_metadata: dict[str, Any] | None = None,
         file_id: str | None = None,
         db_session: Session | None = None,
+        cleanup_on_metadata_failure: bool = False,
     ) -> str:
+        if cleanup_on_metadata_failure and file_id is not None:
+            raise ValueError("Metadata-failure cleanup requires a new file identifier")
         if file_id is None:
             file_id = str(uuid.uuid4())
 
@@ -352,6 +356,9 @@ class S3BackedFileStore(FileStore):
         hash256 = ""
         sha256_hash = hashlib.sha256()
         kwargs: S3PutKwargs = {}
+        if cleanup_on_metadata_failure:
+            # Create-only writes prove cleanup cannot remove a pre-existing object.
+            kwargs["IfNoneMatch"] = "*"
 
         # FIX: Optimize checksum generation to avoid creating extra copies in memory
         # Read content from IO object
@@ -381,19 +388,30 @@ class S3BackedFileStore(FileStore):
             **kwargs,
         )
 
-        with get_session_with_current_tenant_if_none(db_session) as db_session:
-            # Save metadata to database
-            upsert_filerecord(
-                file_id=file_id,
-                display_name=display_name or file_id,
-                file_origin=file_origin,
-                file_type=file_type,
-                bucket_name=bucket_name,
-                object_key=s3_key,
-                db_session=db_session,
-                file_metadata=file_metadata,
-            )
-            db_session.commit()
+        try:
+            with get_session_with_current_tenant_if_none(db_session) as db_session:
+                # Save metadata to database
+                upsert_filerecord(
+                    file_id=file_id,
+                    display_name=display_name or file_id,
+                    file_origin=file_origin,
+                    file_type=file_type,
+                    bucket_name=bucket_name,
+                    object_key=s3_key,
+                    db_session=db_session,
+                    file_metadata=file_metadata,
+                )
+                db_session.commit()
+        except Exception:
+            if cleanup_on_metadata_failure:
+                try:
+                    s3_client.delete_object(Bucket=bucket_name, Key=s3_key)
+                except Exception:
+                    logger.exception(
+                        "Failed to clean fresh S3 object after metadata failure: %s",
+                        file_id,
+                    )
+            raise
 
         return file_id
 

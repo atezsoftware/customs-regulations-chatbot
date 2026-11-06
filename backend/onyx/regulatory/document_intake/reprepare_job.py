@@ -16,7 +16,7 @@ from onyx.regulatory.document_intake.metadata_job import run_intake_metadata
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 from onyx.regulatory.document_intake.preparation import prepare_intake_file
 from onyx.regulatory.document_intake.source_graph import (
-    ZIP_INPUT_KIND,
+    OWNERSHIP_INPUT_KINDS,
     parse_intake_graph,
 )
 from onyx.regulatory.document_intake.versions import reprepare_target_versions
@@ -51,7 +51,7 @@ def run_document_intake_reprepare(
                 assets=assets,
             )
             graph = None
-            if package.input_spec.get("kind") == ZIP_INPUT_KIND:
+            if package.input_spec.get("kind") in OWNERSHIP_INPUT_KINDS:
                 with store.read_file(package.manifest_file_id) as stream:
                     manifest_bytes = stream.read(150 * 1024 * 1024 + 1)
                 if (
@@ -62,7 +62,7 @@ def run_document_intake_reprepare(
                 manifest = json.loads(manifest_bytes)
                 graph = parse_intake_graph(
                     manifest,
-                    input_kind=ZIP_INPUT_KIND,
+                    input_kind=package.input_spec.get("kind"),
                     asset_hashes=[asset.sha256 for asset in assets],
                     links=links,
                 )
