@@ -15,6 +15,7 @@ import type {
 } from "@/lib/regulatory/documentIntake";
 import type { AmendmentSourcePackage } from "@/lib/regulatory/amendments";
 import NewDocumentIntake from "@/views/admin/NewDocumentIntake";
+import type { MarkdownDraft } from "@/lib/regulatory/markdownDrafts";
 
 const base = "/api/regulatory/document-intake";
 const sourceBase = "/api/regulatory/amendments/source-packages";
@@ -118,12 +119,40 @@ function mockApi(
     lineageResponse?: Response;
   } = {}
 ) {
+  let markdownDraft: MarkdownDraft = {
+    id: "draft-1",
+    revision: 0,
+    status: "draft",
+    documents: [],
+    source_package_id: null,
+    updated_at: "2026-11-06",
+  };
   let batch = readyBatch;
   let pollIndex = 0;
   let sourcePollIndex = 0;
   const fetchMock = jest.fn(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url === `${base}/markdown-drafts`)
+        return json(init?.method === "POST" ? markdownDraft : []);
+      if (url === `${base}/markdown-drafts/draft-1`) return json(markdownDraft);
+      if (url === `${base}/markdown-drafts/draft-1/documents`) {
+        const body = init!.body as FormData;
+        markdownDraft = {
+          ...markdownDraft,
+          revision: markdownDraft.revision + 1,
+          documents: (body.getAll("files") as File[]).map((file, index) => ({
+            id: `document-${index}`,
+            display_name: file.name,
+            parent_document_id: null,
+            byte_count: file.size,
+            sha256: "a".repeat(64),
+          })),
+        };
+        return json(markdownDraft);
+      }
+      if (url === `${base}/markdown-drafts/draft-1/prepare`)
+        return options.prepareResponse ?? json(options.source ?? sourcePackage);
       if (url === `${base}/source-packages/source-1/links`)
         return json([
           {
@@ -834,101 +863,77 @@ test("shows the missing ZIP attachment path and blocks document preparation", as
   ).toBe(false);
 });
 
-test.each([
-  ["legislation.zip", "application/zip"],
-  ["ana.md", "text/markdown"],
-])(
-  "uploads %s as prepared Markdown and uses the shared review flow",
-  async (name, type) => {
-    const fetchMock = mockApi({
-      source: {
-        ...sourcePackage,
-        status: "processing",
-        asset_count: 0,
-        assets: [],
-      },
-      polledSources: [sourcePackage],
-    });
+test.each(["ana.md", "mevzuat.md"])(
+  "stages %s before explicitly preparing documents in the shared review flow",
+  async (name) => {
+    const fetchMock = mockApi();
     const user = setupUser();
     render(<NewDocumentIntake />);
-    await user.click(
-      await screen.findByRole("button", { name: "Markdown package" })
+    await user.click(await screen.findByRole("button", { name: "Markdown" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Markdown belgeleri")).toBeEnabled()
     );
-    expect(screen.getByLabelText("Markdown package file")).toHaveAttribute(
+    expect(screen.getByLabelText("Markdown belgeleri")).toHaveAttribute(
       "accept",
-      ".zip,.md"
+      ".md"
     );
     expect(
       screen.queryByLabelText("Original document URL")
     ).not.toBeInTheDocument();
-    expect(screen.getByText(/Conversion is skipped/)).toBeVisible();
-    expect(
-      screen.getByRole("link", { name: "Download Markdown package template" })
-    ).toHaveAttribute("href", `${base}/markdown-template`);
-    const file = new File(["# Ana belge\n[EK-1](ekler/ek-1.md)"], name, {
-      type,
-    });
-    await user.upload(screen.getByLabelText("Markdown package file"), file);
-    await user.click(
-      screen.getByRole("button", { name: "Prepare source and attachments" })
-    );
-    await screen.findByText("Source package ready · 2 documents");
-    const creation = fetchMock.mock.calls.find(
-      ([url]) => url === `${base}/source-packages/markdown`
-    )!;
-    expect(creation[1]?.method).toBe("POST");
-    const upload = creation[1]!.body as FormData;
-    expect(upload.get("file")).toBe(file);
-    expect(upload.get("idempotency_key")).toEqual(expect.any(String));
+    expect(screen.queryByText(/manifest.json/)).not.toBeInTheDocument();
+    const file = new File(["# Ana belge"], name, { type: "text/markdown" });
+    await user.upload(screen.getByLabelText("Markdown belgeleri"), file);
+    expect(await screen.findByRole("region", { name })).toBeVisible();
+    const upload = fetchMock.mock.calls.find(
+      ([url]) => url === `${base}/markdown-drafts/draft-1/documents`
+    )![1]!.body as FormData;
+    expect(upload.getAll("files")).toEqual([file]);
     expect(Array.from(upload.keys()).sort()).toEqual([
-      "file",
+      "expected_revision",
+      "files",
       "idempotency_key",
     ]);
-    expect(fetchMock).toHaveBeenCalledWith(
-      `${sourceBase}/source-1?document_set_id=7`,
-      undefined
-    );
     expect(
-      fetchMock.mock.calls.some(([url]) => url === `${sourceBase}/upload`)
+      fetchMock.mock.calls.some(
+        ([url, init]) => url === `${base}/batches` && init?.method === "POST"
+      )
     ).toBe(false);
-    await user.click(
-      screen.getByRole("button", { name: "Prepare new documents" })
-    );
+    await user.click(screen.getByRole("button", { name: "Chunkları hazırla" }));
     expect(
       await screen.findByRole("region", { name: "EK-1.pdf" })
     ).toBeVisible();
     expect(
       screen.getByRole("button", { name: "Approve all new documents" })
     ).toBeEnabled();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => url === `${base}/source-packages/markdown`
+      )
+    ).toBe(false);
   }
 );
 
-test("shows Markdown package validation errors without starting document preparation", async () => {
+test("shows actionable Markdown preparation errors without starting document preparation", async () => {
   const fetchMock = mockApi({
     prepareResponse: Promise.resolve({
       ok: false,
-      status: 422,
-      json: async () => ({ detail: "The ZIP is missing manifest.json." }),
+      status: 400,
+      json: async () => ({}),
     } as Response),
   });
   const user = setupUser();
   render(<NewDocumentIntake />);
-  await user.click(
-    await screen.findByRole("button", { name: "Markdown package" })
+  await user.click(await screen.findByRole("button", { name: "Markdown" }));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Markdown belgeleri")).toBeEnabled()
   );
   await user.upload(
-    screen.getByLabelText("Markdown package file"),
-    new File(["invalid package"], "invalid.zip", { type: "application/zip" })
+    screen.getByLabelText("Markdown belgeleri"),
+    new File(["# Test"], "ana.md", { type: "text/markdown" })
   );
-  await user.click(
-    screen.getByRole("button", { name: "Prepare source and attachments" })
-  );
-  expect(
-    await screen.findByText("The ZIP is missing manifest.json.")
-  ).toBeVisible();
-  expect(
-    screen.getByRole("button", { name: "Prepare new documents" })
-  ).toBeDisabled();
+  await screen.findByRole("region", { name: "ana.md" });
+  await user.click(screen.getByRole("button", { name: "Chunkları hazırla" }));
+  expect(await screen.findByText(/UTF-8/)).toBeVisible();
   expect(
     fetchMock.mock.calls.some(
       ([url, init]) => url === `${base}/batches` && init?.method === "POST"
@@ -938,9 +943,7 @@ test("shows Markdown package validation errors without starting document prepara
   expect(
     screen.getByRole("button", { name: "Prepare source and attachments" })
   ).toBeDisabled();
-  expect(
-    screen.queryByText("The ZIP is missing manifest.json.")
-  ).not.toBeInTheDocument();
+  expect(screen.queryByText(/UTF-8/)).not.toBeInTheDocument();
 });
 
 test("opens trusted attachment links in the same import and navigates back without changing external citations", async () => {
@@ -2340,12 +2343,6 @@ test.each([
     `${sourceBase}/upload`,
   ],
   ["file", "belgeler.zip", "application/zip", `${base}/source-packages/zip`],
-  [
-    "markdown",
-    "mevzuat.zip",
-    "application/zip",
-    `${base}/source-packages/markdown`,
-  ],
   ["url", "", "", sourceBase],
 ])(
   "reuses the source request after a lost response for %s %s and renews it only for changed input",
@@ -2368,7 +2365,7 @@ test.each([
     if (mode !== "file")
       await user.click(
         screen.getByRole("button", {
-          name: mode === "url" ? "URL" : "Markdown package",
+          name: "URL",
         })
       );
     if (mode === "url")
@@ -2378,11 +2375,7 @@ test.each([
       );
     else
       await user.upload(
-        screen.getByLabelText(
-          mode === "markdown"
-            ? "Markdown package file"
-            : "New document source file"
-        ),
+        screen.getByLabelText("New document source file"),
         new File(["source bytes"], name, { type: mime })
       );
     const prepare = screen.getByRole("button", {
@@ -2416,11 +2409,7 @@ test.each([
       );
     } else
       await user.upload(
-        screen.getByLabelText(
-          mode === "markdown"
-            ? "Markdown package file"
-            : "New document source file"
-        ),
+        screen.getByLabelText("New document source file"),
         new File(["changed bytes"], `changed-${name}`, { type: mime })
       );
     await user.click(prepare);
@@ -2430,3 +2419,84 @@ test.each([
     expect(changed[2]).not.toBe(changed[0]);
   }
 );
+
+test("preserves existing Markdown ZIP imports and their retry identity through source polling and review", async () => {
+  const fetchMock = mockApi({
+    source: {
+      ...sourcePackage,
+      status: "processing",
+      asset_count: 0,
+      assets: [],
+    },
+    polledSources: [sourcePackage],
+  });
+  const dispatch = fetchMock.getMockImplementation()!;
+  let responseLost = true;
+  fetchMock.mockImplementation(async (input, init) => {
+    const response = await dispatch(input, init);
+    if (
+      String(input) === `${base}/source-packages/markdown` &&
+      init?.method === "POST" &&
+      responseLost
+    ) {
+      responseLost = false;
+      throw new TypeError("Source response lost");
+    }
+    return response;
+  });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(await screen.findByRole("button", { name: "Markdown ZIP" }));
+  const picker = screen.getByLabelText("Markdown ZIP paketi");
+  expect(picker).toHaveAttribute("accept", ".zip");
+  expect(screen.queryByLabelText("Markdown belgeleri")).not.toBeInTheDocument();
+  expect(
+    screen.queryByLabelText("Original document URL")
+  ).not.toBeInTheDocument();
+  const file = new File(
+    ["existing legislation-markdown-v1 ZIP"],
+    "mevzuat.zip",
+    { type: "application/zip" }
+  );
+  await user.upload(picker, file);
+  const prepare = screen.getByRole("button", {
+    name: "Prepare source and attachments",
+  });
+  await user.click(prepare);
+  await screen.findByText("Source response lost");
+  await user.click(prepare);
+  await screen.findByText("Source package ready · 2 documents");
+  const requests = fetchMock.mock.calls.filter(
+    ([url]) => url === `${base}/source-packages/markdown`
+  );
+  expect(requests).toHaveLength(2);
+  const first = requests[0]![1]!.body as FormData;
+  const retry = requests[1]![1]!.body as FormData;
+  expect(first.get("file")).toBe(file);
+  expect(Array.from(first.keys()).sort()).toEqual(["file", "idempotency_key"]);
+  expect(first.get("idempotency_key")).toEqual(expect.any(String));
+  expect(retry.get("idempotency_key")).toBe(first.get("idempotency_key"));
+  expect(fetchMock).toHaveBeenCalledWith(
+    `${sourceBase}/source-1?document_set_id=7`,
+    undefined
+  );
+  expect(
+    fetchMock.mock.calls.some(
+      ([url, init]) => url === `${base}/batches` && init?.method === "POST"
+    )
+  ).toBe(false);
+  expect(
+    fetchMock.mock.calls.some(
+      ([url]) =>
+        url === `${base}/source-packages/zip` ||
+        String(url).startsWith(`${base}/markdown-drafts`)
+    )
+  ).toBe(false);
+  await user.click(
+    screen.getByRole("button", { name: "Prepare new documents" })
+  );
+  expect(await screen.findByRole("region", { name: "EK-1.pdf" })).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeEnabled();
+});

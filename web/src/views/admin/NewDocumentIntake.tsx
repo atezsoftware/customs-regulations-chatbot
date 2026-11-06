@@ -13,6 +13,7 @@ import IntakePublicationReview, {
   RetainedSourceChunk,
 } from "@/sections/cards/IntakePublicationReview";
 import IntakeSourceIssues from "@/views/admin/IntakeSourceIssues";
+import MarkdownDraftStaging from "@/sections/admin/MarkdownDraftStaging";
 import {
   type AmendmentSourcePackage,
   createAmendmentSourcePackage,
@@ -36,8 +37,8 @@ import {
   listDocumentIntakeBatches,
   reprepareDocumentIntakeBatch,
   retryDocumentIntakeBatch,
-  uploadDocumentIntakeMarkdownPackage,
   uploadDocumentIntakeZipPackage,
+  uploadDocumentIntakeMarkdownPackage,
   updateDocumentIntakeChunk,
   updateDocumentIntakeChunks,
   saveDocumentIntakePredecessorSelection,
@@ -55,7 +56,8 @@ import {
 const sourceModes = [
   { value: "file", label: "File" },
   { value: "url", label: "URL" },
-  { value: "markdown", label: "Markdown package" },
+  { value: "markdown", label: "Markdown" },
+  { value: "markdown-package", label: "Markdown ZIP" },
 ] as const;
 
 function errorMessage(error: unknown): string {
@@ -549,7 +551,8 @@ export default function NewDocumentIntake() {
     targetId ? "document-intake-history" : null,
     listDocumentIntakeBatches
   );
-  const [mode, setMode] = useState<"file" | "url" | "markdown">("file");
+  const [mode, setMode] =
+    useState<(typeof sourceModes)[number]["value"]>("file");
   const [file, setFile] = useState<File | null>(null);
   const [url, setUrl] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -725,7 +728,7 @@ export default function NewDocumentIntake() {
           ? await createAmendmentSourcePackage(targetId, key, {
               url: url.trim(),
             })
-          : mode === "markdown"
+          : mode === "markdown-package"
             ? await uploadDocumentIntakeMarkdownPackage(file!, key)
             : isZipFile
               ? await uploadDocumentIntakeZipPackage(file!, key)
@@ -737,6 +740,18 @@ export default function NewDocumentIntake() {
                 );
       if (requestVersion.current === version) setInitialPackage(prepared);
     });
+  }
+
+  async function admitPreparedMarkdown(source: AmendmentSourcePackage) {
+    const version = requestVersion.current;
+    const key =
+      intakeRequestKeys.current.get(source.id) ??
+      globalThis.crypto.randomUUID();
+    intakeRequestKeys.current.set(source.id, key);
+    const created = await createDocumentIntakeBatch(source.id, key);
+    if (requestVersion.current !== version) return;
+    setInitialBatch(created);
+    await refreshHistory();
   }
 
   async function prepareDocuments() {
@@ -871,7 +886,15 @@ export default function NewDocumentIntake() {
               </Button>
             ))}
           </div>
-          {mode === "url" ? (
+          {mode === "markdown" ? (
+            <MarkdownDraftStaging
+              disabled={dirtyKeys.size > 0 || busy}
+              preparationEnabled={
+                labelingReady && Boolean(setup?.default_label_count)
+              }
+              onPrepared={admitPreparedMarkdown}
+            />
+          ) : mode === "url" ? (
             <InputTypeIn
               aria-label="New document source URL"
               placeholder="https://www.resmigazete.gov.tr/..."
@@ -890,13 +913,13 @@ export default function NewDocumentIntake() {
                 type="file"
                 disabled={dirtyKeys.size > 0}
                 accept={
-                  mode === "markdown"
-                    ? ".zip,.md"
+                  mode === "markdown-package"
+                    ? ".zip"
                     : ".zip,.pdf,.docx,.html,.htm,.xlsx,.png,.jpg,.jpeg,.webp,.tif,.tiff"
                 }
                 aria-label={
-                  mode === "markdown"
-                    ? "Markdown package file"
+                  mode === "markdown-package"
+                    ? "Markdown ZIP paketi"
                     : "New document source file"
                 }
                 onChange={(event) => {
@@ -909,12 +932,17 @@ export default function NewDocumentIntake() {
                   prominence="secondary"
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  {mode === "markdown"
-                    ? "Choose Markdown or ZIP"
+                  {mode === "markdown-package"
+                    ? "Markdown ZIP seç"
                     : "Choose document or ZIP"}
                 </Button>
                 {file && <Text>{file.name}</Text>}
               </div>
+              {mode === "markdown-package" && (
+                <Text as="p" font="secondary-body">
+                  Önceden hazırladığınız Markdown ZIP paketini yükleyin.
+                </Text>
+              )}
               {mode === "file" && (
                 <Text as="p" font="secondary-body">
                   Upload a document or a ZIP containing supported documents.
@@ -925,30 +953,7 @@ export default function NewDocumentIntake() {
                   metadata preparation.
                 </Text>
               )}
-              {mode === "markdown" ? (
-                <div className="flex flex-col gap-2">
-                  <Text as="p" font="secondary-body">
-                    Upload one .md document, or a ZIP with one main document and
-                    its attachments. Each Markdown document becomes separate
-                    legislation. Conversion is skipped; Gemini 3.5 Flash
-                    generates labels before review.
-                  </Text>
-                  <Text as="p" font="secondary-body">
-                    The ZIP must contain manifest.json and the listed .md files.
-                    Each attachment needs a parent in the manifest and a
-                    relative Markdown link from that parent, such as
-                    [EK-1](ekler/ek-1.md). One enclosing folder is allowed.
-                  </Text>
-                  <div>
-                    <Button
-                      prominence="tertiary"
-                      href="/api/regulatory/document-intake/markdown-template"
-                    >
-                      Download Markdown package template
-                    </Button>
-                  </div>
-                </div>
-              ) : !isZipFile ? (
+              {mode === "file" && !isZipFile ? (
                 <InputTypeIn
                   aria-label="Original document URL"
                   placeholder="Original document URL (for relative attachment links)"
@@ -962,19 +967,21 @@ export default function NewDocumentIntake() {
               ) : null}
             </div>
           )}
-          <div>
-            <Button
-              disabled={
-                busy ||
-                dirtyKeys.size > 0 ||
-                sourcePackage?.status === "processing" ||
-                (mode === "url" ? !url.trim() : !file)
-              }
-              onClick={() => void prepareSource()}
-            >
-              Prepare source and attachments
-            </Button>
-          </div>
+          {mode !== "markdown" && (
+            <div>
+              <Button
+                disabled={
+                  busy ||
+                  dirtyKeys.size > 0 ||
+                  sourcePackage?.status === "processing" ||
+                  (mode === "url" ? !url.trim() : !file)
+                }
+                onClick={() => void prepareSource()}
+              >
+                Prepare source and attachments
+              </Button>
+            </div>
+          )}
           {sourcePackage && (
             <section className="flex flex-col gap-2 rounded-12 border border-border-02 p-3">
               <Text font="main-ui-action">{`Source package ${sourcePackage.status} · ${sourcePackage.asset_count} documents`}</Text>
@@ -1042,7 +1049,7 @@ export default function NewDocumentIntake() {
             {String(message)}
           </Text>
         ))}
-      {!batch && (
+      {!batch && mode !== "markdown" && (
         <div>
           <Button
             disabled={

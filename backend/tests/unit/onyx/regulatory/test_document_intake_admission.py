@@ -61,6 +61,7 @@ def test_start_freezes_intake_model_and_only_new_files_or_reuses_frozen_run(
         document_set_id=8,
         labeling_model_configuration_id=7,
         labeling_run_id=old_run.id if existing_run else None,
+        metadata_checkpoint=None,
         status="preparing",
         lease_token=None,
     )

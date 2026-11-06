@@ -9086,6 +9086,96 @@ class AmendmentSourcePackage(Base):
     )
 
 
+class RegulatoryMarkdownDraft(Base):
+    """Owner-scoped originals before explicit source preparation."""
+
+    __tablename__ = "regulatory_markdown_draft"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("user.id"))
+    document_set_id: Mapped[int] = mapped_column(
+        ForeignKey("document_set.id", ondelete="CASCADE")
+    )
+    environment: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[UUID] = mapped_column()
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(Text, default="draft", server_default="draft")
+    source_package_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("amendment_source_package.id"), nullable=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "created_by",
+            "document_set_id",
+            "environment",
+            "idempotency_key",
+            name="uq_markdown_draft_request",
+        ),
+        CheckConstraint(
+            "revision >= 0 AND status IN ('draft', 'prepared')",
+            name="markdown_draft_status_check",
+        ),
+        CheckConstraint(
+            "(status = 'prepared') = (source_package_id IS NOT NULL)",
+            name="markdown_draft_prepared_check",
+        ),
+        Index(
+            "ix_markdown_draft_owner", "created_by", "document_set_id", "environment"
+        ),
+    )
+
+
+class RegulatoryMarkdownDraftDocument(Base):
+    __tablename__ = "regulatory_markdown_draft_document"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    draft_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_markdown_draft.id", ondelete="CASCADE")
+    )
+    parent_document_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    display_name: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    byte_count: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(Text)
+    removed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint("draft_id", "id", name="uq_markdown_draft_document_identity"),
+        ForeignKeyConstraint(
+            ["draft_id", "parent_document_id"],
+            [
+                "regulatory_markdown_draft_document.draft_id",
+                "regulatory_markdown_draft_document.id",
+            ],
+        ),
+        CheckConstraint(
+            "byte_count > 0 AND byte_count <= 2097152",
+            name="markdown_draft_document_size_check",
+        ),
+        Index("ix_markdown_draft_document_draft", "draft_id"),
+    )
+
+
+class RegulatoryMarkdownDraftUpload(Base):
+    """Immutable request receipts survive subtree removal and later mutations."""
+
+    __tablename__ = "regulatory_markdown_draft_upload"
+    draft_id: Mapped[UUID] = mapped_column(
+        ForeignKey("regulatory_markdown_draft.id", ondelete="CASCADE"), primary_key=True
+    )
+    idempotency_key: Mapped[UUID] = mapped_column(primary_key=True)
+    request_hash: Mapped[str] = mapped_column(Text)
+    resulting_revision: Mapped[int] = mapped_column(Integer)
+
+
 class RegulatoryDocumentIntake(Base):
     """A new-document admission, separate from amendment comparison."""
 

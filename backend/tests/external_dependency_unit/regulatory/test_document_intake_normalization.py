@@ -61,6 +61,8 @@ def _transition_fixture(
     owner: tuple[User, DocumentSet, ModelConfiguration],
     store: PostgresBackedFileStore,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_metadata: bool = False,
 ) -> tuple[RegulatoryDocumentIntake, UUID]:
     from onyx.db.document_intake_sources import create_zip_source_package
 
@@ -91,6 +93,12 @@ def _transition_fixture(
     package_id = package.id
     session.commit()
     source_job.run_source_package(package_id=package_id, environment=_ENVIRONMENT)
+    if with_metadata:
+        from tests.external_dependency_unit.regulatory.test_document_intake_zip import (
+            _inference_runtime,
+        )
+
+        _inference_runtime(session, model, store, monkeypatch)
     batch, _ = intake.create_intake(
         session,
         source_package_id=package_id,
@@ -101,18 +109,19 @@ def _transition_fixture(
     )
     batch_id, model_id = batch.id, model.id
     session.commit()
-    monkeypatch.setattr(
-        intake,
-        "resolve_intake_labeling_provider_binding",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            model="gemini-3.5-flash",
-            model_dump=lambda **_options: {"model_configuration_id": model_id},
-        ),
-    )
-    monkeypatch.setattr(
-        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
-        lambda **_kwargs: None,
-    )
+    if not with_metadata:
+        monkeypatch.setattr(
+            intake,
+            "resolve_intake_labeling_provider_binding",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                model="gemini-3.5-flash",
+                model_dump=lambda **_options: {"model_configuration_id": model_id},
+            ),
+        )
+        monkeypatch.setattr(
+            "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
+            lambda **_kwargs: None,
+        )
     current_formatter = preparation.prepare_intake_text
 
     def previous_formatter(text: str, **kwargs: Any) -> str:
@@ -148,7 +157,10 @@ def _transition_fixture(
     )
     monkeypatch.setattr(reprepare_job, "get_default_file_store", lambda: store)
     monkeypatch.setattr(normalization, "get_default_file_store", lambda: store)
-    monkeypatch.setattr(reprepare_job, "run_intake_metadata", lambda **_kwargs: None)
+    if not with_metadata:
+        monkeypatch.setattr(
+            reprepare_job, "run_intake_metadata", lambda **_kwargs: None
+        )
     return batch, run_id
 
 
@@ -157,8 +169,12 @@ def _prepared_transition(
     owner: tuple[User, DocumentSet, ModelConfiguration],
     store: PostgresBackedFileStore,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_metadata: bool = False,
 ) -> tuple[RegulatoryDocumentIntake, RegulatoryDocumentIntakeReprepare]:
-    batch, _run_id = _transition_fixture(session, owner, store, monkeypatch)
+    batch, _run_id = _transition_fixture(
+        session, owner, store, monkeypatch, with_metadata=with_metadata
+    )
     request = _request(session, batch)
     assert (
         reprepare_job.run_document_intake_reprepare(

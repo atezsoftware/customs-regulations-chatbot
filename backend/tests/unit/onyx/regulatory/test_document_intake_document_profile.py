@@ -1,7 +1,7 @@
 """Intake identity comes from the document header, never browser or cited IDs."""
 
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -49,7 +49,10 @@ def test_printed_legal_header_controls_identity_and_preserves_publication_source
     )
     assert result.content == source
     assert [asdict(block) for block in result.blocks] == [
-        asdict(block) for block in original_blocks
+        asdict(replace(block, kind="heading"))
+        if block.text == "Amaç ve kapsam"
+        else asdict(block)
+        for block in original_blocks
     ]
     assert result.metadata.title == " ".join(_TITLE_LINES)
     assert result.structure[0].label == result.metadata.title
@@ -67,7 +70,14 @@ def test_printed_legal_header_controls_identity_and_preserves_publication_source
         assert chunk.metadata.document_number == "SGM-2024/5"
         assert chunk.metadata.heading_path[0] == result.metadata.title
         span = source[chunk.metadata.source_start_char : chunk.metadata.source_end_char]
-        assert all(_compact(line) in _compact(span) for line in chunk.text.splitlines())
+        for line in chunk.text.splitlines():
+            if (
+                chunk.metadata.chunk_variant == "hierarchical_aggregate"
+                and line == chunk.metadata.heading_path[-1]
+            ):
+                assert line == "MADDE 1 - Amaç ve kapsam"
+            else:
+                assert _compact(line) in _compact(span)
     # Existing Update chunking retains its previous inference and source behavior.
     legacy = RegulatoryChunker().chunk_text(source, source_file="2025-01-05.pdf")
     assert legacy.metadata.document_number == "2025/01"
