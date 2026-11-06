@@ -137,3 +137,31 @@ def test_named_section_overview_uses_outline_without_detached_clause_prose() -> 
     )
     assert "999" not in json.dumps(packet)
     assert packet["structure"][0]["verified_ranges"] == [[231, 232]]
+
+
+def test_returned_file_uses_its_own_structure_when_duplicate_titles_resolve() -> None:
+    from onyx.regulatory.catalog_scope import CatalogSearchScope
+
+    page = _page(2)
+    first = page.items[0].file.id
+    other = uuid4()
+    page.scope = CatalogSearchScope(
+        file_ids=[first, other],
+        heading_prefixes=[["Gümrük Kanunu", "Cezalar"]],
+        heading_paths=[
+            ["Gümrük Kanunu", "Cezalar", "Madde 1"],
+            ["Gümrük Kanunu", "Cezalar", "Madde 99"],
+        ],
+        heading_paths_by_file={
+            str(first): [
+                ["Gümrük Kanunu", "Cezalar", "Madde 1"],
+                ["Gümrük Kanunu", "Cezalar", "Madde 2"],
+            ],
+            str(other): [["Gümrük Kanunu", "Cezalar", "Madde 99"]],
+        },
+    )
+    packet = catalog_overview_payload("cezalar", page)
+    assert all(e["text"] == "" for e in packet["evidence"])
+    assert len(packet["structure"]) == 1
+    assert packet["structure"][0]["verified_ranges"] == [[1, 2]]
+    assert "99" not in json.dumps(packet)

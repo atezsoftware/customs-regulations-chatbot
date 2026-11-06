@@ -42,10 +42,10 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
 from onyx.regulatory.catalog_scope import (
     CatalogSearchScope,
+    extract_catalog_source_hint,
     resolve_catalog_source_titles,
     select_catalog_heading_prefixes,
 )
-from onyx.regulatory.heading_path import extract_regulatory_instrument_source_hint
 from onyx.regulatory.publication_reads import (
     filter_publication_read,
     observe_publication_read,
@@ -269,7 +269,7 @@ def search_catalog_chunks(
     scope: CatalogSearchScope | None = None
     if adaptive:
         original_query = scope_query or request.query
-        hint = extract_regulatory_instrument_source_hint(original_query)
+        hint = extract_catalog_source_hint(original_query)
         if hint:
             titles = resolve_catalog_source_titles(
                 original_query, catalog_source_titles(db_session, hint)
@@ -289,7 +289,8 @@ def search_catalog_chunks(
                     scope=scope,
                 )
             require_publication_files(observation, tuple(file_ids))
-            paths = catalog_heading_paths(db_session, file_ids)
+            paths_by_file = catalog_heading_paths(db_session, file_ids)
+            paths = [path for values in paths_by_file.values() for path in values]
             prefixes = select_catalog_heading_prefixes(
                 original_query, hint, paths, source_title=titles[0].name
             )
@@ -300,6 +301,15 @@ def search_catalog_chunks(
                 if not prefixes
                 or any(tuple(path[: len(prefix)]) == prefix for prefix in prefixes)
             ]
+            scope.heading_paths_by_file = {
+                str(file_id): [
+                    path
+                    for path in values
+                    if not prefixes
+                    or any(tuple(path[: len(prefix)]) == prefix for prefix in prefixes)
+                ]
+                for file_id, values in paths_by_file.items()
+            }
             filters.attached_document_ids = [str(file_id) for file_id in file_ids]
             filters.regulatory_heading_scope = [
                 prefix[-1] for prefix in prefixes

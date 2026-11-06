@@ -121,3 +121,33 @@ def test_long_lowercase_title_and_numeric_decision_identity() -> None:
     assert resolve_catalog_source_titles(
         "2009/15481 sayılı karar hükümleri", [decision]
     ) == [decision]
+
+
+def test_generic_notification_word_does_not_cancel_explicit_law_scope() -> None:
+    law = CatalogSourceTitle(file_id=uuid4(), name="gumruk_kanunu.md")
+    assert resolve_catalog_source_titles(
+        "Gümrük Kanunu elektronik tebligat", [law]
+    ) == [law]
+
+
+def test_broad_topic_does_not_select_only_a_more_specific_section_or_clause() -> None:
+    paths = [
+        [
+            "Vergi Usul Kanunu",
+            "ÜÇÜNCÜ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "1. Uzlaşma vaki olursa cezaların ödeme zamanı...",
+        ],
+        [
+            "Vergi Usul Kanunu",
+            "ÜÇÜNCÜ KISIM",
+            "ÜÇÜNCÜ BÖLÜM",
+            "Uzlaşma ve Cezalarda İndirme",
+        ],
+    ]
+    assert (
+        select_catalog_heading_prefixes(
+            "Vergi Usul Kanunu cezalar", "Vergi Usul Kanunu", paths
+        )
+        == []
+    )
