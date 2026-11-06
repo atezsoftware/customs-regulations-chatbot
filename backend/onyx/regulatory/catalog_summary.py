@@ -275,7 +275,7 @@ def catalog_summary_messages(
     ]
 
 
-def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+def strict_catalog_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
@@ -287,7 +287,9 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def render_catalog_passage_summary(content: str, search: CatalogSearchPage) -> str:
     """Resolve selected IDs only against the server's original source passages."""
     try:
-        payload: object = json.loads(content, object_pairs_hook=_strict_json_object)
+        payload: object = json.loads(
+            content, object_pairs_hook=strict_catalog_json_object
+        )
     except json.JSONDecodeError:
         _reject(CatalogSummaryRejectionCode.INVALID_JSON)
     if not isinstance(payload, dict) or set(payload) != {"passage_ids"}:
