@@ -1486,6 +1486,18 @@ def _source_title_query(
     )
     if basename_only:
         normalized_name = func.regexp_replace(normalized_name, "^.*/", "")
+    customs_annex = re.fullmatch(
+        r"gumruk\s+yonetmeligi\s+ek[\s_-]*0*(\d{1,3})", normalized_query
+    )
+    if customs_annex and not basename_only:
+        # Legacy PC annexes use "Yöneteliği Ekleri/ek_06.md". This is a
+        # navigation alias; nested annexes and other instruments stay distinct.
+        number = int(customs_annex[1])
+        return [
+            normalized_name.op("~")(
+                rf"(^|/)gumruk[ _-]+yonetm?eligi[ _-]+ekleri/ek[_ -]+0*{number}\.md$"
+            )
+        ], []
     conditions: list[ColumnElement[bool]] = []
     order: list[ColumnElement[Any]] = []
     references = list(

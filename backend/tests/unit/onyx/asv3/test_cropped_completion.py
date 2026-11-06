@@ -183,7 +183,8 @@ def test_genuine_open_material_followup_renders_only_original_question_after_exa
     assert result.startswith(ANSWER + "\n\n")
     assert result.endswith(str(row["question"]))
     assert str(row["material_rationale"]) not in result
-    assert "İstersen şu açık soruları da araştırabilirim:" in result
+    assert "Yanıtı tamamlamak için açıklığa kavuşturulması gereken sorular:" in result
+    assert "araştırabilirim" not in result
     assert "$" not in result
     assert (ledger.export(), state.export(), outcomes.export()) == before
     assert ledger.completely_delivered("nonexistent-review") == set()
@@ -653,7 +654,8 @@ def test_english_heading_does_not_rewrite_the_model_question() -> None:
     context.language = "en-US"
     question = "Should the original provision and the filing date be verified?"
     result = render(context, [item(question=question)])
-    assert "If you'd like, I can research these open questions too:" in result
+    assert "Open questions needed to complete this answer:" in result
+    assert "I can research" not in result
     assert result.endswith(question)
 
 
