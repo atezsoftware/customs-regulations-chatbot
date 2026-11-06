@@ -24,8 +24,13 @@ jobs:
           set -euo pipefail
           [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json)
-          selected=$(jq -r --arg sha "$EXPECTED_IMAGE_SHA" '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name as $pod | .spec.containers[] | select(.image | endswith(":" + $sha)) | [$pod,.name] | @tsv' <<<"$pods" | head -n 1)
+          selected=""
+          for attempt in {1..18}; do
+            pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json)
+            selected=$(jq -r --arg sha "$EXPECTED_IMAGE_SHA" '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name as $pod | .spec.containers[] | select(.image | endswith(":" + $sha)) | [$pod,.name] | @tsv' <<<"$pods" | head -n 1)
+            if [[ -n "$selected" ]]; then break; fi
+            sleep 10
+          done
           [[ -n "$selected" ]]
           IFS=$'\t' read -r pod container <<<"$selected"
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
