@@ -41,7 +41,7 @@ jobs:
           from onyx.db.asv3_corpus import resolve_pc_corpus_scope
           from onyx.db.chat import get_chat_session_by_id
           from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
-          SqlEngine.init_engine(pool_size=2, max_overflow=0)
+          SqlEngine.init_engine(pool_size=5, max_overflow=0)
           with get_session_with_current_tenant() as session:
               chat = get_chat_session_by_id(UUID("ebff456a-16b1-49f9-a244-133328bf54d5"), None, session, include_deleted=True)
               user = chat.user
