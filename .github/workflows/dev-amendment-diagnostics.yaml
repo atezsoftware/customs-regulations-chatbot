@@ -1,11 +1,14 @@
-name: DEV amendment approval diagnostics
+name: DEV source lookup acceptance
+run-name: DEV source lookup acceptance ${{ inputs.operation_id }}
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
-        default: inspect
+      operation_id:
+        type: string
+        required: true
+      expected_image_sha:
+        type: string
+        required: true
 permissions:
   contents: read
 jobs:
@@ -13,87 +16,48 @@ jobs:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
-          PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
+      - name: Verify scoped lookup in the exact deployed DEV image
         shell: bash
         env:
-          OPERATION: ${{ inputs.operation }}
+          EXPECTED_IMAGE_SHA: ${{ inputs.expected_image_sha }}
         run: |
           set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
+          [[ "$EXPECTED_IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          pods=$(kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json)
+          selected=$(jq -r --arg sha "$EXPECTED_IMAGE_SHA" '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.name as $pod | .spec.containers[] | select(.image | endswith(":" + $sha)) | [$pod,.name] | @tsv' <<<"$pods" | head -n 1)
+          [[ -n "$selected" ]]
+          IFS=$'\t' read -r pod container <<<"$selected"
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+            sh -ec '. /vault/secrets/config; export PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=30000"; exec python -' <<'PYCODE'
+          import json
+          from datetime import date
+          from uuid import UUID
+          from onyx.asv3.corpus_tools import CorpusBroker
+          from onyx.asv3.models import RunContext
+          from onyx.configs.constants import DocumentSource
+          from onyx.context.search.models import IndexFilters
+          from onyx.db.asv3_corpus import resolve_pc_corpus_scope
+          from onyx.db.chat import get_chat_session_by_id
+          from onyx.db.engine.sql_engine import get_session_with_current_tenant
+          with get_session_with_current_tenant() as session:
+              chat = get_chat_session_by_id(UUID("ebff456a-16b1-49f9-a244-133328bf54d5"), None, session, include_deleted=True)
+              user = chat.user
+              assert user is not None
+              filters = resolve_pc_corpus_scope(session, user=user, filters=IndexFilters(access_control_list=[], document_set=["PC Külliyatı"], forced_document_set=["PC Külliyatı"], source_type=[DocumentSource.USER_FILE], as_of_date=date(2026, 11, 2)))
+              broker = CorpusBroker(user, filters)
+              context = RunContext(scope=filters.model_dump(mode="json"), services={"asv3_exp_cropped": True})
+              expected = {4: "3058d3bb-67ca-4ea6-9da5-281b4706a120", 6: "c2be0b87-9800-4f9f-8c6d-cebfa5cbb2f7"}
+              for number, identifier in expected.items():
+                  for title in (f"Gümrük Yönetmeliği ek {number}", f"Gümrük Yönetmeliği EK-{number}"):
+                      sources, more = broker.sources(title, context)
+                      assert not more and [str(source.id) for source in sources] == [identifier], (title, [(str(source.id), source.name) for source in sources], more)
+                      print(json.dumps({"query": title, "source_ids": [str(source.id) for source in sources], "has_more": more}, ensure_ascii=False))
+                  source, chunks, more = broker.page(identifier, context, start=0, limit=1)
+                  assert chunks and chunks[0].text.strip()
+                  print(json.dumps({"source_id": str(source.id), "original_chunks_read": len(chunks), "text_hash": chunks[0].text_hash if hasattr(chunks[0], "text_hash") else None, "original_characters": len(chunks[0].text), "has_more": more}))
+              for title in ("952/2013", "2015/2446", "2016/1036", "71/97", "88/97"):
+                  sources, more = broker.sources(title, context)
+                  print(json.dumps({"unresolved_eu_query": title, "source_ids": [str(source.id) for source in sources], "has_more": more, "absence_proven": False}))
+              print("PASS: scoped original annex resolution and reads; no writes or model calls")
+          PYCODE
