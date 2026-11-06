@@ -374,9 +374,9 @@ def append_cropped_required_followups(
     if not answer.strip():
         raise ValueError("Followups cannot replace a missing user answer")
     heading = (
-        "If you'd like, I can research these open questions too:"
+        "Open questions needed to complete this answer:"
         if context.language.lower().startswith("en")
-        else "İstersen şu açık soruları da araştırabilirim:"
+        else "Yanıtı tamamlamak için açıklığa kavuşturulması gereken sorular:"
     )
     return (
         answer
