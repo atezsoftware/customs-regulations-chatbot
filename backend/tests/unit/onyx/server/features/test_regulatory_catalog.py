@@ -597,7 +597,7 @@ def test_simple_search_pins_source_and_heading_before_embedding_retrieval(
                 )
             ],
         ),
-        patch(f"{MODULE}.catalog_heading_paths", return_value=paths),
+        patch(f"{MODULE}.catalog_heading_paths", return_value={catalog_file.id: paths}),
     ):
         response = api.search_catalog_chunks(
             CatalogSearchRequest(query="Gümrük Kanunu cezalar"),

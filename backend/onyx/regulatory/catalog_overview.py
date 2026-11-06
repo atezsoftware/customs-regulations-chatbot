@@ -29,17 +29,19 @@ from onyx.tracing.flows import LLMFlow
 from onyx.tracing.llm_utils import llm_generation_span, record_llm_response
 
 OVERVIEW_INPUT_TOKENS = 6000
-OVERVIEW_OUTPUT_TOKENS = 320
-OVERVIEW_EVIDENCE_LIMIT = 20
+OVERVIEW_OUTPUT_TOKENS = 420
+OVERVIEW_EVIDENCE_LIMIT = 8
 OVERVIEW_SYSTEM_PROMPT = """Mevzuat arama sonuçlarını Türkçe, doğal ve kısa bir keşif özetiyle anlat.
 Kullanıcının aradığı konu için hangi kaynak ve başlıkların bulunduğunu, pasajların birlikte
-ne gösterdiğini 2–4 cümlede açıkla. Sadece verilen kanıtı kullan; hukuki yorum, tavsiye,
+ne gösterdiğini 2–3 cümlede açıkla. Sadece verilen kanıtı kullan; hukuki yorum, tavsiye,
 uygulanabilirlik veya güncellik iddiası üretme. Koşul ve istisnaları koru; kısa pasajın
 kapsamından daha geniş bir hukuki kural çıkarma. Parça metinlerini art arda alıntılama.
 Bu bir kaynak keşif özetidir: tek tek ceza hesabı, oran, tutar veya uygulama sonucu
 çıkarmak yerine bulunan bölümün alt konularını ve yapısal yerini anlat.
-Her cümleye onu destekleyen evidence.reference değerleriyle [N] biçiminde atıf ekle.
+En fazla 3 farklı kaynak referansı kullan. Her cümleye onu destekleyen evidence.reference değerleriyle [N] biçiminde atıf ekle.
 Başlık yapısını da yalnızca atıf yapılan dosyanın structure kaydından kullan.
+Bölüm ile madde aralığı ilişkisini section_ranges içinden aynen al; örneklenmiş
+chunklardan veya sıralanmamış başlıklardan yeni bir bölüm aralığı çıkarma.
 Bir madde aralığını ancak structure.verified_ranges içinde aynen verilmişse söyle;
 aralığın tüm hükümlerinin aramada getirildiğini iddia etme. Diğer sayıları tahmin etme.
 Özet için örneklenmiş pasajlar verilir; total_chunks tüm sonuçların sayısıdır. Örneklerin
@@ -63,6 +65,7 @@ class OverviewStructure(TypedDict):
     heading_prefixes: list[list[str]]
     article_headings: list[str]
     section_headings: list[str]
+    section_ranges: dict[str, list[int]]
     verified_ranges: list[list[int]]
 
 
@@ -74,11 +77,7 @@ class OverviewPayload(TypedDict):
 
 
 def catalog_overview_payload(query: str, search: CatalogSearchPage) -> OverviewPayload:
-    structural_mode = bool(
-        search.scope
-        and len(search.scope.file_ids) == 1
-        and search.scope.heading_prefixes
-    )
+    structural_mode = bool(search.scope and search.scope.heading_prefixes)
     structural_anchors: set[tuple[str, ...]] = set()
     passages = [] if structural_mode else build_catalog_summary_passages(search)
     by_reference: dict[int, list[str]] = {}
@@ -110,7 +109,7 @@ def catalog_overview_payload(query: str, search: CatalogSearchPage) -> OverviewP
                 if parse_regulatory_article_heading(label):
                     heading_path = heading_path[: index + 1]
                     break
-            anchor = tuple(heading_path)
+            anchor = (str(hit.file.id), *heading_path)
             if anchor in structural_anchors:
                 continue
             structural_anchors.add(anchor)
@@ -130,39 +129,52 @@ def catalog_overview_payload(query: str, search: CatalogSearchPage) -> OverviewP
             break
     structure: list[OverviewStructure] = []
     scope = search.scope
-    # Only expose verified structural ranges when a single source was resolved.
-    if scope and len(scope.file_ids) == 1 and scope.heading_prefixes:
-        articles: set[int] = set()
-        for path in scope.heading_paths:
-            for label in path:
-                article = parse_regulatory_article_heading(label)
-                if (
-                    article
-                    and article.qualifier is None
-                    and article.article_no.isdigit()
-                ):
-                    articles.add(int(article.article_no))
-        structural_labels: dict[str, None] = {}
-        for path in scope.heading_paths:
-            for label in path[1:]:
-                structural_labels[label] = None
-                if parse_regulatory_article_heading(label):
-                    break
-        numbers = sorted(articles)
-        ranges = (
-            [[numbers[0], numbers[-1]]]
-            if len(numbers) > 1 and len(numbers) == numbers[-1] - numbers[0] + 1
-            else []
-        )
-        structure.append(
-            OverviewStructure(
-                file_id=str(scope.file_ids[0]),
-                heading_prefixes=scope.heading_prefixes,
-                article_headings=[str(n) for n in numbers[:160]],
-                section_headings=list(structural_labels)[:80],
-                verified_ranges=ranges,
+    # Structural ranges belong to an individual file, never the union of copies.
+    if scope and scope.heading_prefixes:
+        returned_files = {str(hit.file.id) for hit in search.items}
+        for file_id in sorted(returned_files):
+            paths = scope.heading_paths_by_file.get(
+                file_id, scope.heading_paths if len(scope.file_ids) == 1 else []
             )
-        )
+            if not paths:
+                continue
+            articles: set[int] = set()
+            section_articles: dict[str, set[int]] = {}
+            structural_labels: dict[str, None] = {}
+            for path in paths:
+                for label in path[1:]:
+                    structural_labels[label] = None
+                    article = parse_regulatory_article_heading(label)
+                    if article:
+                        if article.qualifier is None and article.article_no.isdigit():
+                            number = int(article.article_no)
+                            articles.add(number)
+                            article_index = path.index(label)
+                            for depth in range(2, article_index + 1):
+                                section_articles.setdefault(
+                                    " > ".join(path[:depth]), set()
+                                ).add(number)
+                        break
+            numbers = sorted(articles)
+            ranges = (
+                [[numbers[0], numbers[-1]]]
+                if len(numbers) > 1 and len(numbers) == numbers[-1] - numbers[0] + 1
+                else []
+            )
+            structure.append(
+                OverviewStructure(
+                    file_id=file_id,
+                    heading_prefixes=scope.heading_prefixes,
+                    article_headings=[str(n) for n in numbers[:160]],
+                    section_headings=list(structural_labels)[:80],
+                    section_ranges={
+                        section: [min(values), max(values)]
+                        for section, values in list(section_articles.items())[:24]
+                        if len(values) == max(values) - min(values) + 1
+                    },
+                    verified_ranges=ranges,
+                )
+            )
     if structure:
         # A named section is summarized from its verified outline, not detached clauses.
         for entry in evidence:

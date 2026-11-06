@@ -70,15 +70,19 @@ def catalog_source_titles(
 
 def catalog_heading_paths(
     session: Session, file_ids: Sequence[UUID]
-) -> list[list[str]]:
+) -> dict[UUID, list[list[str]]]:
     if not file_ids:
-        return []
-    paths = session.scalars(
-        select(RegulatoryChunk.heading_path)
+        return {}
+    rows = session.execute(
+        select(RegulatoryChunk.user_file_id, RegulatoryChunk.heading_path)
         .where(
             RegulatoryChunk.user_file_id.in_(file_ids),
             RegulatoryChunk.status != "superseded",
         )
         .distinct()
     ).all()
-    return sorted([list(path) for path in paths if path])
+    paths: dict[UUID, list[list[str]]] = {}
+    for file_id, path in rows:
+        if path:
+            paths.setdefault(file_id, []).append(list(path))
+    return {file_id: sorted(values) for file_id, values in paths.items()}

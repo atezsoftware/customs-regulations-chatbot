@@ -22,6 +22,7 @@ class CatalogSearchScope(BaseModel):
     heading_prefixes: list[list[str]] = Field(default_factory=list)
     # Complete distinct canonical paths, not inferred article ranges.
     heading_paths: list[list[str]] = Field(default_factory=list)
+    heading_paths_by_file: dict[str, list[list[str]]] = Field(default_factory=dict)
 
 
 def catalog_fold(value: str) -> str:
@@ -58,10 +59,16 @@ def _own_title(value: str) -> list[str]:
     return _instrument_tokens(title)
 
 
+def extract_catalog_source_hint(query: str) -> str | None:
+    # Notification is a topic, whereas a tebliğ is an instrument type.
+    routing_query = re.sub(r"\btebli[gğ]at\w*", "bildirim", query, flags=re.I)
+    return extract_regulatory_instrument_source_hint(routing_query)
+
+
 def resolve_catalog_source_titles(
     query: str, titles: Sequence[CatalogSourceTitle]
 ) -> list[CatalogSourceTitle]:
-    hint = extract_regulatory_instrument_source_hint(query)
+    hint = extract_catalog_source_hint(query)
     if not hint:
         return []
     target = _instrument_tokens(hint)
@@ -187,10 +194,23 @@ def select_catalog_heading_prefixes(
         for depth in range(2, len(path) + 1):
             label = path[depth - 1]
             # Article-specific questions retain semantic retrieval, not section-wide narrowing.
-            if re.search(r"\b(?:madde|article|ek|gecici)\s*\d", catalog_fold(label)):
+            if (
+                re.search(r"\b(?:madde|article|ek|gecici)\s*\d", catalog_fold(label))
+                or re.match(
+                    r"^(?:\d+\s*[.)]|[a-zçğıöşü]\)|\([^)]+\))", label, flags=re.I
+                )
+                or label.endswith(("...", "…"))
+            ):
                 break
-            words = {_topic_stem(t) for t in _tokens(label)}
-            if topics <= words:
+            ordinal = r"^(?:birinci|ikinci|ucuncu|dorduncu|besinci|altinci|yedinci|sekizinci|dokuzuncu|onuncu|onbirinci|onikinci|onucuncu)$"
+            words = {
+                _topic_stem(t)
+                for t in _tokens(label)
+                if t not in {"bolum", "kisim", "kitap", "ve", "ile"}
+                and not re.fullmatch(ordinal, t)
+            }
+            # A broad topic must not be narrowed to one more-specific subtopic.
+            if topics == words:
                 matches.add(tuple(path[:depth]))
                 break
     return sorted(
