@@ -60,9 +60,9 @@ jobs:
                       sources, more = broker.sources(title, context)
                       assert not more and [str(source.id) for source in sources] == [identifier], (title, [(str(source.id), source.name) for source in sources], more)
                       print(json.dumps({"query": title, "source_ids": [str(source.id) for source in sources], "has_more": more}, ensure_ascii=False))
-                  source, chunks, more = broker.page(identifier, context, start=0, limit=1)
-                  assert chunks and chunks[0].text.strip()
-                  print(json.dumps({"source_id": str(source.id), "original_chunks_read": len(chunks), "text_hash": hashlib.sha256(chunks[0].text.encode()).hexdigest(), "original_characters": len(chunks[0].text), "has_more": more}))
+                  source, chunks, more = broker.page(identifier, context, start=0, limit=100)
+                  assert chunks and not more and sum(len(chunk.text) for chunk in chunks) > 1000
+                  print(json.dumps({"source_id": str(source.id), "original_chunks_read": len(chunks), "text_hash": hashlib.sha256("".join(chunk.text for chunk in chunks).encode()).hexdigest(), "original_characters": sum(len(chunk.text) for chunk in chunks), "has_more": more}))
               for title in ("952/2013", "2015/2446", "2016/1036", "71/97", "88/97"):
                   sources, more = broker.sources(title, context)
                   print(json.dumps({"unresolved_eu_query": title, "source_ids": [str(source.id) for source in sources], "has_more": more, "absence_proven": False}))
