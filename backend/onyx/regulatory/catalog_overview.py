@@ -226,7 +226,10 @@ def validate_catalog_overview(text: str, payload: OverviewPayload) -> str:
                     }
                     for item in cited
                 ],
-                structures,
+                [
+                    {key: value for key, value in item.items() if key != "file_id"}
+                    for item in structures
+                ],
             ],
             ensure_ascii=False,
         )
