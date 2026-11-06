@@ -165,3 +165,25 @@ def test_returned_file_uses_its_own_structure_when_duplicate_titles_resolve() ->
     assert len(packet["structure"]) == 1
     assert packet["structure"][0]["verified_ranges"] == [[1, 2]]
     assert "99" not in json.dumps(packet)
+
+
+def test_identifier_digits_are_not_numeric_source_evidence() -> None:
+    from uuid import UUID
+
+    from onyx.regulatory.catalog_scope import CatalogSearchScope
+
+    page = _page(1)
+    file_id = UUID("00000000-a230-4000-8000-000000000000")
+    page.items[0].file.id = file_id
+    page.items[0].chunk.heading_path = ["Kanun", "Cezalar", "Madde 231"]
+    page.scope = CatalogSearchScope(
+        file_ids=[file_id],
+        heading_prefixes=[["Kanun", "Cezalar"]],
+        heading_paths=[
+            ["Kanun", "Cezalar", "Madde 231"],
+            ["Kanun", "Cezalar", "Madde 232"],
+        ],
+    )
+    packet = catalog_overview_payload("cezalar", page)
+    with pytest.raises(CatalogSummaryUnavailable):
+        validate_catalog_overview("Madde 230 bulunur [1].", packet)
