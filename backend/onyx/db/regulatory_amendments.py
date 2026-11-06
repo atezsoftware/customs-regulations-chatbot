@@ -1402,6 +1402,61 @@ def _lock_reviewed_replacement_scope(
     return [row for row in rows if row.id != old_chunk.id]
 
 
+def _review_preserved_descendant_scopes(
+    db_session: Session,
+    changes: list[dict[str, Any]],
+    locked: dict[str, RegulatoryChunk],
+) -> dict[str, list[RegulatoryChunk]]:
+    """Verify preserved subtrees before any sibling in the atomic edit is changed."""
+    scopes: dict[str, list[RegulatoryChunk]] = {}
+    for change in changes:
+        if any(
+            explicit_replacement_body(text)
+            for text in change.get("instruction_texts", [])
+        ):
+            continue
+        parent = locked.get(str(change.get("old_chunk_id")))
+        if parent is None:
+            continue
+        snapshot = dict(change.get("old_chunk_snapshot") or {})
+        snapshots = snapshot.get("descendant_snapshots") or []
+        descendants = load_active_structural_descendants(db_session, parent)
+        if not descendants and not snapshots:
+            continue
+        declared = {item["id"]: item for item in snapshots}
+        if len(declared) != len(snapshots) or set(declared) != {
+            row.id for row in descendants
+        }:
+            raise ValueError("Preserved descendants changed after review")
+        _ensure_old_chunk_matches_review_snapshot(parent, snapshot)
+        for identifier, reviewed in declared.items():
+            _ensure_old_chunk_matches_review_snapshot(locked[identifier], reviewed)
+        draft = _validated_reviewed_chunk_draft(
+            change["new_chunk_draft"],
+            change["new_chunk_draft"],
+            old_chunk_snapshot=snapshot,
+        )
+        if (
+            draft["heading_path"] != parent.heading_path
+            or any(
+                draft["metadata"].get(key) != parent.chunk_metadata.get(key)
+                for key in (
+                    "article_no",
+                    "paragraph_no",
+                    "clause_label",
+                    "subclause_label",
+                    "appendix_label",
+                )
+            )
+            or re.search(r"\(\s*mülga\s*\)", draft["text"], re.IGNORECASE)
+        ):
+            raise ValueError(
+                "Parent structural changes require a complete scope review"
+            )
+        scopes[parent.id] = descendants
+    return scopes
+
+
 def _approve_multi_chunk_proposal(
     db_session: Session,
     proposal: AmendmentProposal,
@@ -1491,7 +1546,22 @@ def _approve_multi_chunk_proposal(
         raise ValueError(
             "Replacement descendants require a complete reviewed heading scope"
         )
-    locked_ids = set(target_ids) | consumed_snapshots.keys()
+    preserved_ids: set[str] = set()
+    if heading_scope is None:
+        for change in changes:
+            if any(
+                explicit_replacement_body(text)
+                for text in change.get("instruction_texts", [])
+            ):
+                continue
+            for snapshot in change.get("old_chunk_snapshot", {}).get(
+                "descendant_snapshots", []
+            ):
+                identifier = snapshot.get("id")
+                if not isinstance(identifier, str):
+                    raise ValueError("Invalid preserved descendant identity")
+                preserved_ids.add(identifier)
+    locked_ids = set(target_ids) | consumed_snapshots.keys() | preserved_ids
     locked = list(
         db_session.scalars(
             select(RegulatoryChunk)
@@ -1504,6 +1574,11 @@ def _approve_multi_chunk_proposal(
     by_id = {chunk.id: chunk for chunk in locked}
     if set(by_id) != locked_ids:
         raise ValueError("One or more reviewed chunks no longer exist")
+    preserved_scopes = (
+        _review_preserved_descendant_scopes(db_session, changes, by_id)
+        if heading_scope is None
+        else {}
+    )
 
     from onyx.db.regulatory_annexes import copy_annex_chunk_links
     from onyx.regulatory.chunk_evidence import RegulatoryChunkEvidence
@@ -1527,7 +1602,9 @@ def _approve_multi_chunk_proposal(
             if is_hierarchical_aggregate_chunk(old_chunk):
                 raise ValueError("Derived aggregate chunks cannot be amended directly.")
             _ensure_old_chunk_matches_review_snapshot(old_chunk, snapshot)
-            descendants = load_active_structural_descendants(db_session, old_chunk)
+            descendants = preserved_scopes.get(old_chunk.id)
+            if descendants is None:
+                descendants = load_active_structural_descendants(db_session, old_chunk)
             replacement = any(
                 explicit_replacement_body(text)
                 for text in change.get("instruction_texts", [])
@@ -1559,6 +1636,7 @@ def _approve_multi_chunk_proposal(
             if (
                 descendants
                 and not replaced_descendants
+                and old_chunk.id not in preserved_scopes
                 and not (
                     heading_scope is not None
                     and snapshot.get("heading_change", {}).get("article_no")
