@@ -1,5 +1,6 @@
 """API-key and session accessible admin browsing without generative search."""
 
+import math
 from collections import Counter
 from collections.abc import Sequence
 from uuid import UUID
@@ -12,6 +13,7 @@ from onyx.configs.constants import PUBLIC_API_TAGS
 from onyx.context.search.enums import QueryType
 from onyx.context.search.models import IndexFilters, InferenceChunk
 from onyx.context.search.utils import get_query_embedding
+from onyx.db.catalog_search_scope import catalog_heading_paths, catalog_source_titles
 from onyx.db.document_intake import pending_intake_file_ids
 from onyx.db.document_intake_existing_relations import load_reviewed_file_relations
 from onyx.db.document_intake_source_lineage import load_intake_source_lineages
@@ -38,11 +40,18 @@ from onyx.document_index.factory import get_default_document_index
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.natural_language_processing.search_nlp_models import EmbeddingModel
+from onyx.regulatory.catalog_scope import (
+    CatalogSearchScope,
+    resolve_catalog_source_titles,
+    select_catalog_heading_prefixes,
+)
+from onyx.regulatory.heading_path import extract_regulatory_instrument_source_hint
 from onyx.regulatory.publication_reads import (
     filter_publication_read,
     observe_publication_read,
     require_publication_files,
 )
+from onyx.reranking.normalized_selection import select_normalized_rerank_candidates
 from onyx.reranking.service import rerank_chunks
 from onyx.reranking.staged import rerank_regulatory_candidates_in_batches
 from onyx.server.features.document_set.file_models import (
@@ -234,7 +243,11 @@ def search_chunks(
 
 
 def search_catalog_chunks(
-    request: CatalogSearchRequest, db_session: Session
+    request: CatalogSearchRequest,
+    db_session: Session,
+    *,
+    adaptive: bool = False,
+    scope_query: str | None = None,
 ) -> CatalogSearchPage:
     """Share the same bounded, reranked evidence with both admin search screens."""
     observation = observe_publication_read()
@@ -253,6 +266,44 @@ def search_catalog_chunks(
         tenant_id=get_current_tenant_id(),
         regulatory_chunks_only=True,
     )
+    scope: CatalogSearchScope | None = None
+    if adaptive:
+        original_query = scope_query or request.query
+        hint = extract_regulatory_instrument_source_hint(original_query)
+        if hint:
+            titles = resolve_catalog_source_titles(
+                original_query, catalog_source_titles(db_session, hint)
+            )
+            file_ids = [title.file_id for title in titles]
+            scope = CatalogSearchScope(source_hint=hint, file_ids=file_ids)
+            if not file_ids:
+                return CatalogSearchPage(
+                    items=[],
+                    total=0,
+                    offset=0,
+                    limit=0,
+                    has_more=False,
+                    result_limit=None,
+                    per_file_limit=None,
+                    normalized_threshold=0.8,
+                    scope=scope,
+                )
+            require_publication_files(observation, tuple(file_ids))
+            paths = catalog_heading_paths(db_session, file_ids)
+            prefixes = select_catalog_heading_prefixes(
+                original_query, hint, paths, source_title=titles[0].name
+            )
+            scope.heading_prefixes = [list(prefix) for prefix in prefixes]
+            scope.heading_paths = [
+                path
+                for path in paths
+                if not prefixes
+                or any(tuple(path[: len(prefix)]) == prefix for prefix in prefixes)
+            ]
+            filters.attached_document_ids = [str(file_id) for file_id in file_ids]
+            filters.regulatory_heading_scope = [
+                prefix[-1] for prefix in prefixes
+            ] or None
     model = EmbeddingModel.from_db_model(
         search_settings=settings,
         server_host=MODEL_SERVER_HOST,
@@ -282,12 +333,29 @@ def search_catalog_chunks(
         if canonical_id is None or canonical_id in seen or canonical_id not in rows:
             continue
         chunk, file = rows[canonical_id]
-        if str(file.id) != result.document_id:
+        if str(file.id) != result.document_id or (
+            scope and file.id not in scope.file_ids
+        ):
             continue
         seen.add(canonical_id)
         snapshot = RegulatoryChunkSnapshot.from_model(chunk)
+        if (
+            scope
+            and scope.heading_prefixes
+            and not any(
+                snapshot.heading_path[: len(prefix)] == prefix
+                for prefix in scope.heading_prefixes
+            )
+        ):
+            continue
         hits[canonical_id] = CatalogSearchHit(
-            file=snapshots[file.id], chunk=snapshot, score=None
+            file=snapshots[file.id],
+            chunk=snapshot,
+            score=None,
+            embedding_score=result.embedding_score
+            if result.embedding_score is not None
+            and math.isfinite(result.embedding_score)
+            else None,
         )
         # Score the canonical text that is actually delivered to the administrator.
         candidates.append(
@@ -322,9 +390,20 @@ def search_catalog_chunks(
                 OnyxErrorCode.SERVICE_UNAVAILABLE,
                 "Yeniden sıralama tamamlanamadı. Lütfen tekrar deneyin.",
             )
+        normalized = select_normalized_rerank_candidates(
+            chunks=reranked.ordered_chunks,
+            scores=reranked.scores_by_chunk,
+            baseline_limit=CATALOG_SEARCH_RESULTS,
+            threshold=0.8,
+            anchor_zero=adaptive,
+        )
         file_counts: Counter[str] = Counter()
-        for candidate in reranked.ordered_chunks:
-            if file_counts[candidate.document_id] >= CATALOG_SEARCH_PER_FILE:
+        selected = normalized.ordered_chunks if adaptive else reranked.ordered_chunks
+        for candidate in selected:
+            if (
+                not adaptive
+                and file_counts[candidate.document_id] >= CATALOG_SEARCH_PER_FILE
+            ):
                 continue
             canonical_id = candidate.regulatory_chunk_id
             if canonical_id is None:
@@ -335,19 +414,33 @@ def search_catalog_chunks(
                     update={
                         "score": reranked.scores_by_chunk[
                             (candidate.document_id, candidate.chunk_id)
-                        ]
+                        ],
+                        "reranker_score": reranked.scores_by_chunk[
+                            (candidate.document_id, candidate.chunk_id)
+                        ],
+                        "normalized_score": normalized.normalized_scores_by_chunk[
+                            (candidate.document_id, candidate.chunk_id)
+                        ],
                     }
                 )
             )
             file_counts[candidate.document_id] += 1
-            if len(ranked_hits) == CATALOG_SEARCH_RESULTS:
+            if not adaptive and len(ranked_hits) == CATALOG_SEARCH_RESULTS:
                 break
-    page = ranked_hits[request.offset : request.offset + request.limit]
+    page = (
+        ranked_hits
+        if adaptive
+        else ranked_hits[request.offset : request.offset + request.limit]
+    )
     require_publication_files(observation, tuple(hit.file.id for hit in page))
     return CatalogSearchPage(
         items=page,
         total=len(ranked_hits),
         offset=request.offset,
-        limit=request.limit,
-        has_more=request.offset + len(page) < len(ranked_hits),
+        limit=len(page) if adaptive else request.limit,
+        has_more=False if adaptive else request.offset + len(page) < len(ranked_hits),
+        result_limit=None if adaptive else CATALOG_SEARCH_RESULTS,
+        per_file_limit=None if adaptive else CATALOG_SEARCH_PER_FILE,
+        normalized_threshold=0.8 if adaptive else None,
+        scope=scope,
     )

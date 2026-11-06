@@ -102,6 +102,7 @@ class SearchHit(BaseModel, Generic[SchemaDocumentModel]):
     # relevant for "fuzzy searches"; this will be None for direct queries where
     # score is not relevant like direct retrieval on ID.
     score: float | None = None
+    embedding_score: float | None = None
     # Maps schema property name to a list of highlighted snippets with match
     # terms wrapped in tags (e.g. "something <hi>keyword</hi> other thing").
     match_highlights: dict[str, list[str]] = {}
@@ -1934,6 +1935,7 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     document_chunk_source
                 ),
                 score=document_chunk_score,
+                embedding_score=hit.get("_onyx_embedding_score"),
                 match_highlights=match_highlights,
                 explanation=explanation,
             )
@@ -2218,7 +2220,9 @@ class ElasticsearchIndexClient(ElasticsearchClient):
             if parallel_retrieval_enabled()
             else (acquire(subquery, weight) for subquery, weight in acquisitions)
         )
-        for acquisition, weight in zip(responses, weights, strict=True):
+        for acquisition, weight, subquery in zip(
+            responses, weights, subqueries, strict=True
+        ):
             if isinstance(acquisition, Exception):
                 raise acquisition
             response, node_id = acquisition
@@ -2237,6 +2241,10 @@ class ElasticsearchIndexClient(ElasticsearchClient):
                     merged_hits[hit_id] = dict(hit)
                 elif hit.get("highlight"):
                     previous["highlight"] = hit["highlight"]
+                if subquery.get("knn", {}).get("field") == CONTENT_VECTOR_FIELD_NAME:
+                    raw_score = hit.get("_score")
+                    if isinstance(raw_score, (float, int)) and math.isfinite(raw_score):
+                        merged_hits[hit_id]["_onyx_embedding_score"] = float(raw_score)
 
         for hit_id, hit in merged_hits.items():
             hit["_score"] = merged_scores[hit_id]

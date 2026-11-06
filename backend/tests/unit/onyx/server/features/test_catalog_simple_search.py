@@ -223,7 +223,9 @@ def test_descriptive_query_searches_once_and_summary_keeps_the_original_request(
     prepare.assert_called_once_with(original, session)
     search.assert_called_once()
     assert search.call_args.args[0].query == prepared.query
-    generate.assert_called_once_with(original, search_page, session, usage_observer=ANY)
+    generate.assert_called_once_with(
+        original, search_page, session, usage_observer=ANY, overview=True
+    )
     assert response.search_query == prepared.query
     assert response.query_rewritten is True
 

@@ -86,14 +86,24 @@ export interface LegislationSearchResult {
   file: LegislationFile;
   chunk: RegulatoryChunk;
   score: number | null;
+  embedding_score?: number | null;
+  reranker_score?: number | null;
+  normalized_score?: number | null;
 }
 
 export interface LegislationSearchPage extends CatalogPage<LegislationSearchResult> {
   has_more: boolean;
   total_is_exact: boolean;
   candidate_limit: number;
-  result_limit: number;
-  per_file_limit: number;
+  result_limit: number | null;
+  per_file_limit: number | null;
+  normalized_threshold?: number | null;
+  scope?: {
+    source_hint: string | null;
+    file_ids: string[];
+    heading_prefixes: string[][];
+    heading_paths: string[][];
+  } | null;
 }
 
 export interface LegistationsQuery {

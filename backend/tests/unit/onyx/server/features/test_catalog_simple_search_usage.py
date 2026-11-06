@@ -93,13 +93,16 @@ def test_trace_and_provider_usage_survive_summary_rejection(
         check_trace()
         return CatalogQueryPreparation(query=query, rewritten=False)
 
-    def search(*_: object) -> CatalogSearchPage:
+    def search(*_: object, **_kwargs: object) -> CatalogSearchPage:
         check_trace()
         return page
 
     def generate(
-        *_: object, usage_observer: Callable[[CatalogSummaryUsage], None]
+        *_: object,
+        usage_observer: Callable[[CatalogSummaryUsage], None],
+        overview: bool = False,
     ) -> str:
+        assert overview is True
         check_trace()
         with generation_span(model=api.CATALOG_SUMMARY_MODEL) as span:
             assert not isinstance(span, NoOpSpan)

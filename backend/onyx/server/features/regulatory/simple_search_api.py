@@ -60,11 +60,18 @@ def simple_search(
         prepared_query = prepare_catalog_search_query(request.query, db_session)
         observation = observe_publication_read()
         search = search_catalog_chunks(
-            CatalogSearchRequest(query=prepared_query.query), db_session
+            CatalogSearchRequest(query=prepared_query.query),
+            db_session,
+            adaptive=True,
+            scope_query=request.query,
         )
         try:
             summary = generate_catalog_summary(
-                request.query, search, db_session, usage_observer=observe_usage
+                request.query,
+                search,
+                db_session,
+                usage_observer=observe_usage,
+                overview=True,
             )
         except CatalogSummaryUnavailable as error:
             summary_error = str(error)

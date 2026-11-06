@@ -42,6 +42,7 @@ const chunk: RegulatoryChunk = {
   updated_at: file.created_at,
 };
 let fetchSpy: jest.SpyInstance;
+let searchHitCount: number;
 let summaryError: string | null;
 let summaryUsage: LegislationSummaryUsage | undefined;
 let queryMetadata: { search_query: string; query_rewritten: boolean } | null;
@@ -49,6 +50,7 @@ function jsonResponse(body: unknown): Response {
   return { ok: true, json: async () => body } as Response;
 }
 beforeEach(() => {
+  searchHitCount = 1;
   summaryError = null;
   summaryUsage = undefined;
   queryMetadata = null;
@@ -58,8 +60,23 @@ beforeEach(() => {
     if (url.pathname.endsWith("/simple-search"))
       return jsonResponse({
         search: {
-          items: [{ file, chunk, score: 0.9 }],
-          total: 1,
+          items: Array.from({ length: searchHitCount }, (_, index) => ({
+            file,
+            chunk:
+              index === 0
+                ? chunk
+                : {
+                    ...chunk,
+                    id: `summary-chunk-${index}`,
+                    position: 80 + index,
+                    text: `Kaynak parçası ${index}`,
+                  },
+            score: 0.9,
+            embedding_score: 0.72,
+            reranker_score: 0.9,
+            normalized_score: 1,
+          })),
+          total: searchHitCount,
           offset: 0,
           limit: 20,
           has_more: false,
@@ -105,6 +122,11 @@ async function runSearch() {
     "gümrük vergisi"
   );
   await user.click(screen.getByRole("button", { name: "Ara" }));
+  await user.click(
+    await screen.findByRole("button", {
+      name: `${file.name} · ${searchHitCount} chunk`,
+    })
+  );
   return user;
 }
 
@@ -254,3 +276,35 @@ test.each([null, -1, Number.NaN, Number.POSITIVE_INFINITY])(
     expect(screen.queryByText(/^Nemotron maliyeti:/)).not.toBeInTheDocument();
   }
 );
+
+test("starts with collapsed legislation groups and reveals three independent scores", async () => {
+  const user = setupUser();
+  render(<SimpleSearchPage />);
+  await user.type(
+    screen.getByRole("textbox", { name: "Basit mevzuat araması" }),
+    "cezalar"
+  );
+  await user.click(screen.getByRole("button", { name: "Ara" }));
+  const group = await screen.findByRole("button", {
+    name: `${file.name} · 1 chunk`,
+  });
+  expect(group).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByText(chunk.text)).not.toBeInTheDocument();
+  await user.click(group);
+  expect(screen.getByText("Embedding: 0.7200")).toBeVisible();
+  expect(screen.getByText("Reranker: 0.9000")).toBeVisible();
+  expect(screen.getByText("Normalized: 1.0000")).toBeVisible();
+});
+
+test("reveals every selected chunk after the initial three-chunk preview", async () => {
+  searchHitCount = 50;
+  const user = await runSearch();
+  expect(screen.getByText("1 mevzuat · 50 chunk")).toBeVisible();
+  expect(screen.getByText("Kaynak [3] · Chunk #82")).toBeVisible();
+  expect(screen.queryByText("Kaynak [4] · Chunk #83")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Daha fazla göster" }));
+  expect(screen.getByText("Kaynak [50] · Chunk #129")).toBeVisible();
+  expect(screen.getAllByRole("button", { name: "Dosyaya git" })).toHaveLength(
+    50
+  );
+});

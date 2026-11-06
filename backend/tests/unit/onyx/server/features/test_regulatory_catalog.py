@@ -182,6 +182,7 @@ def _chunk(file_id: UUID, canonical_id: str, chunk_id: int = 0) -> InferenceChun
         title="indexed title",
         boost=0,
         score=12.5,
+        embedding_score=0.8125,
         hidden=False,
         metadata={},
         match_highlights=[],
@@ -509,3 +510,103 @@ def test_search_rejects_blank_queries_generation_modes_and_unbounded_offsets(
 ) -> None:
     with pytest.raises(ValidationError):
         CatalogSearchRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize("candidate_count", [50, 51])
+def test_adaptive_simple_search_keeps_fifty_close_same_file_scores_and_all_score_fields(
+    candidate_count: int,
+    retrieval: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    catalog_file: CatalogFile,
+) -> None:
+    index, _, _, rerank = retrieval
+    chunks = [
+        _chunk(catalog_file.id, f"canonical-{i}", i) for i in range(candidate_count)
+    ]
+    index.hybrid_retrieval.return_value = chunks
+
+    def score(*, chunks: list[InferenceChunk], **_kwargs: object) -> RerankResult:
+        scores = {
+            (c.document_id, c.chunk_id): (
+                0.9 - c.chunk_id / 10000 if c.chunk_id < 50 else 0.01
+            )
+            for c in chunks
+        }
+        return RerankResult(
+            ordered_chunks=chunks,
+            scores_by_chunk=scores,
+            submitted_count=len(chunks),
+            result_count=len(chunks),
+            outcome=RerankOutcome.SUCCESS,
+            fallback_used=False,
+        )
+
+    rerank.side_effect = score
+    with (
+        patch(
+            f"{MODULE}.catalog_search_rows",
+            return_value={
+                c.regulatory_chunk_id: (
+                    MagicMock(id=c.regulatory_chunk_id, user_file_id=catalog_file.id),
+                    catalog_file,
+                )
+                for c in chunks
+            },
+        ),
+        patch(
+            f"{MODULE}._file_snapshots", return_value={catalog_file.id: catalog_file}
+        ),
+        patch(
+            f"{MODULE}.RegulatoryChunkSnapshot.from_model",
+            side_effect=lambda c: _snapshot(c.id, c.user_file_id),
+        ),
+    ):
+        result = api.search_catalog_chunks(
+            CatalogSearchRequest(query="cezalar"), MagicMock(), adaptive=True
+        )
+    assert len(result.items) == result.total == 50
+    assert result.items[0].embedding_score == 0.8125
+    assert result.items[0].reranker_score == 0.9
+    assert result.items[0].normalized_score == 1.0
+    assert result.items[-1].normalized_score is not None
+    assert result.items[-1].normalized_score > 0.8
+    assert result.per_file_limit is None
+    assert result.result_limit is None
+
+
+def test_simple_search_pins_source_and_heading_before_embedding_retrieval(
+    retrieval: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    catalog_file: CatalogFile,
+) -> None:
+    from onyx.regulatory.catalog_scope import CatalogSourceTitle
+
+    index, _, _, _ = retrieval
+    index.hybrid_retrieval.return_value = []
+    paths = [
+        ["Gümrük Kanunu", "Cezalar", "Madde 231"],
+        ["Gümrük Kanunu", "Cezalar", "Madde 234"],
+        ["Gümrük Kanunu", "İtirazlar", "Madde 242"],
+    ]
+    with (
+        patch(
+            f"{MODULE}.catalog_source_titles",
+            return_value=[
+                CatalogSourceTitle(
+                    file_id=catalog_file.id,
+                    name="gumruk_kanunu.md",
+                    root_heading="Gümrük Kanunu",
+                )
+            ],
+        ),
+        patch(f"{MODULE}.catalog_heading_paths", return_value=paths),
+    ):
+        response = api.search_catalog_chunks(
+            CatalogSearchRequest(query="Gümrük Kanunu cezalar"),
+            MagicMock(),
+            adaptive=True,
+            scope_query="Gümrük Kanununun cezalar ile ilgili hükümleri",
+        )
+    filters = index.hybrid_retrieval.call_args.kwargs["filters"]
+    assert filters.attached_document_ids == [str(catalog_file.id)]
+    assert filters.regulatory_heading_scope == ["Cezalar"]
+    assert response.scope is not None
+    assert response.scope.heading_paths == paths[:2]
