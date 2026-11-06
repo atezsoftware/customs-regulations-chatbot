@@ -1204,7 +1204,7 @@ class ElasticsearchDocumentIndex(DocumentIndex):
         inference_chunks_uncleaned: list[InferenceChunkUncleaned] = [
             convert_retrieved_elasticsearch_chunk_to_inference_chunk_uncleaned(
                 search_hit.document_chunk, search_hit.score, search_hit.match_highlights
-            )
+            ).model_copy(update={"embedding_score": search_hit.embedding_score})
             for search_hit in search_hits
         ]
         inference_chunks: list[InferenceChunk] = cleanup_content_for_chunks(

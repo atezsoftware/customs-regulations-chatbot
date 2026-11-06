@@ -25,7 +25,7 @@ export default function LegislationSearchChunkCard({
 }: LegislationSearchChunkCardProps) {
   const [details, setDetails] = useState(false);
   const [editing, setEditing] = useState(false);
-  const { chunk, file, score } = result;
+  const { chunk, file } = result;
   const editRestriction = chunkEditRestriction(chunk);
   return (
     <article className="flex flex-col gap-3 rounded-lg border border-border-02 p-4">
@@ -86,12 +86,19 @@ export default function LegislationSearchChunkCard({
         >
           Chunk detayları
         </Button>
-        {score !== null && (
+        {(
+          [
+            ["Embedding", result.embedding_score],
+            ["Reranker", result.reranker_score ?? result.score],
+            ["Normalized", result.normalized_score],
+          ] as const
+        ).map(([label, value]) => (
           <Text
+            key={label}
             font="secondary-body"
             color="text-03"
-          >{`Skor: ${score.toFixed(4)}`}</Text>
-        )}
+          >{`${label}: ${typeof value === "number" && Number.isFinite(value) ? value.toFixed(4) : "—"}`}</Text>
+        ))}
         {(chunk.validity_start_date || chunk.validity_end_date) && (
           <Text
             font="secondary-body"

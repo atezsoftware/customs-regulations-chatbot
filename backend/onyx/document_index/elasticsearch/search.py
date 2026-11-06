@@ -224,6 +224,7 @@ class DocumentQuery:
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
+            regulatory_heading_scope=index_filters.regulatory_heading_scope,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=min_chunk_index,
@@ -412,6 +413,7 @@ class DocumentQuery:
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
+            regulatory_heading_scope=index_filters.regulatory_heading_scope,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
@@ -507,6 +509,7 @@ class DocumentQuery:
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
+            regulatory_heading_scope=index_filters.regulatory_heading_scope,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
@@ -641,6 +644,7 @@ class DocumentQuery:
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
+            regulatory_heading_scope=index_filters.regulatory_heading_scope,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
@@ -711,6 +715,7 @@ class DocumentQuery:
             updated_at_range=index_filters.updated_at_range,
             as_of_date=index_filters.as_of_date,
             regulatory_source_hint=index_filters.regulatory_source_hint,
+            regulatory_heading_scope=index_filters.regulatory_heading_scope,
             regulatory_chunks_only=index_filters.regulatory_chunks_only,
             regulatory_candidate_ids=index_filters.regulatory_candidate_ids,
             min_chunk_index=None,
@@ -1175,6 +1180,7 @@ class DocumentQuery:
         regulatory_chunks_only: bool = False,
         regulatory_candidate_ids: list[str] | None = None,
         regulatory_source_hint: str | None = None,
+        regulatory_heading_scope: list[str] | None = None,
         max_chunk_size: int | None = None,
         document_id: str | None = None,
         # Assistant knowledge filters
@@ -1640,6 +1646,19 @@ class DocumentQuery:
                         "fields": [TITLE_FIELD_NAME, HEADING_PATH_FIELD_NAME],
                         "type": "phrase",
                         "slop": 0,
+                    }
+                }
+            )
+
+        if regulatory_heading_scope:
+            filter_clauses.append(
+                {
+                    "bool": {
+                        "should": [
+                            {"match_phrase": {HEADING_PATH_FIELD_NAME: heading}}
+                            for heading in regulatory_heading_scope
+                        ],
+                        "minimum_should_match": 1,
                     }
                 }
             )

@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from onyx.regulatory.catalog_scope import CatalogSearchScope
 from onyx.regulatory.document_intake.source_lineage import (
     IntakeFileSourceLineage,
     ReviewedFileRelations,
@@ -89,6 +90,12 @@ class CatalogSearchHit(BaseModel):
     file: CatalogFile
     chunk: RegulatoryChunkSnapshot
     score: float | None
+    embedding_score: float | None = Field(default=None, allow_inf_nan=False)
+    reranker_score: float | None = Field(default=None, allow_inf_nan=False)
+    normalized_score: float | None = Field(
+        default=None, ge=0, le=1, allow_inf_nan=False
+    )
+    embedding_score_kind: Literal["content_vector"] = "content_vector"
 
 
 class CatalogSearchPage(BaseModel):
@@ -100,8 +107,10 @@ class CatalogSearchPage(BaseModel):
     # Retrieval is a bounded ranked candidate set, not an exact corpus count.
     total_is_exact: bool = False
     candidate_limit: int = CATALOG_SEARCH_CANDIDATES
-    result_limit: int = CATALOG_SEARCH_RESULTS
-    per_file_limit: int = CATALOG_SEARCH_PER_FILE
+    result_limit: int | None = CATALOG_SEARCH_RESULTS
+    per_file_limit: int | None = CATALOG_SEARCH_PER_FILE
+    normalized_threshold: float | None = None
+    scope: CatalogSearchScope | None = None
 
 
 class CatalogChunkLocation(BaseModel):

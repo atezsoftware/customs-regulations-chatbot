@@ -15,7 +15,10 @@ import type { LegislationFile } from "@/lib/legistations/interfaces";
 interface LegislationSearchFileCardProps {
   group: LegislationSearchFileGroup;
   onOpenFile: (hit: LegislationSearchResult) => void;
-  onSaved: () => void;
+  onSaved?: () => void;
+  allowEditing?: boolean;
+  showAllMatches?: boolean;
+  sourceNumbers?: Map<string, number>;
   onSelectFile?: (file: LegislationFile) => void;
 }
 
@@ -24,7 +27,11 @@ export default function LegislationSearchFileCard({
   onOpenFile,
   onSaved,
   onSelectFile,
+  allowEditing = true,
+  showAllMatches = false,
+  sourceNumbers,
 }: LegislationSearchFileCardProps) {
+  const [allVisible, setAllVisible] = useState(false);
   const [expanded, setExpanded] = useState(false);
   return (
     <article className="rounded-lg border border-border-02 p-4 flex flex-col gap-3">
@@ -52,15 +59,17 @@ export default function LegislationSearchFileCard({
       </div>
       {expanded && (
         <div className="flex flex-col gap-3">
-          {group.hits.slice(0, 3).map((hit) => (
+          {(allVisible ? group.hits : group.hits.slice(0, 3)).map((hit) => (
             <LegislationSearchChunkCard
               key={hit.chunk.id}
               result={hit}
               onOpenFile={() => onOpenFile(hit)}
               onSaved={onSaved}
+              allowEditing={allowEditing}
+              sourceNumber={sourceNumbers?.get(hit.chunk.id)}
             />
           ))}
-          {group.hits.length > 3 && (
+          {group.hits.length > 3 && !allVisible && (
             <Text
               font="secondary-body"
               color="text-03"
@@ -69,9 +78,15 @@ export default function LegislationSearchFileCard({
           <Button
             size="sm"
             prominence="secondary"
-            onClick={() => onOpenFile(group.hits[0]!)}
+            onClick={() =>
+              showAllMatches
+                ? setAllVisible(!allVisible)
+                : onOpenFile(group.hits[0]!)
+            }
           >
-            Daha fazla göster
+            {showAllMatches && allVisible
+              ? "İlk 3 chunkı göster"
+              : "Daha fazla göster"}
           </Button>
         </div>
       )}

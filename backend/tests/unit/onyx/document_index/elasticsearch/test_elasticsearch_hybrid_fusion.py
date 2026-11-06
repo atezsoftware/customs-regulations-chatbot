@@ -67,6 +67,7 @@ def test_hybrid_fusion_preserves_weights_and_candidate_union(
     hits = result["hits"]["hits"]
     assert [hit["_id"] for hit in hits] == ["a", "b", "c"]
     assert [hit["_score"] for hit in hits] == expected_scores
+    assert [hit.get("_onyx_embedding_score") for hit in hits] == [3.0, 1.0, None]
     assert hits[1]["highlight"] == {"content": ["<em>b</em>"]}
     assert result["took"] == 7
     assert result["timed_out"] is False

@@ -176,6 +176,7 @@ class IndexFilters(BaseFilters, UserFileFilters, AssistantKnowledgeFilters):
     # Internal structural lookup: filter-only keyword reads, never LLM routing.
     regulatory_lookup: bool = False
     regulatory_lookup_heading: str | None = None
+    regulatory_heading_scope: list[str] | None = None
 
     # NOTE: These strings must be formatted in the same way as the output of
     # DocumentAccess::to_acl.
@@ -244,6 +245,7 @@ class InferenceChunk(BaseChunk):
     title: str | None  # Separate from Semantic Identifier though often same
     boost: int
     score: float | None
+    embedding_score: float | None = None
     hidden: bool
     is_relevant: bool | None = None
     relevance_explanation: str | None = None

@@ -320,7 +320,7 @@ def render_catalog_passage_summary(content: str, search: CatalogSearchPage) -> s
     return " ".join(rendered)
 
 
-def _observe_summary_usage(
+def observe_catalog_summary_usage(
     response: ModelResponse,
     observer: Callable[[CatalogSummaryUsage], None] | None,
 ) -> None:
@@ -350,7 +350,14 @@ def generate_catalog_summary(
     db_session: Session,
     *,
     usage_observer: Callable[[CatalogSummaryUsage], None] | None = None,
+    overview: bool = False,
 ) -> str | None:
+    if overview:
+        from onyx.regulatory.catalog_overview import generate_catalog_overview
+
+        return generate_catalog_overview(
+            query, search, db_session, usage_observer=usage_observer
+        )
     if not search.items:
         return None
     if not build_catalog_summary_passages(search):
@@ -376,7 +383,7 @@ def generate_catalog_summary(
             use_streaming=False,
             provider_compatibility_attempts=1,
         )
-        _observe_summary_usage(response, usage_observer)
+        observe_catalog_summary_usage(response, usage_observer)
         record_llm_response(span, response)
     content = response.choice.message.content
     if (

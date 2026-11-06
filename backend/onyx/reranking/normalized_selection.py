@@ -9,10 +9,15 @@ from onyx.reranking.models import RerankSelection
 
 def normalize_rerank_scores(
     scores: Mapping[tuple[str, int], float],
+    *,
+    anchor_zero: bool = False,
 ) -> dict[tuple[str, int], float]:
-    """Min-max normalize one search pool, without treating scores as probabilities."""
+    """Normalize one pool, optionally anchoring positive scores at zero."""
     valid = [score for score in scores.values() if math.isfinite(score)]
     minimum = min(valid, default=0.0)
+    if anchor_zero:
+        # Preserve tightly clustered positive scores instead of stretching their noise.
+        minimum = min(0.0, minimum)
     maximum = max(valid, default=0.0)
     span = maximum - minimum
     scale = max(abs(minimum), abs(maximum)) if math.isinf(span) else 1.0
@@ -34,12 +39,14 @@ def select_normalized_rerank_candidates(
     scores: Mapping[tuple[str, int], float],
     baseline_limit: int,
     threshold: float = 0.90,
+    anchor_zero: bool = False,
 ) -> RerankSelection:
     if baseline_limit < 0 or not 0 < threshold <= 1:
         raise ValueError("Invalid rerank selection limits")
     candidate_ids = {(chunk.document_id, chunk.chunk_id) for chunk in chunks}
     normalized = normalize_rerank_scores(
-        {key: score for key, score in scores.items() if key in candidate_ids}
+        {key: score for key, score in scores.items() if key in candidate_ids},
+        anchor_zero=anchor_zero,
     )
     baseline_ids = {
         (chunk.document_id, chunk.chunk_id) for chunk in chunks[:baseline_limit]

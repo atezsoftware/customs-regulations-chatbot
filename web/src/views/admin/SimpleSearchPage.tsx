@@ -8,7 +8,8 @@ import { SvgArrowLeft, SvgSearch } from "@opal/icons";
 import type { LegislationSearchResult } from "@/lib/legistations/interfaces";
 import { simpleSearchCatalog } from "@/lib/legistations/svc";
 import SelectedLegislationFile from "@/sections/legistations/SelectedLegislationFile";
-import LegislationSearchChunkCard from "@/sections/cards/LegislationSearchChunkCard";
+import LegislationSearchFileCard from "@/sections/cards/LegislationSearchFileCard";
+import { groupLegislationSearchResults } from "@/lib/legistations/hooks";
 
 export default function SimpleSearchPage() {
   const [draft, setDraft] = useState("");
@@ -31,6 +32,11 @@ export default function SimpleSearchPage() {
   const rewrittenQuery = search.data?.query_rewritten
     ? search.data.search_query?.trim()
     : null;
+  const groups = groupLegislationSearchResults(search.data?.search.items ?? []);
+  const sourceNumbers = new Map(
+    search.data?.search.items.map((hit, index) => [hit.chunk.id, index + 1]) ??
+      []
+  );
   const providerCost = search.data?.summary_usage?.provider_cost_usd;
   const summaryCostLabel =
     typeof providerCost === "number" &&
@@ -147,7 +153,7 @@ export default function SimpleSearchPage() {
               <Text
                 font="secondary-body"
                 color="text-03"
-              >{`${search.data.summary_model.includes("nemotron-3-ultra") ? "Nemotron 3 Ultra" : search.data.summary_model} · Kaynak içeriklerinin kısa özeti.`}</Text>
+              >{`${search.data.summary_model.includes("nemotron-3-ultra") ? "Nemotron 3 Ultra" : search.data.summary_model} · Seçili kaynak pasajları ve başlık yapısına dayalı kısa özet.`}</Text>
               {summaryCostLabel && (
                 <Text font="secondary-body" color="text-03">
                   {summaryCostLabel}
@@ -157,26 +163,34 @@ export default function SimpleSearchPage() {
             <Text
               font="main-ui-action"
               as="h2"
-            >{`${search.data.search.items.length} kaynak chunk`}</Text>
+            >{`${groups.length} mevzuat · ${search.data.search.items.length} chunk`}</Text>
+            {search.data.search.scope?.heading_prefixes.map((prefix) => (
+              <Text
+                key={prefix.join(" > ")}
+                font="secondary-body"
+                color="text-03"
+              >{`Arama kapsamı: ${prefix.join(" > ")}`}</Text>
+            ))}
             {search.data.search.items.length === 0 && (
               <Text font="main-ui-body" color="text-03">
                 Eşleşen chunk bulunamadı.
               </Text>
             )}
-            {search.data.search.items.map((hit, index) => (
-              <LegislationSearchChunkCard
-                key={hit.chunk.id}
-                result={hit}
+            {groups.map((group) => (
+              <LegislationSearchFileCard
+                key={`${request?.sequence}-${group.file.id}`}
+                group={group}
                 allowEditing={false}
-                sourceNumber={index + 1}
-                onOpenFile={() => setSelectedHit(hit)}
+                showAllMatches
+                sourceNumbers={sourceNumbers}
+                onOpenFile={setSelectedHit}
               />
             ))}
           </div>
         ) : (
           <Text font="main-ui-body" color="text-03">
-            Arama yapın; ilgili kaynakların özeti ve en iyi 20 chunk burada
-            görünsün.
+            Arama yapın; ilgili kaynakların özeti, en az 20 uygun chunk ve
+            normalize skoru 0,8 ve üzerindeki diğer eşleşmeler burada görünsün.
           </Text>
         )}
       </SettingsLayouts.Body>
