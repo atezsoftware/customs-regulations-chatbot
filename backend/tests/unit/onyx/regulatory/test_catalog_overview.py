@@ -187,3 +187,88 @@ def test_identifier_digits_are_not_numeric_source_evidence() -> None:
     packet = catalog_overview_payload("cezalar", page)
     with pytest.raises(CatalogSummaryUnavailable):
         validate_catalog_overview("Madde 230 bulunur [1].", packet)
+
+
+def test_structured_overview_keeps_valid_sentences_without_reassigning_citations() -> (
+    None
+):
+    from onyx.regulatory.catalog_overview import render_catalog_overview_json
+
+    page = _page(2)
+    page.items[0].chunk.text = "Ödeme süresi 10 gündür."
+    page.items[1].chunk.text = "Ödeme süresi 30 gündür."
+    payload = catalog_overview_payload("ödeme", page)
+    draft = json.dumps(
+        {
+            "sentences": [
+                {"text": "Ödeme süresi 10 gündür.", "references": [1]},
+                {"text": "Ödeme süresi 30 gündür.", "references": [1]},
+                {"text": "Diğer ödeme süresi 30 gündür.", "references": [2]},
+            ]
+        }
+    )
+    result = render_catalog_overview_json(draft, payload)
+    assert result == "Ödeme süresi 10 gündür. [1] Diğer ödeme süresi 30 gündür. [2]"
+
+
+def test_structured_overview_rejects_empty_unknown_or_duplicate_references() -> None:
+    from onyx.regulatory.catalog_overview import render_catalog_overview_json
+
+    payload = catalog_overview_payload("cezalar", _page(1))
+    for references in [[], [99], [1, 1], [True]]:
+        with pytest.raises(CatalogSummaryUnavailable):
+            render_catalog_overview_json(
+                json.dumps(
+                    {
+                        "sentences": [
+                            {"text": "Bir kaynak bulundu.", "references": references}
+                        ]
+                    }
+                ),
+                payload,
+            )
+
+
+def test_overview_uses_one_constrained_nonreasoning_provider_attempt() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from onyx.llm.models import ReasoningEffort
+    from onyx.regulatory import catalog_overview as overview
+
+    llm = MagicMock()
+    llm.config.max_input_tokens = 10000
+    llm.invoke.return_value = SimpleNamespace(
+        choice=SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "sentences": [
+                            {"text": "İlgili hükümler bulundu.", "references": [1]}
+                        ]
+                    }
+                ),
+                tool_calls=[],
+            ),
+        )
+    )
+    with (
+        patch.object(overview, "get_catalog_summary_llm", return_value=llm),
+        patch.object(overview, "get_llm_token_counter", return_value=lambda _: 100),
+        patch.object(overview, "llm_generation_span"),
+        patch.object(overview, "record_llm_response"),
+    ):
+        assert (
+            overview.generate_catalog_overview("hükümler", _page(1), MagicMock())
+            == "İlgili hükümler bulundu. [1]"
+        )
+    llm.invoke.assert_called_once()
+    arguments = llm.invoke.call_args.kwargs
+    assert arguments["provider_compatibility_attempts"] == 1
+    assert arguments["reasoning_effort"] is ReasoningEffort.OFF
+    assert arguments["use_streaming"] is False
+    assert arguments["max_tokens"] == 600
+    assert arguments["structured_response_format"]["json_schema"]["schema"]["$defs"][
+        "CatalogOverviewSentence"
+    ]["properties"]["references"]["items"]["enum"] == [1]
