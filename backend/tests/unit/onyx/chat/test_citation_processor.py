@@ -2590,4 +2590,9 @@ def test_source_display_name_reaches_citation_without_replacing_chunk_label() ->
     _, citations = process_tokens(processor, ["Hüküm [1].", None])
     assert citations[0].display_title == "Gerçek Mevzuat Adı — Madde 18"
     assert citations[0].semantic_identifier == document.semantic_identifier
-    assert citations[0].reference == "Eski kök > MADDE 18 > (1) Bent"
+    assert citations[0].reference == "Gerçek Mevzuat Adı — Madde 18"
+    assert document.metadata["regulatory_heading_path"] == [
+        "Eski kök",
+        "MADDE 18",
+        "(1) Bent",
+    ]
