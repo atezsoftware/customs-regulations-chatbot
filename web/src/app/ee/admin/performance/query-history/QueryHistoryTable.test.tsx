@@ -51,6 +51,25 @@ function historyResponse(question = "Saved question", total = 200): Response {
   } as Response;
 }
 
+function mockHistoryFetch(implementation: typeof fetch) {
+  return jest.spyOn(global, "fetch").mockImplementation((input, init) => {
+    if (String(input).endsWith("/query-history/api-keys")) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => [],
+      } as Response);
+    }
+    return implementation(input, init);
+  });
+}
+
+function historyCalls(spy: ReturnType<typeof mockHistoryFetch>) {
+  return spy.mock.calls.filter(([url]) =>
+    String(url).includes("/admin/chat-session-history")
+  );
+}
+
 beforeEach(() => {
   mockSearch = "";
   mockHistoryType = QueryHistoryType.NORMAL;
@@ -64,13 +83,11 @@ test("restores exact user selection from the URL and applies searches across all
   const user = setupUser();
   mockSearch =
     "user_email=person%40example.com&page=5&feedback_type=like&session_rating=4";
-  const fetchSpy = jest
-    .spyOn(global, "fetch")
-    .mockResolvedValue(historyResponse());
+  const fetchSpy = mockHistoryFetch(async () => historyResponse());
   const view = render(<QueryHistoryTable />);
   await screen.findByText("Saved question");
   const initial = new URL(
-    String(fetchSpy.mock.calls[0]![0]),
+    String(historyCalls(fetchSpy)[0]![0]),
     "http://localhost"
   );
   expect(initial.searchParams.get("user_email")).toBe("person@example.com");
@@ -84,7 +101,7 @@ test("restores exact user selection from the URL and applies searches across all
     "Çağrı Şahin"
   );
   await user.type(screen.getByLabelText("Soru / sohbet ara"), "duty %_");
-  expect(fetchSpy).toHaveBeenCalledTimes(1);
+  expect(historyCalls(fetchSpy)).toHaveLength(1);
   await user.click(screen.getByRole("button", { name: "Ara" }));
   const destination = new URL(
     mockReplace.mock.calls.at(-1)![0],
@@ -98,7 +115,7 @@ test("restores exact user selection from the URL and applies searches across all
   expect(destination.searchParams.get("session_rating")).toBe("4");
   mockSearch = destination.search.slice(1);
   view.rerender(<QueryHistoryTable />);
-  await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(historyCalls(fetchSpy)).toHaveLength(2));
   const filtered = new URL(
     String(fetchSpy.mock.calls.at(-1)![0]),
     "http://localhost"
@@ -111,7 +128,7 @@ test("pagination preserves applied filters and clearing resets the full filter s
   const user = setupUser();
   mockSearch =
     "user_query=Ayse&q=duty&api_key_query=Portal&start_time=2026-10-01T00%3A00%3A00Z&end_time=2026-10-23T00%3A00%3A00Z";
-  jest.spyOn(global, "fetch").mockResolvedValue(historyResponse());
+  mockHistoryFetch(async () => historyResponse());
   render(<QueryHistoryTable />);
   await screen.findByText("Saved question");
   await user.click(screen.getByText("›"));
@@ -134,9 +151,7 @@ test("anonymized history hides identity controls and does not send identity URL 
   mockHistoryType = QueryHistoryType.ANONYMIZED;
   mockSearch =
     "user_email=private%40example.com&user_query=Private&api_key_query=Secret&q=duty";
-  const fetchSpy = jest
-    .spyOn(global, "fetch")
-    .mockResolvedValue(historyResponse("", 0));
+  const fetchSpy = mockHistoryFetch(async () => historyResponse("", 0));
   render(<QueryHistoryTable />);
   await screen.findByText("Bu filtrelere uygun sohbet bulunamadı.");
   expect(
@@ -144,7 +159,7 @@ test("anonymized history hides identity controls and does not send identity URL 
   ).not.toBeInTheDocument();
   expect(screen.queryByLabelText("API anahtarı")).not.toBeInTheDocument();
   const request = new URL(
-    String(fetchSpy.mock.calls[0]![0]),
+    String(historyCalls(fetchSpy)[0]![0]),
     "http://localhost"
   );
   expect(request.searchParams.has("user_email")).toBe(false);
@@ -156,17 +171,15 @@ test("anonymized history hides identity controls and does not send identity URL 
 
 test("late responses from a previous filter cannot replace the active search", async () => {
   const oldResponse = deferred<Response>();
-  const fetchSpy = jest
-    .spyOn(global, "fetch")
-    .mockImplementation(async (input) => {
-      const url = new URL(String(input), "http://localhost");
-      return url.searchParams.get("q") === "old"
-        ? oldResponse.promise
-        : historyResponse("Current filtered question");
-    });
+  const fetchSpy = mockHistoryFetch(async (input) => {
+    const url = new URL(String(input), "http://localhost");
+    return url.searchParams.get("q") === "old"
+      ? oldResponse.promise
+      : historyResponse("Current filtered question");
+  });
   mockSearch = "q=old";
   const view = render(<QueryHistoryTable />);
-  await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(historyCalls(fetchSpy)).toHaveLength(1));
   mockSearch = "q=new";
   view.rerender(<QueryHistoryTable />);
   await screen.findByText("Current filtered question");
@@ -175,15 +188,13 @@ test("late responses from a previous filter cannot replace the active search", a
   expect(screen.getByText("Current filtered question")).toBeInTheDocument();
 });
 
-test("Kickoff Export submits the selected dates, Tariff key and external user", async () => {
+test("Kickoff Export submits the selected dates, exact API key and external user", async () => {
   mockSearch =
-    "api_key_query=tariff&user_query=Ahmet%20Can%20Kara&start_time=2026-11-01T00%3A00%3A00Z&end_time=2026-11-09T00%3A00%3A00Z";
+    "api_key_id=18&user_query=Ahmet%20Can%20Kara&start_time=2026-11-01T00%3A00%3A00Z&end_time=2026-11-09T00%3A00%3A00Z";
   const user = setupUser();
-  const fetchSpy = jest
-    .spyOn(global, "fetch")
-    .mockImplementation(async (_url, init) =>
-      init?.method === "POST" ? ({ ok: false } as Response) : historyResponse()
-    );
+  const fetchSpy = mockHistoryFetch(async (_url, init) =>
+    init?.method === "POST" ? ({ ok: false } as Response) : historyResponse()
+  );
   render(<QueryHistoryTable />);
   await screen.findByText("Saved question");
   await user.click(screen.getByRole("button", { name: "Kickoff Export" }));
@@ -194,6 +205,7 @@ test("Kickoff Export submits the selected dates, Tariff key and external user", 
   const url = new URL(String(request![0]), "http://localhost");
   expect(url.searchParams.get("start")).toBe("2026-11-01T00:00:00.000Z");
   expect(url.searchParams.get("end")).toBe("2026-11-09T00:00:00.000Z");
-  expect(url.searchParams.get("api_key_query")).toBe("tariff");
+  expect(url.searchParams.get("api_key_id")).toBe("18");
+  expect(url.searchParams.has("api_key_query")).toBe(false);
   expect(url.searchParams.get("user_query")).toBe("Ahmet Can Kara");
 });

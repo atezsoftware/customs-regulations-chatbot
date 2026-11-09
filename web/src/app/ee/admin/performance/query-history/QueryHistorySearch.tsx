@@ -1,3 +1,4 @@
+import QueryHistoryApiKeyFilter from "@/app/ee/admin/performance/query-history/QueryHistoryApiKeyFilter";
 import { useEffect, useState } from "react";
 import { Button, InputTypeIn, Text } from "@opal/components";
 import type { QueryHistoryFilters } from "@/app/ee/admin/performance/query-history/filters";
@@ -16,14 +17,9 @@ export default function QueryHistorySearch({
   const selectedUser =
     filters.user_query || filters.user_email || filters.user_id || "";
   const [userQuery, setUserQuery] = useState(selectedUser);
-  const [apiKeyQuery, setApiKeyQuery] = useState(filters.api_key_query || "");
   const [query, setQuery] = useState(filters.q || "");
 
   useEffect(() => setUserQuery(selectedUser), [selectedUser]);
-  useEffect(
-    () => setApiKeyQuery(filters.api_key_query || ""),
-    [filters.api_key_query]
-  );
   useEffect(() => setQuery(filters.q || ""), [filters.q]);
 
   return (
@@ -36,7 +32,6 @@ export default function QueryHistorySearch({
           q: query.trim() || undefined,
         };
         if (allowIdentity) {
-          next.api_key_query = apiKeyQuery.trim() || undefined;
           if (userQuery.trim() !== selectedUser) {
             delete next.user_id;
             delete next.user_email;
@@ -46,6 +41,7 @@ export default function QueryHistorySearch({
         onApply(next);
       }}
     >
+      <Text font="heading-h3">Sohbet ve rapor filtreleri</Text>
       <div className="grid gap-3 md:grid-cols-3">
         {allowIdentity && (
           <>
@@ -68,18 +64,7 @@ export default function QueryHistorySearch({
                 </Text>
               )}
             </div>
-            <div className="flex flex-col gap-1">
-              <label htmlFor="query-history-api-key">
-                <Text font="main-ui-action">API anahtarı</Text>
-              </label>
-              <InputTypeIn
-                id="query-history-api-key"
-                placeholder="Anahtar adı, numarası veya maskeli değeri"
-                value={apiKeyQuery}
-                maxLength={255}
-                onChange={(event) => setApiKeyQuery(event.target.value)}
-              />
-            </div>
+            <QueryHistoryApiKeyFilter filters={filters} onApply={onApply} />
           </>
         )}
         <div className="flex flex-col gap-1">
@@ -109,7 +94,6 @@ export default function QueryHistorySearch({
           prominence="secondary"
           onClick={() => {
             setUserQuery("");
-            setApiKeyQuery("");
             setQuery("");
             onApply({});
           }}

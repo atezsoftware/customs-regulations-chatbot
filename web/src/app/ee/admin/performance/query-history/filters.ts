@@ -6,6 +6,7 @@ export interface QueryHistoryFilters {
   user_email?: string;
   user_query?: string;
   api_key_query?: string;
+  api_key_id?: number;
   q?: string;
   feedback_type?: Feedback;
   session_rating?: SessionFeedbackRating;
@@ -18,6 +19,7 @@ const FILTER_KEYS = [
   "user_email",
   "user_query",
   "api_key_query",
+  "api_key_id",
   "q",
   "feedback_type",
   "session_rating",
@@ -44,6 +46,15 @@ export function readQueryHistoryFilters(
       const value = params.get(key)?.trim();
       if (value) filters[key] = value;
     }
+  }
+  const apiKeyId = Number(params.get("api_key_id"));
+  if (
+    allowIdentity &&
+    Number.isSafeInteger(apiKeyId) &&
+    apiKeyId > 0 &&
+    apiKeyId <= 2147483647
+  ) {
+    filters.api_key_id = apiKeyId;
   }
   const feedback = params.get("feedback_type");
   if (feedback === "like" || feedback === "dislike" || feedback === "mixed") {

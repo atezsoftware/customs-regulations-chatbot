@@ -8,9 +8,13 @@ from sqlalchemy.sql import case, func, select
 from sqlalchemy.sql.expression import UnaryExpression, literal
 
 from ee.onyx.background.task_name_builders import QUERY_HISTORY_TASK_NAME_PREFIX
-from ee.onyx.server.query_history.models import QueryHistoryExportFilters
+from ee.onyx.server.query_history.models import (
+    QueryHistoryApiKeyOption,
+    QueryHistoryExportFilters,
+)
 from onyx.configs.constants import MessageType, QAFeedbackType
 from onyx.db.models import (
+    ApiKey,
     ChatMessage,
     ChatMessageFeedback,
     ChatSession,
@@ -32,6 +36,7 @@ def _build_filter_conditions(
     user_email: str | None = None,
     user_query: str | None = None,
     api_key_query: str | None = None,
+    api_key_id: int | None = None,
     q: str | None = None,
 ) -> list[ColumnElement]:
     """Keep page contents and total counts under the same session predicates."""
@@ -62,6 +67,8 @@ def _build_filter_conditions(
                 ),
             )
         )
+    if api_key_id is not None:
+        conditions.append(ChatSession.api_key_id == api_key_id)
     key_search = (api_key_query or "").strip()
     if key_search:
         conditions.append(
@@ -130,6 +137,44 @@ def _build_filter_conditions(
     return conditions
 
 
+def get_query_history_api_key_options(
+    db_session: Session,
+) -> list[QueryHistoryApiKeyOption]:
+    historical = db_session.execute(
+        select(
+            ChatSession.api_key_id,
+            ChatSession.api_key_name,
+            ChatSession.api_key_display,
+        )
+        .where(ChatSession.api_key_id.is_not(None))
+        .distinct(ChatSession.api_key_id)
+        .order_by(
+            ChatSession.api_key_id, desc(ChatSession.time_created), desc(ChatSession.id)
+        )
+    )
+    options = {
+        key_id: QueryHistoryApiKeyOption(
+            api_key_id=key_id,
+            api_key_name=name or f"API #{key_id}",
+            api_key_display=display,
+        )
+        for key_id, name, display in historical
+        if key_id is not None
+    }
+    for key_id, name, display in db_session.execute(
+        select(ApiKey.id, ApiKey.name, ApiKey.api_key_display)
+    ):
+        options[key_id] = QueryHistoryApiKeyOption(
+            api_key_id=key_id,
+            api_key_name=name or f"API #{key_id}",
+            api_key_display=display,
+        )
+    return sorted(
+        options.values(),
+        key=lambda option: (option.api_key_name.casefold(), option.api_key_id),
+    )
+
+
 def get_total_filtered_chat_sessions_count(
     db_session: Session,
     start_time: datetime | None,
@@ -140,6 +185,7 @@ def get_total_filtered_chat_sessions_count(
     user_email: str | None = None,
     user_query: str | None = None,
     api_key_query: str | None = None,
+    api_key_id: int | None = None,
     q: str | None = None,
 ) -> int:
     conditions = _build_filter_conditions(
@@ -151,6 +197,7 @@ def get_total_filtered_chat_sessions_count(
         user_email=user_email,
         user_query=user_query,
         api_key_query=api_key_query,
+        api_key_id=api_key_id,
         q=q,
     )
     stmt = (
@@ -173,6 +220,7 @@ def get_page_of_chat_sessions(
     user_email: str | None = None,
     user_query: str | None = None,
     api_key_query: str | None = None,
+    api_key_id: int | None = None,
     q: str | None = None,
 ) -> Sequence[ChatSession]:
     conditions = _build_filter_conditions(
@@ -184,6 +232,7 @@ def get_page_of_chat_sessions(
         user_email=user_email,
         user_query=user_query,
         api_key_query=api_key_query,
+        api_key_id=api_key_id,
         q=q,
     )
 
