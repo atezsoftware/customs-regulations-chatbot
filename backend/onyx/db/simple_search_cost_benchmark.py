@@ -15,8 +15,9 @@ os.environ['PGOPTIONS'] = '-c default_transaction_read_only=on'
 from sqlalchemy import text
 import tiktoken
 from google.genai.models import AsyncModels
-from onyx.db.engine.sql_engine import get_session_with_tenant
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_tenant
 from onyx.db.models import User
+import onyx.context.search.utils as search_utils
 from onyx.reranking.openrouter import OpenRouterRerankClient
 from onyx.server.features.regulatory.simple_search_api import simple_search
 from onyx.server.features.regulatory.simple_search_models import SimpleSearchRequest
@@ -61,6 +62,17 @@ class Collector(TracingProcessor):
             active.setdefault('llm_events', []).append({'span_id':span.span_id,'flow':cfg.get('flow'),'model':data.model,'usage':data.usage})
 
 set_trace_processors([Collector()])
+SqlEngine.set_app_name('simple_search_ten_query_benchmark')
+SqlEngine.init_engine(pool_size=2,max_overflow=2)
+original_cache_read = search_utils.get_cached_query_embeddings
+
+def observe_cache_read(*args: Any, **kwargs: Any) -> Any:
+    result = original_cache_read(*args, **kwargs)
+    active['embedding_cache_hits'] = sum(value is not None for value in result)
+    active['embedding_cache_misses'] = sum(value is None for value in result)
+    return result
+
+search_utils.get_cached_query_embeddings = observe_cache_read
 original_rerank = OpenRouterRerankClient._post_json
 
 def observe_rerank(self: OpenRouterRerankClient, *, url: str, api_key: str, request_payload: dict[str, Any]) -> Any:
@@ -108,4 +120,6 @@ for index in range(start,stop):
         active['error_frames']=[{'file':f.filename,'line':f.lineno,'function':f.name} for f in traceback.extract_tb(exc.__traceback__)[-8:]]
     active['elapsed_seconds']=round(time.monotonic()-began,3)
     emit('BENCH_QUERY',active)
+    if active.get('error_type') and not any(active[k] for k in ('llm_events','embedding_events','rerank_events')):
+        raise SystemExit('Measurement setup failed before a provider call')
 emit('BENCH_DONE', {'utc':datetime.now(timezone.utc).isoformat(),'start':start,'stop':stop})
