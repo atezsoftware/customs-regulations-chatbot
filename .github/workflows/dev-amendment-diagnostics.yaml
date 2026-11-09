@@ -43,23 +43,35 @@ jobs:
           PY
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1 >/dev/null
           python - <<'PYREMOTE'
-          import json,subprocess,re
-          def k(*args):
-              r=subprocess.run(['kubectl',*args],capture_output=True,text=True)
-              if r.returncode: return {}
-              return json.loads(r.stdout)
-          ds=k('get','ds','fluentd','-n','logging','-o','json')
-          volumes=ds.get('spec',{}).get('template',{}).get('spec',{}).get('volumes',[])
-          for v in volumes:
-              cm=v.get('configMap',{}).get('name')
-              if not cm:continue
-              cfg=k('get','cm',cm,'-n','logging','-o','json')
-              for name,value in cfg.get('data',{}).items():
-                  for line in value.splitlines():
-                      line=line.strip()
-                      if re.match(r'(@type|host|port|log_group_name|log_group_name_key|region|bucket|path|index_name|endpoint|url|stream_name)\s',line):
-                          line=re.sub(r'(https?://)[^/@ ]+:[^/@ ]+@',r'\1[redacted]@',line)
-                          print('LOG_SINK',json.dumps({'config':cm,'file':name,'setting':line}))
-          for c in ds.get('spec',{}).get('template',{}).get('spec',{}).get('containers',[]):
-              print('LOG_COLLECTOR',json.dumps({'name':c.get('name'),'image':c.get('image'),'env_names':[e.get('name') for e in c.get('env',[])]}))
+          import json,subprocess,re,urllib.request,urllib.error,ssl,base64,shlex
+          r=subprocess.run(['kubectl','get','cm','fluentd-config-fluentd','-n','logging','-o','json'],capture_output=True,text=True,check=True)
+          cfg=json.loads(r.stdout)['data']['04_outputs.conf']
+          settings={}
+          for line in cfg.splitlines():
+              parts=shlex.split(line.strip())
+              if len(parts)==2:settings[parts[0]]=parts[1]
+          scheme=settings.get('scheme','http')
+          host=settings['host'];port=settings.get('port','9200')
+          assert host=='elastic.dev.singlewindow.io'
+          prefix=settings.get('logstash_prefix','logstash') if settings.get('logstash_format')=='true' else settings.get('index_name','fluentd')
+          assert re.fullmatch(r'[a-zA-Z0-9_.-]+',prefix)
+          headers={'Content-Type':'application/json'}
+          if settings.get('user'):
+              token=base64.b64encode((settings['user']+':'+settings.get('password','')).encode()).decode()
+              headers['Authorization']='Basic '+token
+          body={'size':10000,'track_total_hits':True,'query':{'bool':{'filter':[{'range':{'@timestamp':{'gte':'2026-11-03T00:00:00Z'}}}], 'must':[{'multi_match':{'query':'Catalog simple search request_id','type':'phrase','fields':['message','log','log_message']}}]}},'sort':[{'@timestamp':'asc'}]}
+          url=scheme+'://'+host+':'+port+'/'+prefix+'*/_search'
+          try:
+              request=urllib.request.Request(url,data=json.dumps(body).encode(),headers=headers)
+              with urllib.request.urlopen(request,timeout=45,context=ssl._create_unverified_context()) as response: data=json.load(response)
+              print('SEARCH_LOG_RESULT',json.dumps({'total':data.get('hits',{}).get('total'),'timed_out':data.get('timed_out'),'shards':data.get('_shards')}))
+              for hit in data.get('hits',{}).get('hits',[]):
+                  row=hit['_source']
+                  ns=row.get('kubernetes',{}).get('namespace_name')
+                  if ns and ns!='customs-regulations-dev':continue
+                  print('ARCHIVED_SIMPLE_SEARCH',json.dumps(row))
+          except urllib.error.HTTPError as e:
+              print('SEARCH_LOG_HTTP_STATUS',e.code)
+          except Exception as e:
+              print('SEARCH_LOG_UNAVAILABLE',type(e).__name__)
           PYREMOTE
