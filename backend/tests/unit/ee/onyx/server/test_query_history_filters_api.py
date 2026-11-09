@@ -212,3 +212,30 @@ def test_export_validates_filter_bounds(
         client.post("/api/admin/query-history/start-export", params=params).status_code
         == 422
     )
+
+
+def test_download_streams_large_utf8_csv_in_bounded_blocks(
+    history_client: tuple[TestClient, MagicMock, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import io
+
+    _, _, user = history_client
+    payload = ('Çağrı,"çok satırlı\nrapor"\n' * 10000).encode("utf-8")
+    store = MagicMock()
+    store.has_file.return_value = True
+    store.read_file.return_value = io.BytesIO(payload)
+    monkeypatch.setattr(api, "get_default_file_store", lambda: store)
+    response = api.download_query_history_csv("report-id", user, MagicMock())
+
+    async def chunks() -> list[bytes]:
+        return [
+            chunk.encode() if isinstance(chunk, str) else bytes(chunk)
+            async for chunk in response.body_iterator
+        ]
+
+    parts = asyncio.run(chunks())
+    assert b"".join(parts) == payload
+    assert len(parts) <= (len(payload) + 65535) // 65536
+    assert response.media_type == "text/csv"
