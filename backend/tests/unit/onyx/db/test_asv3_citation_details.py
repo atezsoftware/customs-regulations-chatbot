@@ -339,3 +339,37 @@ def test_uncited_ledger_original_never_enters_inline_response(
     assert len(fences[1].call_args.args[0]) == 2
     assert [row.citation_number for row in result[900]] == [1, 5]
     assert uncited.text not in "".join(row.text or "" for row in result[900])
+
+
+@pytest.mark.usefixtures("fences")
+def test_owned_history_source_titles_include_each_chunks_article(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message, originals = fixture_message()
+    assert message.tool_calls and message.tool_calls[0].tool_call_response
+    checkpoint = json.loads(message.tool_calls[0].tool_call_response)
+    for row, heading in zip(
+        checkpoint["evidence"]["records"],
+        ("MADDE 18 - İbraz süresi", "GEÇİCİ MADDE 2 - Geçiş"),
+        strict=True,
+    ):
+        row["item"]["metadata"]["heading_path"] = ["Eski kök", heading, "(1) Bent"]
+    message.tool_calls[0].tool_call_response = json.dumps(checkpoint)
+    response = _get_session(monkeypatch, [message], run_id=None)
+    result = response.messages[0]
+    expected = [TITLE + " — Madde 18", TITLE + " — Geçici Madde 2"]
+    assert [citation.display_title for citation in result.citation_info] == expected
+    assert [citation.text for citation in result.citation_info] == [
+        item.text for item in originals
+    ]
+    assert result.context_docs is not None
+    assert [
+        doc.metadata["asv3_source_display_name"] for doc in result.context_docs
+    ] == expected
+    replayed = [
+        packet.obj
+        for group in response.packets
+        for packet in group
+        if isinstance(packet.obj, CitationInfo)
+    ]
+    assert replayed == result.citation_info

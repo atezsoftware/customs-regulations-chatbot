@@ -2575,3 +2575,19 @@ class TestPossibleCitationPatternReDoS:
                 DynamicCitationProcessor().possible_citation_pattern.search(segment)
                 is None
             ), f"expected {segment!r} to NOT be treated as a possible citation"
+
+
+def test_source_display_name_reaches_citation_without_replacing_chunk_label() -> None:
+    document = create_test_search_doc(
+        semantic_identifier="stored.md — Eski kök > MADDE 18 > (1) Bent",
+        metadata={
+            "asv3_source_display_name": "Gerçek Mevzuat Adı — Madde 18",
+            "regulatory_heading_path": ["Eski kök", "MADDE 18", "(1) Bent"],
+        },
+    )
+    processor = DynamicCitationProcessor()
+    processor.update_citation_mapping({1: document})
+    _, citations = process_tokens(processor, ["Hüküm [1].", None])
+    assert citations[0].display_title == "Gerçek Mevzuat Adı — Madde 18"
+    assert citations[0].semantic_identifier == document.semantic_identifier
+    assert citations[0].reference == "Eski kök > MADDE 18 > (1) Bent"

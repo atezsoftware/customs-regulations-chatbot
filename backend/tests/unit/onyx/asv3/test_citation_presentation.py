@@ -78,8 +78,14 @@ def test_optional_title_preserves_original_identity_and_exact_passage(
     assert original.search_doc is not None
     before = original.model_dump(mode="json")
     result = evidence_citation_presentation(original)
-    assert result.display_title == (
-        title if title and title.strip() else original.search_doc.semantic_identifier
+    assert (
+        result.display_title
+        == (
+            title
+            if title and title.strip()
+            else original.search_doc.semantic_identifier
+        )
+        + " — Madde 142"
     )
     assert result.text == original.text and result.chunk_id == original.chunk_id
     assert original.model_dump(mode="json") == before
@@ -102,7 +108,9 @@ def test_native_original_keeps_its_locator_and_has_no_canonical_chunk_id(
     result = evidence_citation_presentation(original)
     assert result.chunk_id is None
     assert result.text == original.text
-    assert result.display_title == original.search_doc.semantic_identifier
+    assert (
+        result.display_title == original.search_doc.semantic_identifier + " — Madde 142"
+    )
     assert original.model_dump(mode="json") == before
 
 
@@ -188,7 +196,7 @@ def test_actual_publication_keeps_two_chunks_of_one_file_separate(
         assert citation.preview_url == f"/api/asv3/citation/2/{number}"
         assert citation.chunk_id == (original.id if enriched else None)
         assert citation.text == (original.text if enriched else None)
-        assert citation.display_title == (title if enriched else None)
+        assert citation.display_title == (title + " — Madde 142" if enriched else None)
         assert citation.semantic_identifier is not None
         assert citation.semantic_identifier != title
     published = next(
@@ -199,7 +207,9 @@ def test_actual_publication_keeps_two_chunks_of_one_file_separate(
     assert [
         doc.metadata.get("asv3_source_display_name")
         for doc in published.final_documents
-    ] == ([title, title] if enriched else [None, None])
+    ] == (
+        [title + " — Madde 142", title + " — Madde 142"] if enriched else [None, None]
+    )
     saved = copy.deepcopy(checkpoints[-1]["evidence"]["records"])
     assert [row["item"]["text"] for row in saved] == [item.text for item in originals]
     assert all(
@@ -327,4 +337,81 @@ def test_native_title_uses_existing_authorized_source_read_only_for_presentation
         title not in message.model_dump_json()
         for call in llm.invoke.call_args_list
         for message in call.kwargs["prompt"]
+    )
+
+
+@pytest.mark.parametrize(
+    "headings,expected",
+    [
+        (
+            ["MADDE 18 - Kapsam", "MADDE 7 uyarınca işlemler"],
+            "Gerçek Mevzuat Adı — Madde 18",
+        ),
+        (
+            ["MADDE 18 - İbraz süresi", "(1) A.TR belgesi"],
+            "Gerçek Mevzuat Adı — Madde 18",
+        ),
+        (
+            ["GEÇİCİ MADDE 2 - Geçiş", "(1) Koşul"],
+            "Gerçek Mevzuat Adı — Geçici Madde 2",
+        ),
+        (["EK MADDE 3", "a) Bent"], "Gerçek Mevzuat Adı — Ek Madde 3"),
+        (["MÜKERRER MADDE 7"], "Gerçek Mevzuat Adı — Mükerrer Madde 7"),
+        (["Kapsam", "Başka kanunun 18. maddesine atıf"], "Gerçek Mevzuat Adı"),
+    ],
+)
+def test_source_title_uses_official_name_and_only_structural_article(
+    monkeypatch: pytest.MonkeyPatch, headings: list[str], expected: str
+) -> None:
+    _, broker, _, _, _ = setup_run(monkeypatch)
+    source = replace(
+        broker.sources[0],
+        legistation_metadata=LegistationMetadata(official_title="Gerçek Mevzuat Adı"),
+    )
+    chunk = replace(
+        broker.chunks[str(source.id)], heading_path=["Eski hiyerarşi kökü", *headings]
+    )
+    original = evidence_for_chunk(source, chunk)
+    before = original.model_dump(mode="json")
+    result = evidence_citation_presentation(original)
+    assert result.display_title == expected
+    assert original.model_dump(mode="json") == before
+    assert result.text == original.text and result.chunk_id == original.chunk_id
+
+
+def test_source_title_drops_chunk_hierarchy_when_optional_names_are_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, broker, _, _, _ = setup_run(monkeypatch)
+    original = evidence_for_chunk(
+        broker.sources[0], broker.chunks[str(broker.sources[0].id)]
+    )
+    assert original.search_doc is not None
+    original.search_doc.semantic_identifier = "Readable source — PART II > Scope > (1)"
+    original.metadata = {"heading_path": ["PART II", "Scope", "(1)"]}
+    assert evidence_citation_presentation(original).display_title == "Readable source"
+
+
+@pytest.mark.parametrize(
+    "article_no,expected",
+    [
+        ("18", "Madde 18"),
+        ("Geçici 2", "Geçici Madde 2"),
+        ("Ek 3", "Ek Madde 3"),
+        ("8.2.2", None),
+    ],
+)
+def test_source_title_uses_structural_article_metadata_without_guessing_sections(
+    monkeypatch: pytest.MonkeyPatch, article_no: str, expected: str | None
+) -> None:
+    _, broker, _, _, _ = setup_run(monkeypatch)
+    source = replace(
+        broker.sources[0],
+        legistation_metadata=LegistationMetadata(official_title="Gerçek Ad"),
+    )
+    original = evidence_for_chunk(source, broker.chunks[str(source.id)])
+    original.metadata["heading_path"] = ["Bölüm", "(1) Bent"]
+    original.metadata["canonical_metadata"] = {"article_no": article_no}
+    assert evidence_citation_presentation(original).display_title == "Gerçek Ad" + (
+        f" — {expected}" if expected else ""
     )

@@ -181,7 +181,17 @@ class CitationInfo(BaseObj):
             and all(isinstance(part, str) for part in heading)
             else None
         )
-        return self.model_copy(update={"reference": reference, "link": link})
+        title = metadata.get("asv3_source_display_name")
+        return self.model_copy(
+            update={
+                "reference": reference,
+                "link": link,
+                "display_title": self.display_title
+                or (
+                    title.strip() if isinstance(title, str) and title.strip() else None
+                ),
+            }
+        )
 
 
 class ToolCallDebug(BaseObj):
