@@ -1,99 +1,61 @@
-name: DEV amendment approval diagnostics
+name: Read-only simple search cost evidence
 on:
   workflow_dispatch:
-    inputs:
-      operation:
-        type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
-        default: inspect
 permissions:
   contents: read
 jobs:
   inspect:
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read only batch inventory
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/amendment-pods.json
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          pods=json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          ready=[]
-          for pod in pods:
-              if pod['status']['phase']!='Running' or pod['metadata'].get('deletionTimestamp'):
-                  continue
-              statuses={item['name']:item for item in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  image=container['image']
-                  if 'customs-regulations-backend-lite-dev:' in image and statuses.get(container['name'],{}).get('ready'):
-                      ready.append((pod['metadata']['name'],container['name'],image))
-          if not ready:
-              raise SystemExit('No ready DEV backend container')
-          ready.sort()
-          pod,container,image=ready[0]
-          print('TARGET',pod,container,image)
-          Path('/tmp/amendment-target').write_text(pod+'\t'+container+'\n')
-          PY
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
-            backend/onyx/db/diagnose_amendment_batches_299_310.py
-      - name: Filter amendment approval worker errors
-        if: inputs.operation == 'inspect'
+      - name: Read retained DEV search logs
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json
-          import re
-          import subprocess
-          from pathlib import Path
-
-          pods = json.loads(Path('/tmp/amendment-pods.json').read_text())['items']
-          needles = re.compile(r'Amendment proposal (460|462|465|470) approval failed|amendment_(prepared|approved) proposal_id=(460|462|465|470)')
-          for pod in pods:
-              name = pod['metadata']['name']
-              if pod['status']['phase'] != 'Running' or 'background' not in name:
-                  continue
-              for container in pod['spec']['containers']:
-                  result = subprocess.run(
-                      ['kubectl', 'logs', name, '-n', 'customs-regulations-dev',
-                       '-c', container['name'], '--since=36h', '--tail=30000'],
-                      capture_output=True, text=True, check=False,
-                  )
-                  if result.returncode:
-                      print('LOG_READ_FAILED', name, container['name'], result.returncode)
-                      continue
-                  lines = result.stdout.splitlines()
-                  print('LOG_SCAN', name, container['name'], len(lines))
-                  for index, line in enumerate(lines):
-                      if needles.search(line):
-                          print('LOG_MATCH', name, container['name'])
-                          for excerpt in lines[index:index + 45]:
-                              print(excerpt[:500])
+          import datetime,json,subprocess,time
+          def aws(*args):
+              result=subprocess.run(['aws',*args,'--region','eu-central-1','--output','json'],capture_output=True,text=True)
+              if result.returncode:
+                  print('AWS_READ_UNAVAILABLE',json.dumps({'operation':args[0:2],'error':result.stderr[-500:]}))
+                  return None
+              return json.loads(result.stdout)
+          groups={}
+          for filters in (['--log-group-name-prefix','/aws/containerinsights/atez-dev-cluster/'],['--log-group-name-pattern','customs']):
+              data=aws('logs','describe-log-groups',*filters,'--max-items','50')
+              for row in (data or {}).get('logGroups',[]):
+                  groups[row['logGroupName']]=row
+          print('LOG_GROUPS',json.dumps([{'name':name,'retention_days':row.get('retentionInDays'),'stored_bytes':row.get('storedBytes')} for name,row in groups.items()]))
+          start=int(datetime.datetime(2026,11,3,tzinfo=datetime.timezone.utc).timestamp())
+          for name in list(groups)[:8]:
+              if 'performance' in name or 'dataplane' in name or 'host' in name:continue
+              data=aws('logs','start-query','--log-group-name',name,'--start-time',str(start),'--end-time',str(int(time.time())), '--query-string','fields @timestamp, @message, @logStream | filter @message like /Catalog simple search/ | sort @timestamp asc | limit 10000')
+              if not data:continue
+              for _ in range(40):
+                  result=aws('logs','get-query-results','--query-id',data['queryId'])
+                  if not result:break
+                  if result.get('status') not in ('Scheduled','Running'):break
+                  time.sleep(2)
+              print('LOG_QUERY',json.dumps({'group':name,'status':(result or {}).get('status'),'statistics':(result or {}).get('statistics')}))
+              for row in (result or {}).get('results',[]):
+                  fields={field['field']:field['value'] for field in row if field['field']!='@ptr'}
+                  print('SIMPLE_SEARCH_LOG',json.dumps(fields))
           PY
-      - name: Resume one existing reviewed proposal
-        if: inputs.operation != 'inspect'
-        shell: bash
-        env:
-          OPERATION: ${{ inputs.operation }}
-        run: |
-          set -euo pipefail
-          case "$OPERATION" in
-            approve_462) proposal_id=462 ;;
-            approve_465) proposal_id=465 ;;
-            approve_470) proposal_id=470 ;;
-            *) exit 2 ;;
-          esac
-          IFS=$'\t' read -r pod container < /tmp/amendment-target
-          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
-            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
-            backend/onyx/db/resume_amendment_approvals_309_310.py
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1 >/dev/null
+          kubectl get pods -n customs-regulations-dev -o json > /tmp/simple-search-pods.json
+          python - <<'PY'
+          import json,subprocess
+          pods=json.load(open('/tmp/simple-search-pods.json'))['items']
+          for pod in pods:
+              name=pod['metadata']['name']
+              if 'customs-regulations-api' not in name or pod['status']['phase']!='Running':continue
+              containers=[c['name'] for c in pod['spec']['containers'] if 'customs-regulations-backend-lite-dev:' in c['image']]
+              for container in containers:
+                  result=subprocess.run(['kubectl','logs',name,'-n','customs-regulations-dev','-c',container,'--since=168h'],capture_output=True,text=True)
+                  lines=[line for line in result.stdout.splitlines() if 'Catalog simple search request_id=' in line]
+                  print('CURRENT_POD_SEARCH_LOG',json.dumps({'pod':name,'created':pod['metadata']['creationTimestamp'],'matches':len(lines)}))
+                  for line in lines:print('POD_SEARCH_LOG',line)
+                  command="find /var/log/onyx -maxdepth 1 -type f -name '*api*' -printf '%f %s bytes\\n' 2>/dev/null"
+                  inventory=subprocess.run(['kubectl','exec',name,'-n','customs-regulations-dev','-c',container,'--','sh','-c',command],capture_output=True,text=True)
+                  print('POD_LOG_FILES',inventory.stdout[-3000:])
+          PY
