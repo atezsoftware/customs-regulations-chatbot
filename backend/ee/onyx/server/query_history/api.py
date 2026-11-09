@@ -80,6 +80,8 @@ from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter()
 
+CSV_DOWNLOAD_CHUNK_SIZE = 64 * 1024
+
 
 def ensure_query_history_is_enabled(
     disallowed: list[QueryHistoryType],
@@ -563,7 +565,7 @@ def download_query_history_csv(
             )
         csv_stream.seek(0)
         return StreamingResponse(
-            iter(csv_stream),
+            iter(lambda: csv_stream.read(CSV_DOWNLOAD_CHUNK_SIZE), b""),
             media_type=FileType.CSV,
             headers={"Content-Disposition": f"attachment;filename={report_name}"},
         )
