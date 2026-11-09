@@ -42,27 +42,24 @@ jobs:
                   print('SIMPLE_SEARCH_LOG',json.dumps(fields))
           PY
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1 >/dev/null
-          kubectl get pods -n customs-regulations-dev -o json > /tmp/simple-search-pods.json
-          python - <<'PY'
-          import json,subprocess
-          pods=json.load(open('/tmp/simple-search-pods.json'))['items']
-          inventory=subprocess.run(['kubectl','get','ds,deploy,svc','-A','-o','json'],capture_output=True,text=True)
-          if inventory.returncode==0:
-              import re
-              logging_names=re.compile(r'loki|promtail|fluent|filebeat|grafana|datadog|opentelemetry|cloudwatch|elastic|kibana|vector',re.I)
-              for item in json.loads(inventory.stdout).get('items',[]):
-                  if logging_names.search(item['metadata']['name']):
-                      print('LOGGING_INFRA',json.dumps({'kind':item['kind'],'name':item['metadata']['name'],'namespace':item['metadata']['namespace'],'ports':item.get('spec',{}).get('ports')}))
-          for pod in pods:
-              name=pod['metadata']['name']
-              if 'customs-regulations-api' not in name or pod['status']['phase']!='Running':continue
-              containers=[c['name'] for c in pod['spec']['containers'] if 'customs-regulations-backend-lite-dev:' in c['image']]
-              for container in containers:
-                  result=subprocess.run(['kubectl','logs',name,'-n','customs-regulations-dev','-c',container,'--since=168h'],capture_output=True,text=True)
-                  lines=[line for line in result.stdout.splitlines() if 'Catalog simple search request_id=' in line or '[API:nUO-T9g0]' in line]
-                  print('CURRENT_POD_SEARCH_LOG',json.dumps({'pod':name,'created':pod['metadata']['creationTimestamp'],'matches':len(lines)}))
-                  for line in lines:print('POD_SEARCH_LOG',line)
-                  command="find /var/log/onyx -maxdepth 1 -type f -name '*api*' -printf '%f %s bytes\\n' 2>/dev/null"
-                  inventory=subprocess.run(['kubectl','exec',name,'-n','customs-regulations-dev','-c',container,'--','sh','-c',command],capture_output=True,text=True)
-                  print('POD_LOG_FILES',inventory.stdout[-3000:])
-          PY
+          python - <<'PYREMOTE'
+          import json,subprocess,re
+          def k(*args):
+              r=subprocess.run(['kubectl',*args],capture_output=True,text=True)
+              if r.returncode: return {}
+              return json.loads(r.stdout)
+          ds=k('get','ds','fluentd','-n','logging','-o','json')
+          volumes=ds.get('spec',{}).get('template',{}).get('spec',{}).get('volumes',[])
+          for v in volumes:
+              cm=v.get('configMap',{}).get('name')
+              if not cm:continue
+              cfg=k('get','cm',cm,'-n','logging','-o','json')
+              for name,value in cfg.get('data',{}).items():
+                  for line in value.splitlines():
+                      line=line.strip()
+                      if re.match(r'(@type|host|port|log_group_name|log_group_name_key|region|bucket|path|index_name|endpoint|url|stream_name)\s',line):
+                          line=re.sub(r'(https?://)[^/@ ]+:[^/@ ]+@',r'\1[redacted]@',line)
+                          print('LOG_SINK',json.dumps({'config':cm,'file':name,'setting':line}))
+          for c in ds.get('spec',{}).get('template',{}).get('spec',{}).get('containers',[]):
+              print('LOG_COLLECTOR',json.dumps({'name':c.get('name'),'image':c.get('image'),'env_names':[e.get('name') for e in c.get('env',[])]}))
+          PYREMOTE
