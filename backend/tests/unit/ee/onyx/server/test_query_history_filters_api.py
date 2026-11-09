@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -239,3 +240,57 @@ def test_download_streams_large_utf8_csv_in_bounded_blocks(
     assert b"".join(parts) == payload
     assert len(parts) <= (len(payload) + 65535) // 65536
     assert response.media_type == "text/csv"
+
+
+def test_exact_api_selection_reaches_table_count_and_csv(
+    history_client: tuple[TestClient, MagicMock, User],
+) -> None:
+    client, reads, _ = history_client
+    assert (
+        client.get(
+            "/api/admin/chat-session-history", params={"api_key_id": 17}
+        ).status_code
+        == 200
+    )
+    assert reads.page.call_args.kwargs["api_key_id"] == 17
+    assert reads.count.call_args.kwargs["api_key_id"] == 17
+    assert (
+        client.post(
+            "/api/admin/query-history/start-export", params={"api_key_id": 17}
+        ).status_code
+        == 200
+    )
+    assert (
+        cast(MagicMock, api.client_app.send_task).call_args.kwargs["kwargs"]["filters"][
+            "api_key_id"
+        ]
+        == 17
+    )
+
+
+def test_api_picker_is_private_and_anonymized_history_cannot_list_keys(
+    history_client: tuple[TestClient, MagicMock, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, reads, _ = history_client
+    monkeypatch.setattr(
+        api, "get_query_history_api_key_options", lambda _session: [], raising=False
+    )
+    response = client.get("/api/admin/query-history/api-keys")
+    assert response.status_code == 200
+    assert response.json() == []
+    assert response.headers["cache-control"] == "private, no-store"
+    reads.settings.return_value.query_history_type = QueryHistoryType.ANONYMIZED
+    assert client.get("/api/admin/query-history/api-keys").status_code == 403
+    assert (
+        client.get(
+            "/api/admin/chat-session-history", params={"api_key_id": 17}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/admin/query-history/start-export", params={"api_key_id": 17}
+        ).status_code
+        == 403
+    )

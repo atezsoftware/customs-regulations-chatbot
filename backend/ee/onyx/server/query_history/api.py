@@ -14,6 +14,7 @@ from ee.onyx.db.query_history import (
     get_all_query_history_export_tasks,
     get_export_page_of_chat_sessions,
     get_page_of_chat_sessions,
+    get_query_history_api_key_options,
     get_total_filtered_chat_sessions_count,
 )
 from ee.onyx.db.query_history_citations import (
@@ -26,6 +27,7 @@ from ee.onyx.server.query_history.models import (
     ChatSessionMinimal,
     ChatSessionSnapshot,
     MessageSnapshot,
+    QueryHistoryApiKeyOption,
     QueryHistoryExport,
     QueryHistoryExportFilters,
     QueryHistoryIdentity,
@@ -208,6 +210,19 @@ def private_history_response(response: Response) -> None:
     response.headers["Cache-Control"] = "private, no-store"
 
 
+@router.get("/admin/query-history/api-keys")
+def list_query_history_api_keys(
+    response: Response,
+    _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> list[QueryHistoryApiKeyOption]:
+    ensure_query_history_is_enabled(
+        [QueryHistoryType.DISABLED, QueryHistoryType.ANONYMIZED]
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return get_query_history_api_key_options(db_session)
+
+
 @router.get(
     "/admin/chat-session-history",
     dependencies=[Depends(private_history_response)],
@@ -223,6 +238,7 @@ def get_chat_session_history(
     user_email: Annotated[str | None, Query(max_length=320)] = None,
     user_query: Annotated[str | None, Query(max_length=255)] = None,
     api_key_query: Annotated[str | None, Query(max_length=255)] = None,
+    api_key_id: Annotated[int | None, Query(ge=1, le=2147483647)] = None,
     q: Annotated[str | None, Query(max_length=500)] = None,
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
@@ -233,6 +249,7 @@ def get_chat_session_history(
 
     if query_history_type == QueryHistoryType.ANONYMIZED and (
         user_id is not None
+        or api_key_id is not None
         or any(
             value and value.strip() for value in (user_email, user_query, api_key_query)
         )
@@ -254,6 +271,7 @@ def get_chat_session_history(
         user_email=user_email,
         user_query=user_query,
         api_key_query=api_key_query,
+        api_key_id=api_key_id,
         q=q,
     )
 
@@ -267,6 +285,7 @@ def get_chat_session_history(
         user_email=user_email,
         user_query=user_query,
         api_key_query=api_key_query,
+        api_key_id=api_key_id,
         q=q,
     )
 

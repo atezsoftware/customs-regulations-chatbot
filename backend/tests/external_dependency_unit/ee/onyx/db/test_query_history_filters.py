@@ -279,3 +279,44 @@ def test_export_filters_and_stable_pages_skip_transcript_enrichment(
         assert [chat.id for chat in exact] == [sessions[0].id]
     finally:
         event.remove(engine, "before_cursor_execute", record_sql)
+
+
+def test_exact_api_id_and_picker_options_include_historical_keys(
+    db_session: Session,
+    history_rows: tuple[User, User, list[ChatSession]],
+) -> None:
+    from ee.onyx.db.query_history import get_query_history_api_key_options
+    from onyx.db.models import ApiKey
+
+    user, _, sessions = history_rows
+    db_session.add(
+        ApiKey(
+            id=19,
+            user_id=user.id,
+            name="Portal 17",
+            hashed_api_key=uuid4().hex,
+            api_key_display="masked-" + uuid4().hex,
+        )
+    )
+    db_session.flush()
+    filters: HistoryFilterArguments = dict(
+        db_session=db_session, start_time=None, end_time=None, feedback_filter=None
+    )
+    assert get_total_filtered_chat_sessions_count(**filters, api_key_id=17) == 2
+    assert {
+        chat.id
+        for chat in get_page_of_chat_sessions(
+            **filters, page_num=0, page_size=20, api_key_id=17
+        )
+    } == {sessions[0].id, sessions[2].id}
+    options = {
+        option.api_key_id: option
+        for option in get_query_history_api_key_options(db_session)
+    }
+    assert options[17].api_key_name == "Customer Portal %_"
+    assert options[18].api_key_name == "Other Portal"
+    assert options[19].api_key_name == "Portal 17"
+    assert all(
+        set(option.model_dump()) == {"api_key_id", "api_key_name", "api_key_display"}
+        for option in options.values()
+    )

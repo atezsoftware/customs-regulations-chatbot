@@ -59,19 +59,30 @@ class QueryHistoryIdentity(BaseModel):
         self.api_key_display = None
 
 
+class QueryHistoryApiKeyOption(BaseModel):
+    api_key_id: int
+    api_key_name: str
+    api_key_display: str | None = None
+
+
 class QueryHistoryExportFilters(BaseModel):
     user_id: UUID | None = None
     user_email: str | None = Field(default=None, max_length=320)
     user_query: str | None = Field(default=None, max_length=255)
     api_key_query: str | None = Field(default=None, max_length=255)
+    api_key_id: int | None = Field(default=None, ge=1, le=2147483647)
     q: str | None = Field(default=None, max_length=500)
     feedback_type: QAFeedbackType | None = None
     session_rating: int | None = Field(default=None, ge=1, le=4)
 
     def requires_identity(self) -> bool:
-        return self.user_id is not None or any(
-            value and value.strip()
-            for value in (self.user_email, self.user_query, self.api_key_query)
+        return (
+            self.user_id is not None
+            or self.api_key_id is not None
+            or any(
+                value and value.strip()
+                for value in (self.user_email, self.user_query, self.api_key_query)
+            )
         )
 
 
