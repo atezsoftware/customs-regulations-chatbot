@@ -59,7 +59,7 @@ jobs:
           if settings.get('user'):
               token=base64.b64encode((settings['user']+':'+settings.get('password','')).encode()).decode()
               headers['Authorization']='Basic '+token
-          body={'size':10000,'track_total_hits':True,'query':{'bool':{'filter':[{'range':{'@timestamp':{'gte':'2026-11-03T00:00:00Z'}}}], 'must':[{'multi_match':{'query':'Catalog simple search request_id','type':'phrase','fields':['message','log','log_message']}}]}},'sort':[{'@timestamp':'asc'}]}
+          body={'size':10000,'track_total_hits':True,'query':{'bool':{'filter':[{'range':{'@timestamp':{'gte':'2026-11-03T00:00:00Z'}}}], 'must':[{'query_string':{'query':'"Catalog simple search" OR "/api/regulatory/catalog/simple-search"','default_field':'*','lenient':True}}]}},'sort':[{'@timestamp':'asc'}]}
           url=scheme+'://'+host+':'+port+'/'+prefix+'*/_search'
           try:
               request=urllib.request.Request(url,data=json.dumps(body).encode(),headers=headers)
