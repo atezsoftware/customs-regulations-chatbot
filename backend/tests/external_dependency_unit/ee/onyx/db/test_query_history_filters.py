@@ -203,3 +203,79 @@ def test_query_history_searches_all_user_turns_and_session_identity(
         get_total_filtered_chat_sessions_count(**filters, user_query="no-such-user")
         == 0
     )
+
+
+def test_export_filters_and_stable_pages_skip_transcript_enrichment(
+    db_session: Session,
+    history_rows: tuple[User, User, list[ChatSession]],
+) -> None:
+    from sqlalchemy import event
+    from sqlalchemy.engine import Connection, ExecutionContext
+    from sqlalchemy.engine.interfaces import DBAPICursor
+
+    from ee.onyx.db.query_history import get_export_page_of_chat_sessions
+    from ee.onyx.server.query_history.models import (
+        ChatSessionSnapshot,
+        QueryHistoryExportFilters,
+        QuestionAnswerPairSnapshot,
+    )
+
+    user, _, sessions = history_rows
+    created = sessions[0].time_created
+    selected = {sessions[0].id, sessions[2].id}
+    filters = QueryHistoryExportFilters(
+        api_key_query="portal %_", user_query="şahin %_"
+    )
+    db_session.expunge_all()
+    before: tuple[datetime, UUID] | None = None
+    exported: list[UUID] = []
+    statements: list[str] = []
+
+    def record_sql(
+        _connection: Connection,
+        _cursor: DBAPICursor,
+        statement: str,
+        _parameters: object,
+        _context: ExecutionContext | None,
+        _many: bool,
+    ) -> None:
+        statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", record_sql)
+    try:
+        while True:
+            page = get_export_page_of_chat_sessions(
+                db_session,
+                created,
+                created,
+                filters,
+                before=before,
+                page_size=1,
+            )
+            if not page:
+                break
+            query_count = len(statements)
+            snapshot = ChatSessionSnapshot.for_export(page[0])
+            rows = QuestionAnswerPairSnapshot.from_chat_session_snapshot(snapshot)
+            assert rows[0].user_name == "Çağrı Şahin %_"
+            assert rows[0].api_key_name == "Customer Portal %_"
+            assert len(statements) == query_count
+            exported.append(snapshot.id)
+            before = page[-1].time_created, page[-1].id
+        assert set(exported) == selected
+        assert len(exported) == 2
+        assert not any(
+            "tool_call" in statement or "answer_graph" in statement
+            for statement in statements
+        )
+        assert "chat_message.reasoning_tokens" not in " ".join(statements)
+        exact = get_export_page_of_chat_sessions(
+            db_session,
+            created,
+            created,
+            QueryHistoryExportFilters(user_id=user.id, api_key_query="17"),
+        )
+        assert [chat.id for chat in exact] == [sessions[0].id]
+    finally:
+        event.remove(engine, "before_cursor_execute", record_sql)

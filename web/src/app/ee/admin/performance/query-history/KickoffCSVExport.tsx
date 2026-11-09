@@ -1,7 +1,8 @@
 import { toast } from "@opal/layouts";
 import Button from "@/refresh-components/buttons/Button";
 import { useRef, useState } from "react";
-import { DateRange } from "../../../../../components/dateRangeSelectors/AdminDateRangeSelector";
+import type { DateRange } from "@/components/dateRangeSelectors/AdminDateRangeSelector";
+import type { QueryHistoryFilters } from "@/app/ee/admin/performance/query-history/filters";
 import { withRequestId, withDateRange } from "./utils";
 import {
   CHECK_QUERY_HISTORY_EXPORT_STATUS_URL,
@@ -17,11 +18,15 @@ import {
 } from "./types";
 import { cn } from "@opal/utils";
 import { SvgLoader, SvgPlayCircle } from "@opal/icons";
+interface KickoffCSVExportProps {
+  dateRange: DateRange;
+  filters?: QueryHistoryFilters;
+}
+
 export default function KickoffCSVExport({
   dateRange,
-}: {
-  dateRange: DateRange;
-}) {
+  filters,
+}: KickoffCSVExportProps) {
   const timerIdRef = useRef<null | number>(null);
   const retryCount = useRef<number>(0);
   const [, rerender] = useState<void>();
@@ -53,7 +58,7 @@ export default function KickoffCSVExport({
     toast.info(
       `Generating CSV report. Click the '${PREVIOUS_CSV_TASK_BUTTON_NAME}' button to see all jobs.`
     );
-    const response = await fetch(withDateRange(dateRange), {
+    const response = await fetch(withDateRange(dateRange, filters), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

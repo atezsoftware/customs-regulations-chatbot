@@ -399,13 +399,14 @@ export function QueryHistoryTable() {
           </div>
           <div className="flex flex-col gap-2 justify-center">
             <div className="flex flex-wrap items-center gap-2">
-              <KickoffCSVExport dateRange={dateRange} />
+              <KickoffCSVExport dateRange={dateRange} filters={filters} />
               <Button prominence="secondary" onClick={() => setShowModal(true)}>
                 {PREVIOUS_CSV_TASK_BUTTON_NAME}
               </Button>
             </div>
             <OpalText font="secondary-body" color="text-03">
-              CSV dışa aktarımı yalnızca tarih aralığını kullanır.
+              CSV raporu seçili tarih, kullanıcı, API anahtarı ve diğer
+              filtreleri kullanır.
             </OpalText>
           </div>
         </div>

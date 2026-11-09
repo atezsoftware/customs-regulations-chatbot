@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ee.onyx.background.task_name_builders import query_history_task_name
 from ee.onyx.db.query_history import (
     get_all_query_history_export_tasks,
+    get_export_page_of_chat_sessions,
     get_page_of_chat_sessions,
     get_total_filtered_chat_sessions_count,
 )
@@ -26,6 +27,7 @@ from ee.onyx.server.query_history.models import (
     ChatSessionSnapshot,
     MessageSnapshot,
     QueryHistoryExport,
+    QueryHistoryExportFilters,
     QueryHistoryIdentity,
 )
 from onyx.asv3.corpus_tools import CorpusBroker
@@ -33,6 +35,7 @@ from onyx.asv3.models import RunContext, RunStopped
 from onyx.auth.permissions import require_permission
 from onyx.background.celery.versioned_apps.client import app as client_app
 from onyx.background.task_utils import construct_query_history_report_name
+from onyx.configs.app_configs import JOB_TIMEOUT
 from onyx.configs.constants import (
     PUBLIC_API_TAGS,
     FileOrigin,
@@ -73,7 +76,6 @@ from onyx.server.query_and_chat.models import (
     SessionFeedbackResponse,
 )
 from onyx.server.settings.store import load_settings
-from onyx.utils.threadpool_concurrency import parallel_yield
 from shared_configs.contextvars import get_current_tenant_id
 
 router = APIRouter()
@@ -91,55 +93,29 @@ def ensure_query_history_is_enabled(
     return query_history_type
 
 
-def yield_snapshot_from_chat_session(
-    chat_session: ChatSession,
-    db_session: Session,
-) -> Generator[ChatSessionSnapshot | None]:
-    yield snapshot_from_chat_session(chat_session=chat_session, db_session=db_session)
-
-
 def fetch_and_process_chat_session_history(
     db_session: Session,
     start: datetime,
     end: datetime,
     limit: int | None = 500,  # noqa: ARG001
+    filters: QueryHistoryExportFilters | None = None,
 ) -> Generator[ChatSessionSnapshot]:
-    PAGE_SIZE = 100
-
-    page = 0
+    before: tuple[datetime, UUID] | None = None
     while True:
-        paged_chat_sessions = get_page_of_chat_sessions(
-            start_time=start,
-            end_time=end,
-            db_session=db_session,
-            page_num=page,
-            page_size=PAGE_SIZE,
+        sessions = get_export_page_of_chat_sessions(
+            db_session,
+            start,
+            end,
+            filters or QueryHistoryExportFilters(),
+            before=before,
         )
-
-        if not paged_chat_sessions:
+        if not sessions:
             break
-
-        paged_snapshots = parallel_yield(
-            [  # ty: ignore[invalid-argument-type]
-                yield_snapshot_from_chat_session(
-                    db_session=db_session,
-                    chat_session=chat_session,
-                )
-                for chat_session in paged_chat_sessions
-            ]
-        )
-
-        for snapshot in paged_snapshots:
-            if snapshot:
-                yield snapshot
-
-        # If we've fetched *less* than a `PAGE_SIZE` worth
-        # of data, we have reached the end of the
-        # pagination sequence; break.
-        if len(paged_chat_sessions) < PAGE_SIZE:
+        for chat in sessions:
+            yield ChatSessionSnapshot.for_export(chat)
+        before = sessions[-1].time_created, sessions[-1].id
+        if len(sessions) < 100:
             break
-
-        page += 1
 
 
 def snapshot_from_chat_session(
@@ -479,8 +455,14 @@ def start_query_history_export(
     db_session: Session = Depends(get_session),
     start: datetime | None = None,
     end: datetime | None = None,
+    filters: QueryHistoryExportFilters = Depends(),
 ) -> dict[str, str]:
-    ensure_query_history_is_enabled(disallowed=[QueryHistoryType.DISABLED])
+    mode = ensure_query_history_is_enabled(disallowed=[QueryHistoryType.DISABLED])
+    if mode == QueryHistoryType.ANONYMIZED and filters.requires_identity():
+        raise OnyxError(
+            OnyxErrorCode.INSUFFICIENT_PERMISSIONS,
+            "User and API key filters are unavailable in anonymized query history.",
+        )
 
     start = start or datetime.fromtimestamp(0, tz=timezone.utc)
     end = end or datetime.now(tz=timezone.utc)
@@ -508,11 +490,13 @@ def start_query_history_export(
         task_id=task_id,
         priority=OnyxCeleryPriority.MEDIUM,
         queue=OnyxCeleryQueues.CSV_GENERATION,
+        expires=JOB_TIMEOUT,
         kwargs={
             "start": start,
             "end": end,
             "start_time": start_time,
             "tenant_id": get_current_tenant_id(),
+            "filters": filters.model_dump(mode="json", exclude_none=True),
         },
     )
 

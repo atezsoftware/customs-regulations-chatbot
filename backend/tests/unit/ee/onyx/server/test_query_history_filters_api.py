@@ -27,6 +27,8 @@ def history_client(
     )
     app.dependency_overrides[current_user] = lambda: user
     app.dependency_overrides[get_session] = lambda: MagicMock()
+    monkeypatch.setattr(api.client_app, "send_task", MagicMock())
+    monkeypatch.setattr(api, "register_task", MagicMock())
     reads = MagicMock()
     reads.page.return_value = []
     reads.count.return_value = 0
@@ -138,3 +140,75 @@ def test_history_validates_filter_bounds(
         client.get("/api/admin/chat-session-history", params=params).status_code == 422
     )
     reads.page.assert_not_called()
+
+
+def test_export_dispatch_preserves_date_and_applied_filters(
+    history_client: tuple[TestClient, MagicMock, User],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _ = history_client
+    send = MagicMock()
+    monkeypatch.setattr(api.client_app, "send_task", send)
+    monkeypatch.setattr(api, "register_task", MagicMock())
+    response = client.post(
+        "/api/admin/query-history/start-export",
+        params={
+            "start": "2026-11-01T00:00:00Z",
+            "end": "2026-11-09T00:00:00Z",
+            "user_query": "Çağrı",
+            "api_key_query": "Tariff",
+            "q": "duty",
+            "feedback_type": "like",
+            "session_rating": 4,
+        },
+    )
+    assert response.status_code == 200
+    kwargs = send.call_args.kwargs
+    assert kwargs["expires"] > 0
+    assert kwargs["kwargs"]["filters"] == {
+        "user_query": "Çağrı",
+        "api_key_query": "Tariff",
+        "q": "duty",
+        "feedback_type": "like",
+        "session_rating": 4,
+    }
+    assert kwargs["kwargs"]["start"].isoformat() == "2026-11-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "identity", ["user_id", "user_email", "user_query", "api_key_query"]
+)
+def test_anonymized_export_rejects_identity_filters(
+    history_client: tuple[TestClient, MagicMock, User],
+    identity: str,
+) -> None:
+    client, reads, _ = history_client
+    reads.settings.return_value.query_history_type = QueryHistoryType.ANONYMIZED
+    value = str(uuid4()) if identity == "user_id" else "Tariff"
+    assert (
+        client.post(
+            "/api/admin/query-history/start-export", params={identity: value}
+        ).status_code
+        == 403
+    )
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"user_query": "x" * 256},
+        {"api_key_query": "x" * 256},
+        {"session_rating": 5},
+        {"user_id": "bad-id"},
+        {"q": "x" * 501},
+    ],
+)
+def test_export_validates_filter_bounds(
+    history_client: tuple[TestClient, MagicMock, User],
+    params: dict[str, str | int],
+) -> None:
+    client, _, _ = history_client
+    assert (
+        client.post("/api/admin/query-history/start-export", params=params).status_code
+        == 422
+    )
