@@ -30,15 +30,15 @@ from shared_configs.contextvars import get_current_tenant_id
 
 QUERIES = [
     'dahilde işleme rejimi',
-    'gümrük kıymetinde royalti ve lisans ödemeleri',
-    'ithalatta gözetim uygulaması',
-    'menşe şahadetnamesi ve EUR.1 dolaşım belgesi',
-    'gümrükte fazla çalışma ücretleri',
-    'geçici ithalat rejimi süre uzatımı',
-    'antrepo rejiminde eşyanın devri',
-    'geri gelen eşyanın gümrük vergisinden muafiyeti',
-    'İthal ettiğim ürünün gümrük vergisi eksik hesaplanmışsa sonradan hangi ceza uygulanır?',
-    'Yurt dışından getirilen makineyi Türkiye’de işledikten sonra yeniden ihraç etmek için hangi gümrük rejimi uygulanır?',
+    'gümrük kıymeti hesabında royalti ve lisans bedellerinin eklenmesi',
+    'ithalatta gözetim belgesinin aranması ve gözetim uygulaması',
+    'tercihli menşe ispatında EUR.1 dolaşım belgesi düzenlenmesi',
+    'gümrük işlemlerinde fazla çalışma ücretinin ödenmesi',
+    'geçici ithalat rejimindeki eşya için süre uzatılması',
+    'antrepodaki eşyanın başka bir kişiye devredilmesi',
+    'ihraç edilen eşyanın geri gelmesinde gümrük vergisi muafiyeti',
+    'Gümrük Kanunu ithalatta eksik vergi beyanı nedeniyle uygulanan cezalar',
+    'Yurt dışından gelen makineyi burada işleyip yeniden ihraç etmek istiyorum, hangi gümrük rejimini araştırmalıyım?',
 ]
 active: dict[str, Any] = {}
 lock = threading.Lock()
@@ -74,11 +74,27 @@ def observe_cache_read(*args: Any, **kwargs: Any) -> Any:
 
 search_utils.get_cached_query_embeddings = observe_cache_read
 original_rerank = OpenRouterRerankClient._post_json
+recent_calls: list[tuple[float, int]] = []
+pace_lock = threading.Lock()
+
+def pace_rerank(tokens: int) -> float:
+    began = time.monotonic()
+    with pace_lock:
+        while True:
+            now = time.monotonic()
+            recent_calls[:] = [item for item in recent_calls if now - item[0] < 65]
+            if not recent_calls or (len(recent_calls) < 4 and sum(item[1] for item in recent_calls) + tokens <= 35000):
+                recent_calls.append((now,tokens))
+                return time.monotonic()-began
+            wait = max(0.1,65-(now-recent_calls[0][0]))
+            emit('BENCH_PACING',{'wait_seconds':round(wait,2),'index':active.get('index')})
+            time.sleep(min(wait,30))
 
 def observe_rerank(self: OpenRouterRerankClient, *, url: str, api_key: str, request_payload: dict[str, Any]) -> Any:
     docs = request_payload.get('documents', [])
     q = request_payload.get('query', '')
     event: dict[str, Any] = {'model':request_payload.get('model'),'documents':len(docs), 'estimated_input_tokens_cl100k':sum(len(tokenizer.encode(q))+len(tokenizer.encode(doc)) for doc in docs)}
+    event['pacing_seconds']=round(pace_rerank(event['estimated_input_tokens_cl100k']),3)
     try:
         response = original_rerank(self, url=url, api_key=api_key, request_payload=request_payload)
         if isinstance(response, dict):
@@ -86,6 +102,7 @@ def observe_rerank(self: OpenRouterRerankClient, *, url: str, api_key: str, requ
         return response
     except Exception as exc:
         event['error_type'] = type(exc).__name__
+        event['retry_after_seconds'] = getattr(exc,'retry_after_seconds',None)
         raise
     finally:
         with lock: active.setdefault('rerank_events', []).append(event)
