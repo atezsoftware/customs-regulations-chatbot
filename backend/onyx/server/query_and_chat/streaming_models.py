@@ -171,7 +171,7 @@ class CitationInfo(BaseObj):
     def with_source_metadata(
         self, metadata: Mapping[str, object], *, link: str | None = None
     ) -> "CitationInfo":
-        """Expose the recorded location separately from a shared file-level title."""
+        """Use the source label for clients that render reference as their title."""
         heading = metadata.get("regulatory_heading_path")
         reference = (
             heading
@@ -182,14 +182,14 @@ class CitationInfo(BaseObj):
             else None
         )
         title = metadata.get("asv3_source_display_name")
+        display_title = self.display_title or (
+            title.strip() if isinstance(title, str) and title.strip() else None
+        )
         return self.model_copy(
             update={
-                "reference": reference,
+                "reference": display_title or reference,
                 "link": link,
-                "display_title": self.display_title
-                or (
-                    title.strip() if isinstance(title, str) and title.strip() else None
-                ),
+                "display_title": display_title,
             }
         )
 

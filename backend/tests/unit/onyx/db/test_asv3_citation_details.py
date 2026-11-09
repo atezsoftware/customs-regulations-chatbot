@@ -359,6 +359,7 @@ def test_owned_history_source_titles_include_each_chunks_article(
     result = response.messages[0]
     expected = [TITLE + " — Madde 18", TITLE + " — Geçici Madde 2"]
     assert [citation.display_title for citation in result.citation_info] == expected
+    assert [citation.reference for citation in result.citation_info] == expected
     assert [citation.text for citation in result.citation_info] == [
         item.text for item in originals
     ]

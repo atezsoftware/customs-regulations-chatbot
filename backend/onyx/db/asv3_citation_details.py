@@ -142,6 +142,7 @@ def _present_citations(
                 source_type=document.source_type,
                 preview_url=f"/api/asv3/citation/{message.id}/{number}",
                 display_title=presentation.display_title,
+                reference=presentation.display_title,
                 chunk_id=presentation.chunk_id,
                 text=presentation.text,
             )

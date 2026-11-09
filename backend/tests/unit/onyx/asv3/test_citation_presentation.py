@@ -197,6 +197,8 @@ def test_actual_publication_keeps_two_chunks_of_one_file_separate(
         assert citation.chunk_id == (original.id if enriched else None)
         assert citation.text == (original.text if enriched else None)
         assert citation.display_title == (title + " — Madde 142" if enriched else None)
+        if enriched:
+            assert citation.reference == citation.display_title
         assert citation.semantic_identifier is not None
         assert citation.semantic_identifier != title
     published = next(
