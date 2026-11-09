@@ -3,17 +3,20 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import BinaryExpression, ColumnElement, asc, desc, distinct, or_
-from sqlalchemy.orm import Session, contains_eager, joinedload
+from sqlalchemy.orm import Session, contains_eager, joinedload, raiseload, selectinload
 from sqlalchemy.sql import case, func, select
 from sqlalchemy.sql.expression import UnaryExpression, literal
 
 from ee.onyx.background.task_name_builders import QUERY_HISTORY_TASK_NAME_PREFIX
+from ee.onyx.server.query_history.models import QueryHistoryExportFilters
 from onyx.configs.constants import MessageType, QAFeedbackType
 from onyx.db.models import (
     ChatMessage,
     ChatMessageFeedback,
     ChatSession,
     ChatSessionFeedback,
+    Persona,
+    SearchDoc,
     TaskQueueState,
     User,
 )
@@ -213,6 +216,78 @@ def get_page_of_chat_sessions(
     )
 
     return db_session.scalars(stmt).unique().all()
+
+
+def get_export_page_of_chat_sessions(
+    db_session: Session,
+    start: datetime,
+    end: datetime,
+    filters: QueryHistoryExportFilters,
+    before: tuple[datetime, UUID] | None = None,
+    page_size: int = 100,
+) -> Sequence[ChatSession]:
+    conditions = _build_filter_conditions(
+        start_time=start,
+        end_time=end,
+        feedback_filter=filters.feedback_type,
+        **filters.model_dump(exclude={"feedback_type"}),
+    )
+    if before is not None:
+        created, session_id = before
+        conditions.append(
+            or_(
+                ChatSession.time_created < created,
+                (ChatSession.time_created == created) & (ChatSession.id > session_id),
+            )
+        )
+    stmt = (
+        select(ChatSession)
+        .where(*conditions)
+        .order_by(desc(ChatSession.time_created), ChatSession.id)
+        .limit(page_size)
+        .options(
+            joinedload(ChatSession.user),
+            joinedload(ChatSession.persona).load_only(Persona.id, Persona.name),
+            joinedload(ChatSession.session_feedback),
+            selectinload(ChatSession.messages).load_only(
+                ChatMessage.id,
+                ChatMessage.chat_session_id,
+                ChatMessage.parent_message_id,
+                ChatMessage.message,
+                ChatMessage.message_type,
+                ChatMessage.model_display_name,
+                ChatMessage.time_sent,
+                ChatMessage.publication_read,
+                raiseload=True,
+            ),
+            selectinload(ChatSession.messages).selectinload(
+                ChatMessage.chat_message_feedbacks
+            ),
+            selectinload(ChatSession.messages)
+            .selectinload(ChatMessage.search_docs)
+            .load_only(
+                SearchDoc.id,
+                SearchDoc.document_id,
+                SearchDoc.semantic_id,
+                SearchDoc.link,
+                SearchDoc.chunk_ind,
+                SearchDoc.source_type,
+                SearchDoc.is_internet,
+                SearchDoc.blurb,
+                SearchDoc.doc_metadata,
+                raiseload=True,
+            ),
+            raiseload("*"),
+        )
+        .execution_options(populate_existing=True)
+    )
+    sessions = db_session.scalars(stmt).unique().all()
+    for chat in sessions:
+        # Match the persisted transcript order, including regenerated responses.
+        chat.messages.sort(
+            key=lambda message: (message.parent_message_id or -1, message.id)
+        )
+    return sessions
 
 
 def fetch_chat_sessions_eagerly_by_time(

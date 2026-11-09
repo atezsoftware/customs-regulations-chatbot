@@ -407,3 +407,34 @@ def test_csv_worker_preserves_or_anonymizes_all_identity_fields(
             assert row["api_key_id"] == "17"
             assert row["api_key_name"] == "Shared Application"
             assert row["api_key_display"] == "dn_abcd...wxyz"
+
+
+def test_export_snapshot_keeps_identity_and_documents_without_transcript_enrichment() -> (
+    None
+):
+    chat = ChatSession(
+        id=uuid4(),
+        user=User(email="service@example.com"),
+        api_key_id=17,
+        api_key_name="Tariff",
+        external_user_name="Çağrı Şahin",
+        description="Duty",
+        persona_id=None,
+        persona=None,
+        time_created=datetime.now(timezone.utc),
+        onyxbot_flow=False,
+        messages=[
+            _message(1, MessageType.USER, "Duty?"),
+            _message(2, MessageType.ASSISTANT, "Answer"),
+        ],
+    )
+    with patch(
+        "ee.onyx.server.query_history.models.history_citation_info",
+        side_effect=AssertionError("CSV must not resolve previews"),
+    ):
+        snapshot = ChatSessionSnapshot.for_export(chat)
+    row = QuestionAnswerPairSnapshot.from_chat_session_snapshot(snapshot)[0].to_json()
+    assert row["user_name"] == "Çağrı Şahin"
+    assert row["api_key_name"] == "Tariff"
+    assert row["user_message"] == "Duty?"
+    assert row["ai_response"] == "Answer"

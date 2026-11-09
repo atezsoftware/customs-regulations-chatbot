@@ -174,3 +174,26 @@ test("late responses from a previous filter cannot replace the active search", a
   expect(screen.queryByText("Old question")).not.toBeInTheDocument();
   expect(screen.getByText("Current filtered question")).toBeInTheDocument();
 });
+
+test("Kickoff Export submits the selected dates, Tariff key and external user", async () => {
+  mockSearch =
+    "api_key_query=tariff&user_query=Ahmet%20Can%20Kara&start_time=2026-11-01T00%3A00%3A00Z&end_time=2026-11-09T00%3A00%3A00Z";
+  const user = setupUser();
+  const fetchSpy = jest
+    .spyOn(global, "fetch")
+    .mockImplementation(async (_url, init) =>
+      init?.method === "POST" ? ({ ok: false } as Response) : historyResponse()
+    );
+  render(<QueryHistoryTable />);
+  await screen.findByText("Saved question");
+  await user.click(screen.getByRole("button", { name: "Kickoff Export" }));
+  const request = fetchSpy.mock.calls.find(
+    ([, init]) => init?.method === "POST"
+  );
+  expect(request).toBeDefined();
+  const url = new URL(String(request![0]), "http://localhost");
+  expect(url.searchParams.get("start")).toBe("2026-11-01T00:00:00.000Z");
+  expect(url.searchParams.get("end")).toBe("2026-11-09T00:00:00.000Z");
+  expect(url.searchParams.get("api_key_query")).toBe("tariff");
+  expect(url.searchParams.get("user_query")).toBe("Ahmet Can Kara");
+});

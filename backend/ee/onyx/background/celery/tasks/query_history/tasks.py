@@ -3,9 +3,13 @@ import io
 from datetime import datetime
 
 from celery import Task, shared_task
+from pydantic import JsonValue
 
 from ee.onyx.server.query_history.api import fetch_and_process_chat_session_history
-from ee.onyx.server.query_history.models import QuestionAnswerPairSnapshot
+from ee.onyx.server.query_history.models import (
+    QueryHistoryExportFilters,
+    QuestionAnswerPairSnapshot,
+)
 from onyx.background.task_utils import construct_query_history_report_name
 from onyx.configs.app_configs import JOB_TIMEOUT
 from onyx.configs.constants import (
@@ -20,6 +24,8 @@ from onyx.db.tasks import (
     mark_task_as_finished_with_id,
     mark_task_as_started_with_id,
 )
+from onyx.error_handling.error_codes import OnyxErrorCode
+from onyx.error_handling.exceptions import OnyxError
 from onyx.file_store.file_store import get_default_file_store
 from onyx.server.settings.store import load_settings
 from onyx.utils.csv_utils import sanitize_csv_row
@@ -43,6 +49,7 @@ def export_query_history_task(
     start_time: datetime,
     # Need to include the tenant_id since the TenantAwareTask needs this
     tenant_id: str,  # noqa: ARG001
+    filters: dict[str, JsonValue] | None = None,
 ) -> None:
     if not self.request.id:
         raise RuntimeError("No task id defined for this task; cannot identify it")
@@ -62,13 +69,21 @@ def export_query_history_task(
                 task_id=task_id,
             )
 
+            export_filters = QueryHistoryExportFilters.model_validate(filters or {})
+            query_history_type = load_settings().query_history_type
+            if query_history_type == QueryHistoryType.DISABLED or (
+                query_history_type == QueryHistoryType.ANONYMIZED
+                and export_filters.requires_identity()
+            ):
+                raise OnyxError(OnyxErrorCode.INSUFFICIENT_PERMISSIONS)
+
             snapshot_generator = fetch_and_process_chat_session_history(
                 db_session=db_session,
                 start=start,
                 end=end,
+                filters=export_filters,
             )
 
-            query_history_type = load_settings().query_history_type
             for snapshot in snapshot_generator:
                 if query_history_type == QueryHistoryType.ANONYMIZED:
                     snapshot.anonymize_identity()
@@ -104,6 +119,9 @@ def export_query_history_task(
                     "start": start.isoformat(),
                     "end": end.isoformat(),
                     "start_time": start_time.isoformat(),
+                    "filters": export_filters.model_dump(
+                        mode="json", exclude_none=True
+                    ),
                 },
                 file_id=report_name,
             )

@@ -59,6 +59,22 @@ class QueryHistoryIdentity(BaseModel):
         self.api_key_display = None
 
 
+class QueryHistoryExportFilters(BaseModel):
+    user_id: UUID | None = None
+    user_email: str | None = Field(default=None, max_length=320)
+    user_query: str | None = Field(default=None, max_length=255)
+    api_key_query: str | None = Field(default=None, max_length=255)
+    q: str | None = Field(default=None, max_length=500)
+    feedback_type: QAFeedbackType | None = None
+    session_rating: int | None = Field(default=None, ge=1, le=4)
+
+    def requires_identity(self) -> bool:
+        return self.user_id is not None or any(
+            value and value.strip()
+            for value in (self.user_email, self.user_query, self.api_key_query)
+        )
+
+
 class AbridgedSearchDoc(BaseModel):
     """A subset of the info present in `SearchDoc`"""
 
@@ -91,13 +107,18 @@ class MessageSnapshot(BaseModel):
         message: ChatMessage,
         *,
         citation_documents: Mapping[int, DBSearchDoc] | None = None,
+        include_citation_details: bool = True,
     ) -> "MessageSnapshot":
         publication_available = message_publication_available(message)
-        citations, unresolved = history_citation_info(
-            message,
-            citation_documents
-            if citation_documents is not None
-            else {doc.id: doc for doc in message.search_docs},
+        citations, unresolved = (
+            history_citation_info(
+                message,
+                citation_documents
+                if citation_documents is not None
+                else {doc.id: doc for doc in message.search_docs},
+            )
+            if include_citation_details
+            else ([], [])
         )
         latest_messages_feedback_obj = (
             message.chat_message_feedbacks[-1]
@@ -240,6 +261,31 @@ class ChatSessionSnapshot(QueryHistoryIdentity):
     time_created: datetime
     flow_type: SessionType
     session_feedback: SessionFeedbackResponse | None = None
+
+    @classmethod
+    def for_export(cls, chat_session: ChatSession) -> "ChatSessionSnapshot":
+        """Use batch-loaded CSV fields without transcript-only enrichment."""
+        return cls(
+            id=chat_session.id,
+            **QueryHistoryIdentity.from_chat_session(chat_session).model_dump(),
+            name=chat_session.description,
+            messages=[
+                MessageSnapshot.build(message, include_citation_details=False)
+                for message in chat_session.messages
+                if message.message_type != MessageType.SYSTEM
+            ],
+            assistant_id=chat_session.persona_id,
+            assistant_name=chat_session.persona.name if chat_session.persona else None,
+            time_created=chat_session.time_created,
+            flow_type=SessionType.SLACK
+            if chat_session.onyxbot_flow
+            else SessionType.CHAT,
+            session_feedback=(
+                SessionFeedbackResponse.from_model(chat_session.session_feedback)
+                if chat_session.session_feedback
+                else None
+            ),
+        )
 
 
 class QuestionAnswerPairSnapshot(BaseModel):
