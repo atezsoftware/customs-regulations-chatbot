@@ -4,12 +4,13 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470]
+        options: [inspect, approve_462, approve_465, approve_470, dispatch_md_retry]
         default: inspect
 permissions:
   contents: read
 jobs:
   inspect:
+    if: inputs.operation != 'dispatch_md_retry'
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     steps:
@@ -97,3 +98,35 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
             backend/onyx/db/resume_amendment_approvals_309_310.py
+  dispatch_md_retry:
+    if: inputs.operation == 'dispatch_md_retry'
+    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Dispatch the exact pending DEV Markdown retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
+          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/md-retry-pods.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          expected=':ce378985446905476251ef966e16368ab641a3ca'
+          for pod in json.loads(Path('/tmp/md-retry-pods.json').read_text())['items']:
+              if pod['metadata'].get('deletionTimestamp') or pod['status'].get('phase')!='Running':
+                  continue
+              ready={item['name']:item.get('ready') for item in pod['status'].get('containerStatuses',[])}
+              for container in pod['spec']['containers']:
+                  if container['image'].endswith(expected) and ready.get(container['name']):
+                      Path('/tmp/md-retry-target').write_text(pod['metadata']['name']+'\t'+container['name']+'\n')
+                      raise SystemExit(0)
+          raise SystemExit('No Ready background container for the verified DEV commit')
+          PY
+          IFS=$'\t' read -r pod container < /tmp/md-retry-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/dispatch_md_navigation_retry_20261110.py
