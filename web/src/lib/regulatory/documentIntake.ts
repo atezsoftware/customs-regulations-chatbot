@@ -143,6 +143,19 @@ export interface DocumentIntakeBatch {
   publication_review_sha256?: string | null;
   active_document_count?: number;
   labeling_failed_count?: number;
+  background_labeling?: {
+    status:
+      | "pending"
+      | "waiting"
+      | "running"
+      | "completed"
+      | "failed"
+      | "cancelled";
+    total_chunks: number;
+    completed_chunks: number;
+    failed_chunks: number;
+    error: string | null;
+  } | null;
   error?: string | null;
   issues: AmendmentSourceIssue[];
   documents: IntakeDocument[];

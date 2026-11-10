@@ -1977,6 +1977,230 @@ test.each([
   }
 );
 
+test.each(["pending", "waiting", "running"] as const)(
+  "shows independent %s labeling progress while ready chunks remain read-only and approval stays available",
+  async (status) => {
+    const batch = {
+      ...readyBatch,
+      edit_review_sha256: "c".repeat(64),
+      background_labeling: {
+        status,
+        total_chunks: 8,
+        completed_chunks: 3,
+        failed_chunks: 1,
+        error: null,
+      },
+    };
+    const fetchMock = mockApi({ history: [batch] });
+    const user = setupUser();
+    render(<NewDocumentIntake />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Main regulation.html (ready)",
+      })
+    );
+    const progress = screen.getByRole("region", {
+      name: "Background labeling",
+    });
+    expect(within(progress).getByText(`Labeling: ${status}`)).toBeVisible();
+    expect(
+      within(progress).getByText("3 of 8 chunks labeled · 1 failed")
+    ).toBeVisible();
+    const root = screen.getByRole("region", { name: "Main regulation.html" });
+    expect(await within(root).findByLabelText("After text")).toHaveAttribute(
+      "readonly"
+    );
+    expect(
+      within(root).queryByRole("button", { name: "Save chunk changes" })
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Approve all new documents" })
+    ).toBeEnabled();
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url).endsWith("/approve"))
+    ).toBe(false);
+  }
+);
+
+test("shows canonical chunks read-only while legal metadata prepares and background labels wait", async () => {
+  const batch = {
+    ...readyBatch,
+    status: "preparing" as const,
+    stage: "metadata",
+    review_sha256: null,
+    edit_review_sha256: null,
+    background_labeling: {
+      status: "waiting" as const,
+      total_chunks: 2,
+      completed_chunks: 0,
+      failed_chunks: 0,
+      error: null,
+    },
+  };
+  mockApi({ history: [batch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Main regulation.html (preparing)",
+    })
+  );
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  expect(
+    await within(root).findByDisplayValue("Main document rule")
+  ).toHaveAttribute("readonly");
+  expect(
+    within(
+      screen.getByRole("region", { name: "Background labeling" })
+    ).getByText("Labeling: waiting")
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeDisabled();
+});
+
+test("retains failed background label details without blocking ready review and requires an explicit edit receipt", async () => {
+  const batch = {
+    ...readyBatch,
+    edit_review_sha256: null,
+    background_labeling: {
+      status: "failed" as const,
+      total_chunks: 2,
+      completed_chunks: 1,
+      failed_chunks: 1,
+      error: "Label provider could not finish the last chunk.",
+    },
+  };
+  mockApi({ history: [batch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const progress = screen.getByRole("region", { name: "Background labeling" });
+  expect(within(progress).getByText("Labeling: failed")).toBeVisible();
+  expect(
+    within(progress).getByText(
+      "Label provider could not finish the last chunk."
+    )
+  ).toBeVisible();
+  const root = screen.getByRole("region", { name: "Main regulation.html" });
+  expect(await within(root).findByLabelText("After text")).toHaveAttribute(
+    "readonly"
+  );
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeEnabled();
+});
+
+test("polls background labels after ready and refreshes chunk labels before enabling edits", async () => {
+  jest.useFakeTimers();
+  try {
+    const running = {
+      ...readyBatch,
+      edit_review_sha256: null,
+      background_labeling: {
+        status: "running" as const,
+        total_chunks: 2,
+        completed_chunks: 0,
+        failed_chunks: 0,
+        error: null,
+      },
+    };
+    const completed = {
+      ...running,
+      edit_review_sha256: "c".repeat(64),
+      background_labeling: {
+        ...running.background_labeling,
+        status: "completed" as const,
+        completed_chunks: 2,
+      },
+    };
+    const fetchMock = mockApi({
+      history: [running],
+      polledBatches: [running, completed],
+    });
+    const original = fetchMock.getMockImplementation()!;
+    let labelsReady = false;
+    const finalChunks = deferred<Response>();
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes("/documents/root/chunks?")) {
+        if (labelsReady) return finalChunks.promise;
+        return json({
+          items: [
+            {
+              id: "chunk-root",
+              position: 0,
+              text: "Main document rule",
+              heading_path: [],
+              chunk_metadata: { labels: labelsReady ? ["new label"] : [] },
+            },
+          ],
+          total: 1,
+          offset: 0,
+          limit: 10,
+        });
+      }
+      return original(input, init);
+    });
+    const user = setupUser({ advanceTimers: jest.advanceTimersByTime });
+    render(<NewDocumentIntake />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Main regulation.html (ready)",
+      })
+    );
+    const root = screen.getByRole("region", { name: "Main regulation.html" });
+    expect(await within(root).findByLabelText("After text")).toHaveAttribute(
+      "readonly"
+    );
+    expect(within(root).getByText("Labels pending.")).toBeVisible();
+    labelsReady = true;
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(2200);
+    });
+    expect(await screen.findByText("Labeling: completed")).toBeVisible();
+    expect(within(root).getByLabelText("After text")).toHaveAttribute(
+      "readonly"
+    );
+    await act(async () => {
+      finalChunks.resolve(
+        json({
+          items: [
+            {
+              id: "chunk-root",
+              position: 0,
+              text: "Main document rule",
+              heading_path: [],
+              chunk_metadata: { labels: ["new label"] },
+            },
+          ],
+          total: 1,
+          offset: 0,
+          limit: 10,
+        })
+      );
+    });
+    expect(await within(root).findByText("new label")).toBeVisible();
+    expect(within(root).getByLabelText("After text")).not.toHaveAttribute(
+      "readonly"
+    );
+    const settledCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes("/documents/root/chunks?")
+    ).length;
+    await act(async () => {
+      await jest.advanceTimersByTimeAsync(6000);
+    });
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/documents/root/chunks?")
+      ).length
+    ).toBe(settledCalls);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
 test("shows exact chunk failures and whole-file/import failure counts without treating failures as empty labels", async () => {
   const batch: DocumentIntakeBatch = {
     ...readyBatch,
