@@ -17,6 +17,12 @@ def is_current_intake_labeling_run(
     session: Session, run: RegulatoryLabelingRun
 ) -> bool:
     """Read under the caller's run lease; never lock a batch after its run."""
+    from onyx.db.document_intake_background_labels import (
+        is_current_background_label_run,
+    )
+
+    if is_current_background_label_run(session, run):
+        return True
     associations = session.execute(
         select(
             RegulatoryDocumentIntake.id,

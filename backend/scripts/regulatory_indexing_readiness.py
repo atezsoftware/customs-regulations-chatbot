@@ -80,10 +80,12 @@ _WORKER_QUEUE_CONTRACT: dict[str, frozenset[str]] = {
         }
     ),
     "celery_worker_regulatory_indexing": frozenset({"regulatory_indexing"}),
+    "celery_worker_regulatory_labeling": frozenset({"regulatory_labeling"}),
 }
 _WORKER_NODE_PREFIX = {
     "celery_worker_user_file_processing": "user_file_processing",
     "celery_worker_regulatory_indexing": "regulatory_indexing",
+    "celery_worker_regulatory_labeling": "regulatory_labeling",
 }
 _PROBE_TEXT = "regulatory indexing readiness probe"
 _BATCH_CANARY_MAX_WAIT_SECONDS = 120.0

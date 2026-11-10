@@ -163,7 +163,9 @@ def _job_boundary(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, list[Magi
     monkeypatch.setattr(
         metadata_job,
         "require_current_metadata_checkpoint",
-        lambda *_args, **_kwargs: SimpleNamespace(recipe_sha256=_RECIPE),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            recipe_sha256=_RECIPE, extraction_mode=None
+        ),
     )
     monkeypatch.setattr(metadata_job, "resolve_labeling_gateway", MagicMock())
     monkeypatch.setattr(metadata_job, "metadata_recipe_sha256", lambda: _RECIPE)

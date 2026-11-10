@@ -55,7 +55,7 @@ def enqueue_labeling_step(
         celery_app.send_task(
             OnyxCeleryTask.REGULATORY_LABELING_RUN_STEP,
             kwargs=kwargs,
-            queue=OnyxCeleryQueues.REGULATORY_INDEXING,
+            queue=OnyxCeleryQueues.REGULATORY_LABELING,
             priority=OnyxCeleryPriority.MEDIUM,
             expires=_delivery_expiry(countdown_seconds),
             countdown=countdown_seconds,
@@ -64,7 +64,7 @@ def enqueue_labeling_step(
         celery_app.send_task(
             OnyxCeleryTask.REGULATORY_LABELING_RUN_STEP,
             kwargs=kwargs,
-            queue=OnyxCeleryQueues.REGULATORY_INDEXING,
+            queue=OnyxCeleryQueues.REGULATORY_LABELING,
             priority=OnyxCeleryPriority.MEDIUM,
             expires=_delivery_expiry(countdown_seconds),
         )

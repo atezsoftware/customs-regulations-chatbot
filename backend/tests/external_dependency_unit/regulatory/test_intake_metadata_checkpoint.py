@@ -63,6 +63,7 @@ def ready_checkpoint(
     owner: tuple[User, DocumentSet, ModelConfiguration],
     *,
     title: str | None = None,
+    scoped: bool = False,
 ) -> tuple[
     RegulatoryDocumentIntake,
     list[RegulatoryDocumentIntakeFile],
@@ -73,6 +74,8 @@ def ready_checkpoint(
     if title is not None:
         _article.text = title
     batch.stage = "metadata"
+    if scoped:
+        batch.metadata_extraction_mode = "scoped_v1"
     model = owner[2]
     binding = LabelingProviderBinding(
         model_configuration_id=model.id,
@@ -89,11 +92,45 @@ def ready_checkpoint(
         batch.id,
         token,
         provider_binding=binding,
-        recipe_sha256=metadata_recipe_sha256(),
+        recipe_sha256=metadata_recipe_sha256("scoped_v1")
+        if scoped
+        else metadata_recipe_sha256(),
         capture=True,
     )
     session.flush()
     return batch, members, token, binding
+
+
+def test_scoped_checkpoint_freezes_one_request_per_document_and_rejects_mode_change(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+) -> None:
+    batch, members, token, binding = ready_checkpoint(
+        intake_session, intake_owner, scoped=True
+    )
+    saved = MetadataCheckpoint.model_validate(batch.metadata_checkpoint)
+    assert saved.extraction_mode == "scoped_v1"
+    assert set(saved.request_hashes) == {str(member.id) for member in members}
+    assert all(len(hashes) == 1 for hashes in saved.request_hashes.values())
+    current = require_current_metadata_checkpoint(
+        intake_session,
+        batch.id,
+        token,
+        provider_binding=binding,
+        recipe_sha256=metadata_recipe_sha256("scoped_v1"),
+        capture=False,
+    )
+    assert current == saved
+    batch.metadata_extraction_mode = None
+    with pytest.raises(intake.IntakeConflictError, match="changed"):
+        require_current_metadata_checkpoint(
+            intake_session,
+            batch.id,
+            token,
+            provider_binding=binding,
+            recipe_sha256=metadata_recipe_sha256(),
+            capture=False,
+        )
 
 
 @pytest.mark.parametrize(

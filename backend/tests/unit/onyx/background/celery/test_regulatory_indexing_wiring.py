@@ -171,6 +171,7 @@ def test_production_lite_scheduler_contains_only_recovery_and_queue_monitoring()
         publication_queue_name(),
         REGULATORY_AMENDMENT_QUEUE,
         OnyxCeleryQueues.REGULATORY_INDEXING,
+        OnyxCeleryQueues.REGULATORY_LABELING,
         OnyxCeleryQueues.MONITORING,
         OnyxCeleryQueues.CHECKPOINT_CLEANUP,
     }
@@ -975,6 +976,7 @@ def test_production_lite_health_requires_every_worker_including_regulatory_index
         "celery_worker_regulatory_benchmark",
         "celery_worker_user_file_processing",
         "celery_worker_regulatory_indexing",
+        "celery_worker_regulatory_labeling",
         "celery_worker_light",
         "celery_worker_monitoring",
         "celery_worker_csv_generation",
@@ -1329,11 +1331,12 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     forbidden_queues = contract["forbidden_queues"]
     assert isinstance(forbidden_queues, list)
 
-    assert contract["supervisor_process_count"] == 9
+    assert contract["supervisor_process_count"] == 10
     assert set(workers) == {
         "celery_worker_regulatory_benchmark",
         "celery_worker_user_file_processing",
         "celery_worker_regulatory_indexing",
+        "celery_worker_regulatory_labeling",
         "celery_worker_light",
         "celery_worker_monitoring",
         "celery_worker_csv_generation",
@@ -1345,6 +1348,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
         "user_file_port",
     ]
     assert workers["celery_worker_regulatory_indexing"] == ["regulatory_indexing"]
+    assert workers["celery_worker_regulatory_labeling"] == ["regulatory_labeling"]
     assert workers["celery_worker_regulatory_benchmark"] == [
         "regulatory_benchmark",
         "regulatory_amendment",
@@ -1437,7 +1441,7 @@ def test_canonical_runbook_matches_executable_production_lite_topology() -> None
     handoff = _HANDOFF_PATH.read_text(encoding="utf-8")
     for process_name in supervisor_programs:
         assert f"`{process_name}`" in handoff
-    assert "tam olarak altı worker, iki ayrık Beat ve bir log yönlendirici" in handoff
+    assert "tam olarak yedi worker, iki ayrık Beat ve bir log yönlendirici" in handoff
     assert "API ve background için birlikte `true`" in handoff
     assert "Admin’de seçili Vertex modelinin service-account JSON’u" in handoff
     assert "REGULATORY_INDEXING_GCS_URI" not in handoff

@@ -38,6 +38,9 @@ class MetadataCheckpointPredecessor(BaseModel):
 class MetadataCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     version: Literal[1] = 1
+    extraction_mode: Literal["scoped_v1"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     recipe_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_binding: dict[str, Any]
     source_snapshot: dict[str, Any]
@@ -56,6 +59,7 @@ class MetadataCheckpoint(BaseModel):
         source_snapshot: dict[str, Any],
         request_hashes: dict[str, list[str]],
         predecessor: "MetadataCheckpoint | None" = None,
+        extraction_mode: Literal["scoped_v1"] | None = None,
     ) -> "MetadataCheckpoint":
         payload: dict[str, Any] = {
             "version": 1,
@@ -64,6 +68,8 @@ class MetadataCheckpoint(BaseModel):
             "source_snapshot": source_snapshot,
             "request_hashes": request_hashes,
         }
+        if extraction_mode is not None:
+            payload["extraction_mode"] = extraction_mode
         if predecessor is not None:
             payload["predecessor"] = {
                 "version": predecessor.version,

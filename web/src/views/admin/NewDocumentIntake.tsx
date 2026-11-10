@@ -64,15 +64,30 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The request failed.";
 }
 
+function backgroundLabelsPending(batch: DocumentIntakeBatch): boolean {
+  return ["pending", "waiting", "running"].includes(
+    batch.background_labeling?.status ?? ""
+  );
+}
+
+function chunkEditReceipt(batch: DocumentIntakeBatch): string | null {
+  if (batch.background_labeling) return batch.edit_review_sha256 ?? null;
+  return (
+    batch.edit_review_sha256 ??
+    (batch.status === "ready" ? batch.review_sha256 : null)
+  );
+}
+
 function canReviewChunks(batch: DocumentIntakeBatch): boolean {
   const terminalReview =
     ["ready", "partial"].includes(batch.status) ||
     (batch.status === "failed" &&
       ["metadata", "chunking"].includes(batch.stage));
-  const receipt =
-    batch.edit_review_sha256 ??
-    (batch.status === "ready" ? batch.review_sha256 : null);
-  return terminalReview && Boolean(receipt);
+  return (
+    terminalReview &&
+    !backgroundLabelsPending(batch) &&
+    Boolean(chunkEditReceipt(batch))
+  );
 }
 
 function labelText(value: unknown): string {
@@ -200,9 +215,10 @@ function DocumentPreview({
   const sourceEvidence = document.publication_disposition === "source_evidence";
   const [expanded, setExpanded] = useState(!sourceEvidence);
   const [offset, setOffset] = useState(0);
-  const editReceipt =
-    batch.edit_review_sha256 ??
-    (batch.status === "ready" ? batch.review_sha256 : null);
+  const editReceipt = chunkEditReceipt(batch);
+  const labelsPending = batch.background_labeling
+    ? backgroundLabelsPending(batch)
+    : batch.status === "preparing";
   const onDraftChange = useCallback(
     (chunkId: string, draft: IntakeChunkReviewDraft | null) =>
       onChunkDraftChange(document.id, chunkId, draft),
@@ -217,7 +233,7 @@ function DocumentPreview({
     cardRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
     cardRef.current?.focus({ preventScroll: true });
   }, [navigation, document.id]);
-  const { data, error } = useSWR(
+  const { data, error, isLoading } = useSWR(
     expanded && document.chunk_count > 0
       ? [
           "intake-chunks",
@@ -225,6 +241,7 @@ function DocumentPreview({
           document.id,
           editReceipt,
           batch.review_sha256,
+          batch.background_labeling?.status,
           draftEpoch,
           offset,
         ]
@@ -232,7 +249,10 @@ function DocumentPreview({
     () => getDocumentIntakeChunks(batch.id, document.id, offset),
     {
       keepPreviousData: true,
-      refreshInterval: batch.status === "preparing" ? 1500 : 0,
+      refreshInterval:
+        batch.status === "preparing" || backgroundLabelsPending(batch)
+          ? 1500
+          : 0,
     }
   );
   const parent = batch.documents.find(
@@ -350,10 +370,7 @@ function DocumentPreview({
       {!sourceEvidence && (
         <>
           <Text font="secondary-action">File labels</Text>
-          <Labels
-            value={document.labels}
-            pending={batch.status === "preparing"}
-          />
+          <Labels value={document.labels} pending={labelsPending} />
         </>
       )}
       {document.error && (
@@ -400,7 +417,7 @@ function DocumentPreview({
                 documentName={document.display_name}
                 sourceUrl={document.source_url}
                 reviewSha256={editReceipt}
-                editable={canReviewChunks(batch)}
+                editable={canReviewChunks(batch) && !isLoading && !error}
                 disabled={
                   busy ||
                   Array.from(dirtyKeys).some(
@@ -474,7 +491,7 @@ function DocumentPreview({
                 <Text font="secondary-action">Chunk labels</Text>
                 <Labels
                   value={chunk.chunk_metadata.labels}
-                  pending={batch.status === "preparing"}
+                  pending={labelsPending}
                   failed={hasIntakeLabelingProblem(chunk)}
                 />
                 <Text
@@ -633,12 +650,14 @@ export default function NewDocumentIntake() {
     initialBatch ? ["document-intake-batch", initialBatch.id] : null,
     () => getDocumentIntakeBatch(initialBatch!.id),
     {
-      refreshInterval: (value) =>
-        ["preparing", "approving"].includes(
-          (value ?? initialBatch)?.status ?? ""
-        )
+      refreshInterval: (value) => {
+        const current = value ?? initialBatch;
+        return current &&
+          (["preparing", "approving"].includes(current.status) ||
+            backgroundLabelsPending(current))
           ? 2000
-          : 0,
+          : 0;
+      },
     }
   );
   const batch = batchData?.id === initialBatch?.id ? batchData : initialBatch;
@@ -1120,6 +1139,31 @@ export default function NewDocumentIntake() {
           >{`New documents: ${batch.status}`}</Text>
           <Text font="secondary-body">{batch.stage.replaceAll("_", " ")}</Text>
           <Text font="main-ui-action">{`${batch.active_document_count ?? activeDocuments.length} new files · ${activeDocuments.reduce((total, document) => total + document.chunk_count, 0)} added chunks`}</Text>
+          {batch.background_labeling && (
+            <section
+              aria-label="Background labeling"
+              className="flex flex-col gap-2 rounded-08 border border-border-02 p-3"
+            >
+              <Text font="main-ui-action">{`Labeling: ${batch.background_labeling.status}`}</Text>
+              <Text font="secondary-body">{`${batch.background_labeling.completed_chunks} of ${batch.background_labeling.total_chunks} chunks labeled · ${batch.background_labeling.failed_chunks} failed`}</Text>
+              <Text as="p" font="secondary-body" color="text-03">
+                Labeling runs separately from legal metadata review. Approval
+                becomes available when the legal metadata review is ready.
+              </Text>
+              {backgroundLabelsPending(batch) && (
+                <Text as="p" font="secondary-body" color="text-03">
+                  Chunks can be read while preparation continues. Chunk editing
+                  becomes available after labeling finishes and a fresh review
+                  version is ready.
+                </Text>
+              )}
+              {batch.background_labeling.error && (
+                <Text as="p" color="status-error-05">
+                  {batch.background_labeling.error}
+                </Text>
+              )}
+            </section>
+          )}
           {sourceEvidenceDocuments.length > 0 && (
             <Text font="secondary-body" color="text-03">
               {`${sourceEvidenceDocuments.length} source renditions retained as evidence · excluded from new legislation`}

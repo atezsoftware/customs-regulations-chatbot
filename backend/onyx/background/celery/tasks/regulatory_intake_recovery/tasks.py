@@ -26,6 +26,7 @@ def recover_document_intakes(
     if not config.REGULATORY_ANNEX_WORKER_ENABLED:
         return
 
+    from onyx.db.document_intake_background_labels import resume_background_labeling
     from onyx.db.document_intake_labeling_recovery import (
         reconcile_terminal_intake_labeling,
     )
@@ -47,6 +48,9 @@ def recover_document_intakes(
         )
         run_ids = resume_waiting_intake_labeling(
             session, environment=environment, limit=10
+        )
+        run_ids.extend(
+            resume_background_labeling(session, environment=environment, limit=10)
         )
         session.commit()
 

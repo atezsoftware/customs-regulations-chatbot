@@ -109,6 +109,9 @@ POSTGRES_CELERY_WORKER_REGULATORY_ANNEX_APP_NAME = "celery_regulatory_annex"
 POSTGRES_CELERY_WORKER_REGULATORY_INDEXING_APP_NAME = (
     "celery_worker_regulatory_indexing"
 )
+POSTGRES_CELERY_WORKER_REGULATORY_LABELING_APP_NAME = (
+    "celery_worker_regulatory_labeling"
+)
 POSTGRES_PERMISSIONS_APP_NAME = "permissions"
 POSTGRES_UNKNOWN_APP_NAME = "unknown"
 
@@ -489,6 +492,7 @@ class OnyxCeleryQueues:
     REGULATORY_BENCHMARK = "regulatory_benchmark"
     REGULATORY_AMENDMENT = "regulatory_amendment"
     REGULATORY_INDEXING = "regulatory_indexing"
+    REGULATORY_LABELING = "regulatory_labeling"
 
     ELASTICSEARCH_MIGRATION = "elasticsearch_migration"
 

@@ -178,6 +178,8 @@ def load_intake_edit_review_context(
     session: Session, batch: RegulatoryDocumentIntake
 ) -> IntakeEditReviewContext | None:
     """Load eligible scalar edit inputs before current canonical validation."""
+    from onyx.db.document_intake_background_labels import uses_background_labels
+
     metadata_review = batch.status == "failed" and batch.stage in {
         "metadata",
         "chunking",
@@ -196,7 +198,11 @@ def load_intake_edit_review_context(
     if (
         run is None
         or run.status not in _TERMINAL_LABELING_STATUSES
-        or (batch.status == "ready" and run.status != "completed")
+        or (
+            batch.status == "ready"
+            and run.status != "completed"
+            and not uses_background_labels(batch)
+        )
         or labeling.get_active_run_id(session, batch.document_set_id) is not None
         or (
             run.lease_token is not None
@@ -765,6 +771,12 @@ def _edit_intake_chunks(
             refresh_metadata=previous_input != current_input,
         )
     if prelabel or context_changed or pending is not None:
+        from onyx.db.document_intake_background_labels import uses_background_labels
+
+        if uses_background_labels(batch):
+            batch.background_label_status = "cancelled"
+            batch.background_label_source_sha256 = None
+            batch.background_label_error = None
         batch.status, batch.stage, batch.error = "preparing", "chunking", None
         batch.review_sha256, batch.lease_token, batch.lease_expires_at = (
             None,
@@ -780,6 +792,18 @@ def _edit_intake_chunks(
             documents=documents,
             binding=binding,
         )
+        session.flush()
+        return None
+    from onyx.db.document_intake_background_labels import (
+        schedule_background_labels,
+        uses_background_labels,
+        validate_legal_source,
+    )
+
+    if uses_background_labels(batch):
+        validate_legal_source(session, batch)
+        batch.status, batch.stage, batch.error = "ready", "review", None
+        schedule_background_labels(session, batch)
         session.flush()
         return None
     assert previous is not None

@@ -1,10 +1,10 @@
 """Short metadata lease transactions and an execution mutex across provider calls."""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -29,6 +29,7 @@ from onyx.db.models import (
     UserFileProjectionRepair,
 )
 from onyx.file_processing.original_ingestion import OriginalIngestionReceipt
+from onyx.regulatory.document_intake.metadata import MetadataChunk
 from onyx.regulatory.document_intake.metadata_checkpoint import (
     MetadataCheckpoint,
     MetadataLeaseLost,
@@ -125,8 +126,6 @@ def _source_snapshot(
     )
     from onyx.db.document_intake_reprepare import reprepared_original_receipt
     from onyx.regulatory.document_intake.metadata import (
-        TARGETS_PER_REQUEST,
-        build_metadata_request,
         metadata_input_hash,
     )
 
@@ -267,16 +266,7 @@ def _source_snapshot(
         requests[str(member.id)] = (
             []
             if for_review or str(member.id) in completed
-            else [
-                build_metadata_request(
-                    chunks,
-                    [
-                        chunk.chunk_id
-                        for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]
-                    ],
-                ).request_hash
-                for offset in range(0, len(chunks), TARGETS_PER_REQUEST)
-            ]
+            else _metadata_request_hashes(batch, chunks)
         )
         documents[str(member.id)] = {
             "user_file_id": str(file.id),
@@ -318,6 +308,39 @@ def _source_snapshot(
     )
 
 
+def metadata_extraction_mode(
+    batch: RegulatoryDocumentIntake,
+) -> Literal["scoped_v1"] | None:
+    return (
+        "scoped_v1"
+        if getattr(batch, "metadata_extraction_mode", None) == "scoped_v1"
+        else None
+    )
+
+
+def _metadata_request_hashes(
+    batch: RegulatoryDocumentIntake, chunks: Sequence[MetadataChunk]
+) -> list[str]:
+    from onyx.regulatory.document_intake.metadata import (
+        TARGETS_PER_REQUEST,
+        build_metadata_request,
+    )
+
+    if metadata_extraction_mode(batch) is not None:
+        from onyx.regulatory.document_intake.metadata_scopes import (
+            build_scoped_metadata_request,
+        )
+
+        return [build_scoped_metadata_request(chunks).request_hash]
+    return [
+        build_metadata_request(
+            chunks,
+            [chunk.chunk_id for chunk in chunks[offset : offset + TARGETS_PER_REQUEST]],
+        ).request_hash
+        for offset in range(0, len(chunks), TARGETS_PER_REQUEST)
+    ]
+
+
 def _validated_checkpoint(
     session: Session,
     batch: RegulatoryDocumentIntake,
@@ -352,13 +375,15 @@ def _validated_checkpoint(
             provider_binding=binding.model_dump(mode="json"),
             source_snapshot=source,
             request_hashes=requests,
+            extraction_mode=metadata_extraction_mode(batch),
         )
         if batch.metadata_checkpoint is None and capture:
             batch.metadata_checkpoint = current.model_dump(mode="json")
         saved = MetadataCheckpoint.model_validate(batch.metadata_checkpoint)
         saved.validate_checksum()
         if (
-            saved.provider_binding != current.provider_binding
+            saved.extraction_mode != current.extraction_mode
+            or saved.provider_binding != current.provider_binding
             or saved.source_snapshot != current.source_snapshot
             or set(saved.request_hashes) != set(requests)
             or any(
@@ -381,6 +406,7 @@ def _validated_checkpoint(
                 source_snapshot=current.source_snapshot,
                 request_hashes=current.request_hashes,
                 predecessor=saved,
+                extraction_mode=current.extraction_mode,
             )
             batch.metadata_checkpoint = saved.model_dump(mode="json")
     except (ValidationError, ValueError) as error:
@@ -417,7 +443,13 @@ def rebase_metadata_checkpoint_for_retry(
         user=session.get_one(User, batch.created_by),
     )
     _validated_checkpoint(
-        session, batch, binding, metadata_recipe_sha256(), rebase_recipe=True
+        session,
+        batch,
+        binding,
+        metadata_recipe_sha256("scoped_v1")
+        if metadata_extraction_mode(batch)
+        else metadata_recipe_sha256(),
+        rebase_recipe=True,
     )
 
 
@@ -453,4 +485,11 @@ def validate_metadata_recovery_source(
         )
     except ValueError as error:
         raise intake.IntakeConflictError(str(error)) from error
-    _validated_checkpoint(session, batch, binding, metadata_recipe_sha256())
+    _validated_checkpoint(
+        session,
+        batch,
+        binding,
+        metadata_recipe_sha256("scoped_v1")
+        if metadata_extraction_mode(batch)
+        else metadata_recipe_sha256(),
+    )

@@ -9199,6 +9199,25 @@ class RegulatoryDocumentIntake(Base):
     metadata_checkpoint: Mapped[dict[str, Any] | None] = mapped_column(
         PGJSONB(none_as_null=True), nullable=True
     )
+    metadata_extraction_mode: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    background_labeling_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    background_label_status: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    background_label_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    background_label_source_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    background_label_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    background_label_next_retry_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_recovery_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
@@ -9218,6 +9237,18 @@ class RegulatoryDocumentIntake(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "metadata_extraction_mode IS NULL OR metadata_extraction_mode = 'scoped_v1'",
+            name="ck_intake_metadata_extraction_mode",
+        ),
+        CheckConstraint(
+            "background_label_status IS NULL OR background_label_status IN ('pending','waiting','running','completed','failed','cancelled')",
+            name="ck_intake_background_label_status",
+        ),
+        CheckConstraint(
+            "background_label_attempts BETWEEN 0 AND 3",
+            name="ck_intake_background_label_attempts",
+        ),
         CheckConstraint(
             "metadata_recovery_count BETWEEN 0 AND 3",
             name="ck_regulatory_intake_metadata_recovery_count",

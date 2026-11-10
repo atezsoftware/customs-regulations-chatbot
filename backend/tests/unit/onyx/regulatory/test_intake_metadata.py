@@ -401,7 +401,9 @@ def test_metadata_job_uses_bounded_240_second_gateway_with_complete_context(
     monkeypatch.setattr(
         metadata_job,
         "require_current_metadata_checkpoint",
-        lambda *_args, **_kwargs: SimpleNamespace(recipe_sha256="b" * 64),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            recipe_sha256="b" * 64, extraction_mode=None
+        ),
     )
     monkeypatch.setattr(
         metadata_job.repository,

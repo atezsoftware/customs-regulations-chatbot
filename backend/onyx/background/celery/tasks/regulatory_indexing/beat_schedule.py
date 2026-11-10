@@ -82,7 +82,7 @@ PRODUCTION_LITE_TASK_TEMPLATES: tuple[dict[str, Any], ...] = (
         "options": {
             "priority": OnyxCeleryPriority.LOW,
             "expires": 5 * 60,
-            "queue": OnyxCeleryQueues.REGULATORY_INDEXING,
+            "queue": OnyxCeleryQueues.REGULATORY_LABELING,
         },
     },
     {
