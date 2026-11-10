@@ -1,0 +1,98 @@
+{
+  "chunks": [
+    {
+      "chunk_id": "rc_eea4c93655f3d4aca4d8f416e2e865e9e2d10eff",
+      "chunk_type": "paragraph",
+      "heading_path": [
+        "Amaç",
+        "MADDE 1",
+        "(1) Bu Yönetmeliğin amacı"
+      ],
+      "structural_metadata": {
+        "appendix_label": null,
+        "article_no": "1",
+        "article_title": null,
+        "clause_label": null,
+        "document_date": null,
+        "document_number": null,
+        "document_type": "yonetmelik",
+        "paragraph_no": "1",
+        "subclause_label": null,
+        "table_index": null,
+        "table_row_index": null
+      },
+      "text": "MADDE 1-\n(1) Bu Yönetmeliğin amacı; kamuya açık karayoluyla yapılacak tehlikeli madde taşımacılığı faaliyetlerinin; insan sağlığına, diğer canlı varlıklara ve çevreye zarar vermeden güvenli, emniyetli ve düzenli bir şekilde yürütülmesi amacıyla bu faaliyetlerde alıcı, boşaltan, paketleyen, yükleyen, dolduran, gönderen, tank konteyner/portatif tank işletmecisi ile taşımacı olarak yer alanların, tehlikeli madde güvenlik danışmanlarının, tehlikeli madde güvenlik danışmanlığı kuruluşlarının ve tehlikeli maddeleri taşıyan taşıt sürücülerinin sorumluluk ve yükümlülüklerine ilişkin usul ve esasları belirlemektir."
+    },
+    {
+      "chunk_id": "rc_5bf66f92cfe5555eb286bbb5337410de7ea186ba",
+      "chunk_type": "clause",
+      "heading_path": [
+        "Amaç",
+        "TEHLİKELİ MADDELERİN KARAYOLUYLA TAŞINMASI HAKKINDA YÖNETMELİK",
+        "YÖNETMELİK",
+        "g) Dolduran: Tehlikeli maddeleri"
+      ],
+      "structural_metadata": {
+        "appendix_label": null,
+        "article_no": null,
+        "article_title": null,
+        "clause_label": "g",
+        "document_date": null,
+        "document_number": null,
+        "document_type": "yonetmelik",
+        "paragraph_no": null,
+        "subclause_label": null,
+        "table_index": null,
+        "table_row_index": null
+      },
+      "text": "g) Dolduran: Tehlikeli maddeleri; sabit tanka (tanker), sökülebilir tanka, portatif tanka, bir tüplü gaz tankerine, çok elemanlı gaz konteynerine (MEGC) veya tank konteynere ve/veya dökme yük taşıması için bir araca veya büyük konteynere veya küçük konteynerlere dolduran herhangi bir işletmeyi,"
+    }
+  ],
+  "response": {
+    "chunks": [
+      {
+        "chunk_id": "rc_eea4c93655f3d4aca4d8f416e2e865e9e2d10eff",
+        "fields": [
+          {
+            "field": "document_title",
+            "value": "TEHLİKELİ MADDELERİN KARAYOLUYLA TAŞINMASI HAKKINDA YÖNETMELİK",
+            "evidence_id": "3a5472a5bd3aef854740898026d7eada37fbebc952b7f479415667a918687c97",
+            "basis": "explicit",
+            "reference_evidence_id": ""
+          },
+          {
+            "field": "document_type",
+            "value": "YÖNETMELİK",
+            "evidence_id": "90041695776dbb572770deff7f83fe5bb000f51503e8788ac1ef918c00219595",
+            "basis": "explicit",
+            "reference_evidence_id": ""
+          },
+          {
+            "field": "article_no",
+            "value": "1",
+            "evidence_id": "d39b3c6746bbf79d2ca623794ff42a259fd59390f9e4de410e6052a9c52e095d",
+            "basis": "explicit",
+            "reference_evidence_id": ""
+          },
+          {
+            "field": "article_title",
+            "value": "Amaç",
+            "evidence_id": "2748a7be66d4b908befd07f4569b6401f63bf9c5a50e19fc7649eaf924b68c3d",
+            "basis": "explicit",
+            "reference_evidence_id": ""
+          },
+          {
+            "field": "paragraph_no",
+            "value": "1",
+            "evidence_id": "1330ec8473bca7819d3b9597682ac58ad005a4b868970229ee6a3f8982719452",
+            "basis": "explicit",
+            "reference_evidence_id": ""
+          }
+        ]
+      }
+    ],
+    "warnings": [
+      "Could not resolve validity_start_date because the publication date is not specified in the document text, and relative publication commencement cannot be resolved without a reference publication date."
+    ]
+  }
+}

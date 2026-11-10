@@ -892,7 +892,7 @@ def build_metadata_body_scope_repair_request(
     cached_repair_request_hash: str | None = None,
     prior_feedback: Mapping[str, object] | None = None,
 ) -> VertexBatchRequest | None:
-    """Explain rejected date scopes without changing or resolving catalog IDs."""
+    """Explain rejected body-only scopes without changing or resolving catalog IDs."""
     if (
         cached_repair_request_hash is not None
         and re.fullmatch(r"[0-9a-f]{64}", cached_repair_request_hash) is None
@@ -925,19 +925,26 @@ def build_metadata_body_scope_repair_request(
     source_ids = {source.chunk_id for source in sources}
     errors: list[dict[str, object]] = []
     total = 0
+    non_date_scope = False
     for target in result.chunks:
         if target.chunk_id not in target_ids or target.chunk_id not in source_ids:
             continue
         for fact in target.fields:
-            if fact.field not in DATE_FIELDS:
-                continue
             for slot, evidence_id in (
                 ("evidence_id", fact.evidence_id),
                 ("reference_evidence_id", fact.reference_evidence_id),
             ):
+                if (
+                    slot == "evidence_id" and fact.field in HEADING_EVIDENCE_FIELDS
+                ) or (
+                    slot == "reference_evidence_id"
+                    and fact.basis != "relative_publication"
+                ):
+                    continue
                 evidence = by_id.get(evidence_id)
                 if evidence is None or evidence.scope != "heading":
                     continue
+                non_date_scope |= fact.field not in DATE_FIELDS
                 total += 1
                 if len(errors) >= 8:
                     continue
@@ -967,7 +974,11 @@ def build_metadata_body_scope_repair_request(
                         ).hexdigest(),
                         "rejected_scope": "heading",
                         "required_scope": "body",
-                        "error": "date_or_publication_reference_requires_body_evidence",
+                        "error": (
+                            "date_or_publication_reference_requires_body_evidence"
+                            if fact.field in DATE_FIELDS
+                            else "field_requires_body_evidence"
+                        ),
                         "available_evidence": [
                             entry.model_dump(mode="json") for entry in body[:8]
                         ],
@@ -995,6 +1006,22 @@ def build_metadata_body_scope_repair_request(
         ),
         "errors": errors,
     }
+    if non_date_scope:
+        feedback["body_scope_feedback"].update(
+            version=2,
+            instruction=(
+                "These known IDs were rejected because their scope is heading. "
+                "document_type, document_number, publication_number, table indexes, "
+                "all dates and publication references require BODY evidence. "
+                "A filename or heading is not body evidence for these fields. "
+                "Select existing body evidence IDs from the unchanged complete "
+                "document/catalog yourself; the same-source candidates below may "
+                "be empty or may not support the fact. Do not convert heading IDs "
+                "into body IDs. Recheck each fact's wording, own-document identity, "
+                "legal target and basis. Omit unsupported facts; return every "
+                "original target exactly once. All strict checks still apply."
+            ),
+        )
     if cached_repair_response is not None:
         feedback["cached_repair_request_hash"] = (
             cached_repair_request_hash or generic.request_hash
