@@ -115,7 +115,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          expected=':ce378985446905476251ef966e16368ab641a3ca'
+          expected=':e60efa63bf247584121b74aa7c9951c09c74e029'
           for pod in json.loads(Path('/tmp/md-retry-pods.json').read_text())['items']:
               if pod['metadata'].get('deletionTimestamp') or pod['status'].get('phase')!='Running':
                   continue
