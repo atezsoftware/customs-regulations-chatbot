@@ -169,6 +169,8 @@ def create_intake(
         created_by=user.id,
         idempotency_key=idempotency_key,
         labeling_model_configuration_id=labeling_model_configuration_id,
+        metadata_extraction_mode="scoped_v1",
+        background_labeling_enabled=True,
         preparation_policy=policy.model_dump(mode="json")
         if policy is not None
         else None,
@@ -305,6 +307,7 @@ def _require_intake_membership(
 
 
 def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
+    from onyx.db.document_intake_background_labels import uses_background_labels
     from onyx.db.document_intake_review import publication_decision_payload
     from onyx.db.document_lineage import lineage_review_payload
 
@@ -317,7 +320,8 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             .order_by(RegulatoryChunk.id)
         )
     )
-    labels = _labels(session, batch)
+    background = uses_background_labels(batch)
+    labels = {} if background else _labels(session, batch)
     payload: dict[str, Any] = {
         "source_package_id": str(batch.source_package_id),
         "files": [
@@ -349,7 +353,9 @@ def review_digest(session: Session, batch: RegulatoryDocumentIntake) -> str:
             for row in chunks
         ],
     }
-    if batch.labeling_run_id is not None:
+    if background:
+        payload["labeling_mode"] = "independent_background_v1"
+    if batch.labeling_run_id is not None and not background:
         from onyx.db.regulatory_labeling_review_authority import (
             labeling_review_authority,
         )
@@ -390,6 +396,9 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
 
     # Polling must re-read the worker's lease under the same lock as transitions.
     session.refresh(batch, with_for_update=True)
+    from onyx.db.document_intake_background_labels import reconcile_background_labels
+
+    reconcile_background_labels(session, batch)
     checkpoint_owned_expiry = (
         batch.stage == "metadata"
         and batch.metadata_checkpoint is not None
@@ -506,6 +515,13 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             validate_intake_metadata_receipts(
                 session, batch, verify_contract_ack_bytes=False
             )
+            from onyx.db.document_intake_background_labels import (
+                uses_background_labels,
+                validate_legal_source,
+            )
+
+            if uses_background_labels(batch):
+                validate_legal_source(session, batch)
         except IntakeConflictError:
             batch.status, batch.stage, batch.error = (
                 "partial",
@@ -691,6 +707,11 @@ def intake_snapshot(
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
     }
+    from onyx.db.document_intake_background_labels import background_label_snapshot
+
+    background_labels = background_label_snapshot(session, batch)
+    if background_labels is not None:
+        snapshot["background_labeling"] = background_labels
     review_status, expected_review = batch.status, batch.review_sha256
     prelabel_edit_review = (
         edit_review_digest(session, batch) if batch.labeling_run_id is None else None
@@ -828,6 +849,13 @@ def approve_intake(
     from onyx.db.document_intake_metadata import validate_intake_metadata_receipts
 
     validate_intake_metadata_receipts(session, batch)
+    from onyx.db.document_intake_background_labels import (
+        uses_background_labels,
+        validate_legal_source,
+    )
+
+    if uses_background_labels(batch):
+        validate_legal_source(session, batch)
     from onyx.db.document_intake_review import (
         detach_source_evidence_memberships,
         effective_intake_files,
@@ -1181,6 +1209,13 @@ def start_intake_labeling(
     session.refresh(batch, with_for_update=True)
     if batch.lease_token != token or batch.status != "preparing":
         raise IntakeConflictError("The intake preparation lease changed")
+    from onyx.db.document_intake_background_labels import (
+        finish_legal_preparation,
+        uses_background_labels,
+    )
+
+    if uses_background_labels(batch):
+        return finish_legal_preparation(session, batch)
     return _start_intake_labeling_for_batch(session, batch)
 
 
@@ -1342,7 +1377,16 @@ def mark_intake_label_dispatch_failed(session: Session, intake_id: UUID) -> None
         with_for_update=True,
         populate_existing=True,
     )
-    if batch is not None and batch.status == "preparing" and batch.stage == "labeling":
+    from onyx.db.document_intake_background_labels import (
+        label_delivery_pending,
+        uses_background_labels,
+    )
+
+    if batch is not None and uses_background_labels(batch):
+        label_delivery_pending(batch)
+    elif (
+        batch is not None and batch.status == "preparing" and batch.stage == "labeling"
+    ):
         # The committed labeling run is the durable intent; its recovery task
         # redelivers a lost broker hint without preparing these files again.
         batch.error = "Labeling delivery is pending; automatic recovery will retry"

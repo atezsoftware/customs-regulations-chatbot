@@ -203,6 +203,73 @@ def _scoped_response() -> tuple[list[metadata.MetadataChunk], dict[str, Any]]:
     }
 
 
+@pytest.mark.parametrize("incorrect_general", [False, True])
+def test_special_start_overrides_general_and_split_targets_are_independent(
+    incorrect_general: bool,
+) -> None:
+    from onyx.regulatory.document_intake.metadata_scopes import (
+        expand_scoped_metadata_response,
+    )
+
+    chunks = [
+        metadata.MetadataChunk(
+            chunk_id="special",
+            text="MADDE 1-\n(1) Bu madde 1/3/2025 tarihinde yürürlüğe girer.",
+            heading_path=["MADDE 1"],
+            chunk_type="paragraph",
+        ),
+        metadata.MetadataChunk(
+            chunk_id="general",
+            text="Bu Yönetmelik 1/7/2025 tarihinde yürürlüğe girer.",
+            heading_path=[],
+            chunk_type="paragraph",
+        ),
+    ]
+    aliases = {
+        entry.source_chunk_id: f"e{i}"
+        for i, entry in enumerate(metadata.build_metadata_evidence_catalog(chunks))
+        if entry.scope == "body"
+    }
+    response = json.dumps(
+        {
+            "covered_targets": [0],
+            "shared_fields": [],
+            "assignments": [
+                {
+                    "targets": [0],
+                    "fields": [
+                        {
+                            "field": "validity_start_date",
+                            "value": "2025-07-01"
+                            if incorrect_general
+                            else "2025-03-01",
+                            "basis": "explicit",
+                            "evidence_id": aliases[
+                                "general" if incorrect_general else "special"
+                            ],
+                            "reference_evidence_id": "",
+                        }
+                    ],
+                }
+            ],
+            "warnings": [],
+        }
+    )
+    if incorrect_general:
+        with pytest.raises(ValueError, match="target.*commencement"):
+            expand_scoped_metadata_response(response, chunks=chunks, target_indices=[0])
+    else:
+        assert (
+            expand_scoped_metadata_response(
+                response, chunks=chunks, target_indices=[0]
+            )[0]
+            .chunks[0]
+            .fields[0]
+            .value
+            == "2025-03-01"
+        )
+
+
 def test_scoped_extraction_keeps_distinct_dates_and_publication_relative_rules() -> (
     None
 ):
@@ -346,6 +413,83 @@ def test_scoped_gateway_replays_its_valid_receipt_without_new_provider_work() ->
     assert {request_hash for request_hash, _result in result} == {
         build_scoped_metadata_request(sources).request_hash
     }
+
+
+def test_split_fallback_retains_valid_parent_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory.document_intake import metadata_scopes_job as job
+
+    chunks = [
+        metadata.MetadataChunk(
+            chunk_id=f"c{i}",
+            text="Bu Yönetmelik 1/1/2025 tarihinde yürürlüğe girer."
+            if i == 0
+            else "Hüküm uygulanır.",
+            heading_path=[],
+            chunk_type="paragraph",
+        )
+        for i in range(10)
+    ]
+    evidence = next(
+        f"e{i}"
+        for i, entry in enumerate(metadata.build_metadata_evidence_catalog(chunks))
+        if entry.scope == "body" and entry.source_chunk_id == "c0"
+    )
+    parent_hashes = []
+
+    def respond(**kwargs: Any) -> tuple[str, bool]:
+        request = kwargs["request"]
+        payload = json.loads(request.prompt)
+        targets = payload["target_indices"]
+        parent = len(targets) == 10
+        if parent:
+            parent_hashes.append(request.request_hash)
+        return json.dumps(
+            {
+                "covered_targets": targets,
+                "shared_fields": [],
+                "assignments": [
+                    {
+                        "targets": targets
+                        if parent
+                        else [i for i in targets if i != 0],
+                        "fields": [
+                            {
+                                "field": "validity_start_date",
+                                "value": "2025-01-01",
+                                "evidence_id": evidence,
+                                "basis": "explicit",
+                                "reference_evidence_id": "",
+                            }
+                        ],
+                    }
+                ],
+                "warnings": [],
+                **({"invalid_neighbor": True} if parent else {}),
+            }
+        ), False
+
+    # Parent has valid facts but a rejected envelope. Children must preserve them.
+    monkeypatch.setattr(job, "_run_metadata_request", respond)
+    from typing import cast
+
+    from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
+
+    results = job.extract_scoped_metadata_document(
+        gateway=cast(VertexBatchGateway, object()),
+        chunks=chunks,
+        identity_prefix="split-test",
+        heartbeat=lambda: None,
+    )
+    facts = {
+        target.chunk_id: target.fields
+        for _, result in results
+        for target in result.chunks
+    }
+    assert len(parent_hashes) == 3
+    assert len(facts) == 10
+    assert facts["c0"][0].retained_request_hash in parent_hashes
 
 
 @pytest.mark.parametrize(

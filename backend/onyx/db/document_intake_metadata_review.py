@@ -187,7 +187,10 @@ def capture_reviewed_metadata_checkpoint(
     documents: dict[UUID, ReviewedMetadataDocument],
     binding: LabelingProviderBinding,
 ) -> None:
-    from onyx.db.document_intake_metadata_checkpoint import _source_snapshot
+    from onyx.db.document_intake_metadata_checkpoint import (
+        _source_snapshot,
+        metadata_extraction_mode,
+    )
     from onyx.regulatory.document_intake.metadata_job import metadata_recipe_sha256
 
     predecessor = (
@@ -209,11 +212,14 @@ def capture_reviewed_metadata_checkpoint(
     )
     source, requests, _completed = _source_snapshot(session, batch, reviewed=edit)
     checkpoint = MetadataCheckpoint.build(
-        recipe_sha256=metadata_recipe_sha256(),
+        recipe_sha256=metadata_recipe_sha256("scoped_v1")
+        if metadata_extraction_mode(batch)
+        else metadata_recipe_sha256(),
         provider_binding=binding.model_dump(mode="json"),
         source_snapshot=source,
         request_hashes=requests,
         predecessor=predecessor,
+        extraction_mode=metadata_extraction_mode(batch),
     )
     batch.metadata_checkpoint = checkpoint.model_dump(mode="json")
 

@@ -67,6 +67,8 @@ def google_settings(intake_session: Session) -> SearchSettings:
         model_name="gemini-embedding-2",
         model_dim=1024,
         normalize=False,
+        query_prefix="",
+        passage_prefix="",
         status=IndexModelStatus.PRESENT,
         index_name=f"policy-test-{uuid4().hex}",
         cloud_provider=provider,

@@ -188,6 +188,14 @@ class IntakeDocumentSnapshot(BaseModel):
     publication_review: IntakePublicationReview | None = None
 
 
+class IntakeBackgroundLabelSnapshot(BaseModel):
+    status: Literal["pending", "waiting", "running", "completed", "failed", "cancelled"]
+    total_chunks: int = Field(ge=0)
+    completed_chunks: int = Field(ge=0)
+    failed_chunks: int = Field(ge=0)
+    error: str | None = None
+
+
 class IntakeBatchSnapshot(BaseModel):
     id: UUID
     source_package_id: UUID
@@ -206,6 +214,9 @@ class IntakeBatchSnapshot(BaseModel):
     documents: list[IntakeDocumentSnapshot] = Field(default_factory=list)
     labeling_run_id: UUID | None = None
     labeling_failed_count: int = Field(default=0, ge=0)
+    background_labeling: IntakeBackgroundLabelSnapshot | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     metadata_contract_retry: dict[str, JsonValue] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

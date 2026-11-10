@@ -208,6 +208,9 @@ def _admitted(
         environment=_ENVIRONMENT,
     )
     assert created
+    # These historical admission/retry fixtures exercise the frozen legacy mode.
+    batch.metadata_extraction_mode = None
+    batch.background_labeling_enabled = False
     members = intake.admit_intake_assets(
         session, batch, assets, links, root_hash=assets[0].sha256
     )

@@ -11,6 +11,7 @@ from onyx.regulatory.document_intake.metadata_structure import (
     STRUCTURAL_FIELDS,
     VerifiedStructuralFact,
     explicit_own_start_rules,
+    explicit_target_start_rules,
     positive_locator_evidence,
     verified_structural_metadata,
 )
@@ -435,6 +436,7 @@ def expand_scoped_metadata_response(
         except ValueError:
             continue
     structural = verified_structural_metadata(chunks)
+    target_starts = explicit_target_start_rules(chunks)
     results = []
     for index, transport in enumerate(windows):
         target_ids = [target["chunk_id"] for target in json.loads(transport)["chunks"]]
@@ -461,6 +463,14 @@ def expand_scoped_metadata_response(
         enriched = []
         for target in result.chunks:
             fields = list(target.fields)
+            expected_start = target_starts.get(target.chunk_id)
+            if expected_start is not None and not any(
+                fact.field == "validity_start_date" and fact.value == expected_start
+                for fact in fields
+            ):
+                raise ValueError(
+                    f"target {target.chunk_id} commencement must preserve its explicit special date {expected_start}"
+                )
             present = {fact.field for fact in fields}
             fields.extend(
                 VerifiedStructuralFact.model_validate(fact.model_dump())
@@ -497,7 +507,8 @@ def expand_scoped_metadata_response(
     missing_starts = [
         rule
         for rule in explicit_own_start_rules(chunks)
-        if rule not in represented_starts
+        if rule[0] in {chunks[index].chunk_id for index in targets}
+        and rule not in represented_starts
     ]
     if missing_starts:
         raise ValueError(

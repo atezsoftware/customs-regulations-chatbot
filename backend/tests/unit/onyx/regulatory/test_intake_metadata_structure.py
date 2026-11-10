@@ -3,6 +3,62 @@
 from onyx.regulatory.document_intake.metadata import MetadataChunk
 
 
+def test_saved_structural_receipt_requires_positive_source_marker() -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    import pytest
+
+    from onyx.db.document_intake_structure_metadata import (
+        validate_structural_verification,
+    )
+    from onyx.db.models import RegulatoryChunk
+    from onyx.regulatory.document_intake import metadata
+    from onyx.regulatory.document_intake.metadata_checkpoint import metadata_digest
+
+    chunks = [
+        MetadataChunk(
+            chunk_id="a",
+            text="Belge ibraz edilir.",
+            heading_path=[],
+            chunk_type="paragraph",
+        )
+    ]
+    source_hash = metadata.metadata_input_hash(chunks)
+    fact = metadata.LegalMetadataFact(
+        field="article_no",
+        value="999",
+        source_chunk_id="a",
+        evidence_quote=chunks[0].text,
+    )
+    witness = {
+        "target_chunk_id": "a",
+        **fact.model_dump(mode="json"),
+        "input_sha256": source_hash,
+    }
+    row = SimpleNamespace(
+        id="a",
+        chunk_metadata={
+            "article_no": "999",
+            metadata.METADATA_AUDIT_KEY: {
+                "fields": {"article_no": {"source": "structural"}},
+                "structural_verification": {
+                    "version": 1,
+                    "input_sha256": source_hash,
+                    "fields": {
+                        "article_no": {
+                            "witness": witness,
+                            "sha256": metadata_digest(witness),
+                        }
+                    },
+                },
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="source marker"):
+        validate_structural_verification([cast(RegulatoryChunk, row)], chunks)
+
+
 def test_unmarked_structural_article_guess_is_not_a_verified_fact() -> None:
     from onyx.regulatory.document_intake.metadata_structure import (
         verified_structural_metadata,

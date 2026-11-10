@@ -66,6 +66,23 @@ def explicit_own_start_rules(
     return sorted(rules)
 
 
+def explicit_target_start_rules(
+    chunks: Sequence[metadata.MetadataChunk],
+) -> dict[str, str]:
+    rules = {}
+    for chunk in chunks:
+        dates = set()
+        for line in chunk.text.splitlines():
+            if re.match(
+                r"^\s*(?:madde\s+\d+\s*[-–—]\s*)?(?:\(\d+\)\s*)?bu\s+(?:madde|fikra|bent|hukum)\s+[^.;]{0,160}\btarihinde\s+yururluge\s+girer\b",
+                metadata._fold(line),
+            ):
+                dates.update(metadata.quoted_dates(line))
+        if len(dates) == 1:
+            rules[chunk.chunk_id] = next(iter(dates)).isoformat()
+    return rules
+
+
 def verified_structural_metadata(
     chunks: Sequence[metadata.MetadataChunk],
 ) -> dict[str, dict[str, metadata.LegalMetadataFact]]:

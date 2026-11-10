@@ -4,13 +4,12 @@ on:
     inputs:
       operation:
         type: choice
-        options: [inspect, approve_462, approve_465, approve_470, scoped_md_canary]
+        options: [inspect, approve_462, approve_465, approve_470]
         default: inspect
 permissions:
   contents: read
 jobs:
   inspect:
-    if: inputs.operation != 'scoped_md_canary'
     runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 10
     steps:
@@ -98,42 +97,3 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python - "$1"' sh "$proposal_id" < \
             backend/onyx/db/resume_amendment_approvals_309_310.py
-
-  scoped_md_canary:
-    if: inputs.operation == 'scoped_md_canary'
-    runs-on: codebuild-customs-regulations-runner-${{ github.run_id }}-${{ github.run_attempt }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          persist-credentials: false
-      - name: Read-only scoped metadata canary; no apply or indexing
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
-          kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-background -o json > /tmp/scope-pods.json
-          python - <<'PY2'
-          import json
-          from pathlib import Path
-          for pod in json.loads(Path('/tmp/scope-pods.json').read_text())['items']:
-              if pod['metadata'].get('deletionTimestamp'):
-                  continue
-              ready={s['name']:s.get('ready') for s in pod['status'].get('containerStatuses',[])}
-              for container in pod['spec']['containers']:
-                  if container['image'].endswith(':e60efa63bf247584121b74aa7c9951c09c74e029') and ready.get(container['name']):
-                      Path('/tmp/scope-target').write_text(pod['metadata']['name']+'\t'+container['name']+'\n')
-                      raise SystemExit(0)
-          raise SystemExit('No verified DEV worker')
-          PY2
-          IFS=$'\t' read -r pod container < /tmp/scope-target
-          tar -czf - backend/onyx/regulatory/document_intake/metadata_structure.py backend/tests/unit/onyx/regulatory/fixtures/md_annex_navigation/scoped_temporal_controls.json backend/onyx/regulatory/document_intake/metadata_scopes.py backend/onyx/regulatory/document_intake/metadata_scopes_job.py backend/onyx/db/_scoped_metadata_canary_20261110.py | \
-            kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec '
-              target=$(mktemp -d /tmp/scoped-metadata-canary.XXXXXX)
-              cleanup() { rm -rf -- "$target"; }
-              trap cleanup EXIT
-              tar -xzf - -C "$target"
-              . /vault/secrets/config
-              export PYTHONPATH=/app
-              python "$target/backend/onyx/db/_scoped_metadata_canary_20261110.py" "$target"
-            '

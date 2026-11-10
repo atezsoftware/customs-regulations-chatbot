@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from onyx.db import document_intake_metadata as repository
 from onyx.db.document_intake_metadata_checkpoint import (
     metadata_execution_lock,
+    metadata_extraction_mode,
     require_current_metadata_checkpoint,
 )
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
@@ -770,11 +771,11 @@ def _extract_metadata_document(
     return [result for index in range(len(windows)) for result in results[index]]
 
 
-def metadata_recipe_sha256() -> str:
+def metadata_recipe_sha256(extraction_mode: Literal["scoped_v1"] | None = None) -> str:
     from onyx.regulatory import source_document_identity
     from onyx.regulatory.document_intake import metadata_contract_retry
 
-    return metadata_recipe_fingerprint(
+    legacy_recipe = metadata_recipe_fingerprint(
         {
             "contract": inspect.getsource(metadata_contract),
             "contract_retry": inspect.getsource(metadata_contract_retry),
@@ -800,6 +801,27 @@ def metadata_recipe_sha256() -> str:
             "targets_per_request": TARGETS_PER_REQUEST,
         },
     )
+    if extraction_mode == "scoped_v1":
+        from onyx.db import document_intake_structure_metadata
+        from onyx.regulatory.document_intake import (
+            metadata_scopes,
+            metadata_scopes_job,
+            metadata_structure,
+        )
+
+        return metadata_recipe_fingerprint(
+            {
+                "legacy_recipe": legacy_recipe,
+                "scope_transport": inspect.getsource(metadata_scopes),
+                "scope_job": inspect.getsource(metadata_scopes_job),
+                "structure": inspect.getsource(metadata_structure),
+                "structure_receipts": inspect.getsource(
+                    document_intake_structure_metadata
+                ),
+            },
+            {"extraction_mode": extraction_mode},
+        )
+    return legacy_recipe
 
 
 def run_intake_metadata(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -> None:
@@ -833,7 +855,11 @@ def run_intake_metadata_locked(
             intake_id,
             lease_token,
             provider_binding=binding,
-            recipe_sha256=metadata_recipe_sha256(),
+            recipe_sha256=(
+                metadata_recipe_sha256("scoped_v1")
+                if metadata_extraction_mode(batch)
+                else metadata_recipe_sha256()
+            ),
             capture=True,
         )
         gateway = resolve_labeling_gateway(
@@ -857,7 +883,14 @@ def run_intake_metadata_locked(
                 session.commit()
 
         with maintain_metadata_lease(heartbeat) as owned_heartbeat:
-            results = _extract_metadata_document(
+            extract = _extract_metadata_document
+            if checkpoint.extraction_mode == "scoped_v1":
+                from onyx.regulatory.document_intake.metadata_scopes_job import (
+                    extract_scoped_metadata_document,
+                )
+
+                extract = extract_scoped_metadata_document
+            results = extract(
                 gateway=gateway,
                 chunks=chunks,
                 identity_prefix=f"metadata-v{METADATA_VERSION}:{tenant_id}:{intake_id}:{document_id}:{binding.fingerprint}",
@@ -880,6 +913,19 @@ def run_intake_metadata_locked(
                 expected_input_sha256=metadata_input_hash(chunks),
                 results=results,
             )
+            if checkpoint.extraction_mode == "scoped_v1":
+                from onyx.db.document_intake_structure_metadata import (
+                    record_structural_verification,
+                )
+                from onyx.db.models import RegulatoryDocumentIntakeFile
+
+                member = session.get_one(RegulatoryDocumentIntakeFile, document_id)
+                record_structural_verification(
+                    session,
+                    user_file_id=member.user_file_id,
+                    results=results,
+                    input_sha256=metadata_input_hash(chunks),
+                )
             session.commit()
 
 
