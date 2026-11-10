@@ -7,7 +7,7 @@ from sqlalchemy import select, text
 from onyx.background.celery.tasks.regulatory_amendments.document_intake import (
     enqueue_intake_batch,
 )
-from onyx.db.engine.sql_engine import get_session_with_current_tenant
+from onyx.db.engine.sql_engine import SqlEngine, get_session_with_current_tenant
 from onyx.db.models import (
     AmendmentSourcePackage,
     RegulatoryDocumentIntake,
@@ -18,6 +18,7 @@ from onyx.regulatory.amendments.annexes import config
 assert config.REGULATORY_ANNEX_ENVIRONMENT == "dev"
 batch_id = UUID("70a4b080-00eb-4399-bc89-88024477a04c")
 package_id = UUID("28c45534-021a-4b20-8ca7-71848d780b54")
+SqlEngine.init_engine(pool_size=2, max_overflow=0)
 with get_session_with_current_tenant() as session:
     session.execute(text("SET TRANSACTION READ ONLY"))
     assert (
