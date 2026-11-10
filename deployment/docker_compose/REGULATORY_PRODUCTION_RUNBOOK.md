@@ -188,7 +188,9 @@ Before the maintenance window:
     full-backend, importer, indexer, primary, docfetching, docprocessing, or generic
     user-file-processing container is a blocker until its work is drained and its removal is approved.
     Production-lite owns that queue through `celery_worker_user_file_processing`; the separate
-    `celery_worker_regulatory_indexing` consumes only `regulatory_indexing`. In cloud mode, any
+    `celery_worker_regulatory_indexing` consumes only `regulatory_indexing`;
+    `celery_worker_regulatory_labeling` consumes only `regulatory_labeling` with one thread and
+    prefetch one. In cloud mode, any
     inference-model or indexing-model container is also a blocker. Rendered-Compose preflight cannot
     discover an orphan owned by another project.
 
@@ -776,15 +778,23 @@ First verify the same reviewed topology through the authoritative status command
 The machine-readable block below is the canonical production-lite runtime contract and is parsed by
 repository tests. It must change with supervisor, Compose health, workflow readiness, or queue wiring.
 
+Label deliveries and stale-run recovery use the independent `regulatory_labeling` queue.
+On rollout, start the labeling worker and restart both Beat schedules with the new image.
+Do not purge the old `regulatory_indexing` backlog: existing label deliveries retain their
+original destination until consumed or expired, and durable recovery republishes unfinished
+runs onto the labeling queue. Existing lease generations reject duplicate deliveries.
+
 <!-- production-lite-runtime-contract:start -->
 ```yaml
-supervisor_process_count: 9
+supervisor_process_count: 10
 workers:
   celery_worker_regulatory_benchmark:
     - regulatory_benchmark
     - regulatory_amendment
   celery_worker_regulatory_indexing:
     - regulatory_indexing
+  celery_worker_regulatory_labeling:
+    - regulatory_labeling
   celery_worker_user_file_processing:
     - user_file_processing
     - user_file_project_sync

@@ -72,20 +72,21 @@ iş yükü de kontrollü olarak yeniden başlatılır. Bayrağın yalnız bir po
 migration'dan önce açılması kabul edilmez. Admin’de seçili Vertex modelinin service-account JSON’u
 şifreli Admin yapılandırmasında kalır; environment değişkenine veya teslim dokümanına yazılmaz.
 
-Background podunun supervisor sözleşmesi tam olarak altı worker, iki ayrık Beat ve bir log yönlendirici
-olmak üzere dokuz process'tir:
+Background podunun supervisor sözleşmesi tam olarak yedi worker, iki ayrık Beat ve bir log yönlendirici
+olmak üzere on process'tir:
 
 | Process | Queue/görev |
 | --- | --- |
 | `celery_worker_regulatory_benchmark` | `regulatory_benchmark` |
 | `celery_worker_user_file_processing` | `user_file_processing,user_file_project_sync,user_file_delete,user_file_port` |
 | `celery_worker_regulatory_indexing` | `regulatory_indexing` |
+| `celery_worker_regulatory_labeling` | `regulatory_labeling`; concurrency=1, prefetch=1 |
 | `celery_worker_light` | Hafif bakım ve `llm_model_update` queue'ları |
 | `celery_worker_csv_generation` | `csv_generation` queue'su |
 | `celery_worker_monitoring` | `monitoring` |
 | `celery_beat` | User-file recovery ve otomatik LLM model keşfi |
 | `celery_beat_regulatory_indexing` | Yalnız stale recovery ve queue monitoring |
-| `log-redirect-handler` | Yedi Celery logunu stdout'a aktarır |
+| `log-redirect-handler` | Celery loglarını stdout'a aktarır |
 
 Beat readiness ve liveness dosyaları sırasıyla
 `/tmp/onyx_k8s_regulatoryindexingbeat_readiness.txt` ve
@@ -93,7 +94,9 @@ Beat readiness ve liveness dosyaları sırasıyla
 schedule görevleri ile primary, docfetching, docprocessing, generic indexing ve Elasticsearch
 migration queue'ları bu topolojide yasaktır. `user_file_processing` yalnız
 `celery_worker_user_file_processing` üzerinde,
-`regulatory_indexing` ise yalnız özel regulatory indexing worker üzerinde zorunludur.
+`regulatory_indexing` yalnız özel regulatory indexing worker üzerinde, `regulatory_labeling` ise
+yalnız özel labeling worker üzerinde zorunludur. Etiketleme ve etiket stale recovery teslimleri
+indeksleme worker slotunu kullanmaz.
 
 Her background podu kendi Beat process'ini çalıştırabilir. Shelf pod-local
 `/tmp/regulatory-indexing-beat-schedule` altında kalır; replica'lar aynı dosyayı paylaşmaz. Yayın

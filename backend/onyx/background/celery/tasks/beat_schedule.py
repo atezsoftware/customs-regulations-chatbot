@@ -80,7 +80,7 @@ beat_task_templates: list[dict] = [
         "options": {
             "priority": OnyxCeleryPriority.LOW,
             "expires": 5 * 60,
-            "queue": OnyxCeleryQueues.REGULATORY_INDEXING,
+            "queue": OnyxCeleryQueues.REGULATORY_LABELING,
         },
     },
     {

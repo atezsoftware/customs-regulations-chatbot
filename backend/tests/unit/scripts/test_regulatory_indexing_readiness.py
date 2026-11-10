@@ -431,7 +431,7 @@ def test_supervisor_worker_pid_fails_closed_when_not_positive_running_pid(
         readiness._supervisor_worker_pid(status_line)
 
 
-def test_worker_readiness_requires_both_workers_and_non_overlapping_beats(
+def test_worker_readiness_requires_independent_label_worker_and_non_overlapping_beats(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -442,6 +442,8 @@ def test_worker_readiness_requires_both_workers_and_non_overlapping_beats(
 command=celery worker --hostname=user_file_processing@%%n -Q user_file_processing,user_file_project_sync,user_file_delete,user_file_port
 [program:celery_worker_regulatory_indexing]
 command=celery worker --hostname=regulatory_indexing@%%n -Q regulatory_indexing
+[program:celery_worker_regulatory_labeling]
+command=celery worker --hostname=regulatory_labeling@%%n -Q regulatory_labeling
 [program:celery_beat]
 command=celery beat
 [program:celery_beat_regulatory_indexing]
@@ -453,6 +455,7 @@ command=celery beat
         (
             "celery_worker_user_file_processing RUNNING pid 111, uptime 0:01:00",
             "celery_worker_regulatory_indexing RUNNING pid 222, uptime 0:01:00",
+            "celery_worker_regulatory_labeling RUNNING pid 555, uptime 0:01:00",
             "celery_beat RUNNING pid 333, uptime 0:01:00",
             "celery_beat_regulatory_indexing RUNNING pid 444, uptime 0:01:00",
         )
@@ -476,6 +479,7 @@ command=celery beat
 
     assert "user-file recovery Beat RUNNING" in result
     command = run.call_args.args[0]
+    assert "celery_worker_regulatory_labeling" in command
     assert "celery_beat" in command
     assert "celery_beat_regulatory_indexing" in command
     validate_beat.assert_called_once_with(status)
