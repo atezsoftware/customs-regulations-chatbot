@@ -4,89 +4,91 @@ import re
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
+from onyx.db.enums import RegulatoryChunkStatus, UserFileStatus
 from onyx.db.models import (
-    AmendmentSourcePackage,
+    DocumentSet,
     DocumentSet__UserFile,
+    FileRecord,
     RegulatoryChunk,
     RegulatoryDocumentIntake,
     RegulatoryDocumentIntakeFile,
-    RegulatoryRetainedPdfEvidence,
-    RegulatorySourceAsset,
+    RegulatoryFilePublication,
     UserFile,
     UserFileProjectionRepair,
 )
 
 
+def catalog_display_name_expression() -> ColumnElement[str]:
+    """Search the same original leaf title that is displayed, never URLs or body text."""
+    metadata = FileRecord.file_metadata
+    original = (
+        select(
+            func.coalesce(
+                func.nullif(
+                    func.btrim(
+                        metadata["legistation_metadata"]["official_title"].astext
+                    ),
+                    "",
+                ),
+                func.nullif(func.btrim(metadata["original_filename"].astext), ""),
+                func.nullif(func.btrim(metadata["original_name"].astext), ""),
+                func.nullif(
+                    func.btrim(
+                        func.replace(
+                            func.regexp_replace(
+                                func.regexp_replace(
+                                    func.replace(FileRecord.display_name, "\\", "/"),
+                                    r"^.*/",
+                                    "",
+                                ),
+                                r"\.(md|txt)$",
+                                "",
+                                "i",
+                            ),
+                            "_",
+                            " ",
+                        )
+                    ),
+                    "",
+                ),
+            )
+        )
+        .where(FileRecord.file_id == UserFile.file_id)
+        .correlate(UserFile)
+        .scalar_subquery()
+    )
+    leaf = func.regexp_replace(func.replace(UserFile.name, "\\", "/"), r"^.*/", "")
+    fallback = func.replace(
+        func.regexp_replace(leaf, r"\.(md|txt)$", "", "i"), "_", " "
+    )
+    return func.coalesce(original, fallback)
+
+
+def catalog_display_path(storage_name: str, display_name: str) -> str:
+    folder = catalog_folder_path(storage_name)
+    return f"{folder}/{display_name}" if folder else display_name
+
+
+def catalog_display_names(
+    db_session: Session, files: Sequence[UserFile]
+) -> dict[UUID, str]:
+    if not files:
+        return {}
+    return dict(
+        db_session.execute(
+            select(UserFile.id, catalog_display_name_expression()).where(
+                UserFile.id.in_([file.id for file in files])
+            )
+        ).all()
+    )
+
+
 def _name_matches(q: str) -> ColumnElement[bool]:
-    source = (
-        select(RegulatoryDocumentIntakeFile.id)
-        .join(
-            RegulatoryDocumentIntake,
-            RegulatoryDocumentIntake.id == RegulatoryDocumentIntakeFile.intake_id,
-        )
-        .join(
-            RegulatorySourceAsset,
-            RegulatorySourceAsset.id == RegulatoryDocumentIntakeFile.source_asset_id,
-        )
-        .join(
-            AmendmentSourcePackage,
-            AmendmentSourcePackage.id == RegulatoryDocumentIntake.source_package_id,
-        )
-        .join(
-            DocumentSet__UserFile,
-            (
-                DocumentSet__UserFile.user_file_id
-                == RegulatoryDocumentIntakeFile.user_file_id
-            )
-            & (
-                DocumentSet__UserFile.document_set_id
-                == RegulatoryDocumentIntake.document_set_id
-            ),
-        )
-        .where(
-            RegulatoryDocumentIntakeFile.user_file_id == UserFile.id,
-            RegulatorySourceAsset.package_id
-            == RegulatoryDocumentIntake.source_package_id,
-            AmendmentSourcePackage.document_set_id
-            == RegulatoryDocumentIntake.document_set_id,
-            AmendmentSourcePackage.created_by == RegulatoryDocumentIntake.created_by,
-            RegulatoryDocumentIntake.created_by == UserFile.user_id,
-            or_(
-                RegulatorySourceAsset.display_name.icontains(q, autoescape=True),
-                RegulatorySourceAsset.original_url.icontains(q, autoescape=True),
-                RegulatorySourceAsset.final_url.icontains(q, autoescape=True),
-            ),
-        )
-        .correlate(UserFile)
-        .exists()
-    )
-    retained = (
-        select(RegulatoryRetainedPdfEvidence.id)
-        .join(
-            DocumentSet__UserFile,
-            (
-                DocumentSet__UserFile.user_file_id
-                == RegulatoryRetainedPdfEvidence.user_file_id
-            )
-            & (
-                DocumentSet__UserFile.document_set_id
-                == RegulatoryRetainedPdfEvidence.document_set_id
-            ),
-        )
-        .where(
-            RegulatoryRetainedPdfEvidence.user_file_id == UserFile.id,
-            RegulatoryRetainedPdfEvidence.original_filename.icontains(
-                q, autoescape=True
-            ),
-        )
-        .correlate(UserFile)
-        .exists()
-    )
-    return or_(UserFile.name.icontains(q, autoescape=True), source, retained)
+    return catalog_display_name_expression().icontains(q, autoescape=True)
 
 
 def normalize_catalog_path(value: str) -> str:
@@ -106,10 +108,43 @@ def _normalized_name() -> ColumnElement[str]:
     )
 
 
-def _file_query(
-    *, q: str, folder: str | None, recursive: bool
+def catalog_file_query(
+    *, q: str, folder: str | None, recursive: bool, document_set_id: int | None = None
 ) -> Select[tuple[UserFile]]:
     query = select(UserFile)
+    if document_set_id is not None:
+        # The Tariff proxy authenticates via a shared service key. A public set
+        # grants the same read ACL to each authenticated caller.
+        query = query.where(
+            UserFile.status == UserFileStatus.COMPLETED,
+            exists().where(
+                DocumentSet__UserFile.user_file_id == UserFile.id,
+                DocumentSet__UserFile.document_set_id == document_set_id,
+                DocumentSet.id == DocumentSet__UserFile.document_set_id,
+                DocumentSet.is_public.is_(True),
+                DocumentSet.is_deleting.is_(False),
+            ),
+            exists().where(
+                RegulatoryChunk.user_file_id == UserFile.id,
+                RegulatoryChunk.status == RegulatoryChunkStatus.ACTIVE.value,
+            ),
+            ~exists().where(
+                RegulatoryFilePublication.user_file_id == UserFile.id,
+                RegulatoryFilePublication.gate_closed.is_(True),
+            ),
+        )
+        pending = (
+            select(RegulatoryDocumentIntakeFile.user_file_id)
+            .join(
+                RegulatoryDocumentIntake,
+                RegulatoryDocumentIntake.id == RegulatoryDocumentIntakeFile.intake_id,
+            )
+            .where(
+                RegulatoryDocumentIntake.status != "completed",
+                RegulatoryDocumentIntakeFile.user_file_id.is_not(None),
+            )
+        )
+        query = query.where(~UserFile.id.in_(pending))
     if q:
         query = query.where(_name_matches(q))
     if folder is not None:
@@ -133,13 +168,16 @@ def list_catalog_files(
     recursive: bool,
     offset: int,
     limit: int,
+    document_set_id: int | None = None,
 ) -> tuple[list[UserFile], int]:
-    query = _file_query(q=q, folder=folder, recursive=recursive)
+    query = catalog_file_query(
+        q=q, folder=folder, recursive=recursive, document_set_id=document_set_id
+    )
     total = db_session.scalar(select(func.count()).select_from(query.subquery())) or 0
     files = list(
         db_session.scalars(
             query.options(selectinload(UserFile.document_sets))
-            .order_by(func.lower(UserFile.name), UserFile.id)
+            .order_by(func.lower(catalog_display_name_expression()), UserFile.id)
             .offset(offset)
             .limit(limit)
         ).all()
@@ -182,7 +220,13 @@ def catalog_index_requests(
 
 
 def list_catalog_folders(
-    db_session: Session, *, parent: str, q: str, offset: int, limit: int
+    db_session: Session,
+    *,
+    parent: str,
+    q: str,
+    offset: int,
+    limit: int,
+    document_set_id: int | None = None,
 ) -> tuple[list[tuple[str, int]], int]:
     """Group immediate children in SQL across the complete filtered catalog."""
     parent = normalize_catalog_path(parent)
@@ -195,6 +239,11 @@ def list_catalog_folders(
         .where(func.strpos(remainder, "/") > 0)
         .group_by(child)
     )
+    if document_set_id is not None:
+        visible = catalog_file_query(
+            q="", folder=None, recursive=True, document_set_id=document_set_id
+        ).with_only_columns(UserFile.id)
+        query = query.where(UserFile.id.in_(visible))
     if prefix:
         query = query.where(path.startswith(prefix, autoescape=True))
     if q:

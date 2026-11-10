@@ -353,12 +353,17 @@ def generate_catalog_summary(
     *,
     usage_observer: Callable[[CatalogSummaryUsage], None] | None = None,
     overview: bool = False,
+    overview_language: str = "tr",
 ) -> str | None:
     if overview:
         from onyx.regulatory.catalog_overview import generate_catalog_overview
 
         return generate_catalog_overview(
-            query, search, db_session, usage_observer=usage_observer
+            query,
+            search,
+            db_session,
+            usage_observer=usage_observer,
+            language=overview_language,
         )
     if not search.items:
         return None

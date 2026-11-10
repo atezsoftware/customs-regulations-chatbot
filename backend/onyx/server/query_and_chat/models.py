@@ -474,6 +474,7 @@ class ChatSessionsResponse(BaseModel):
 
 
 class ChatMessageDetail(BaseModel):
+    research_mode: Literal["single", "parallel"] | None = None
     chat_session_id: UUID | None = None
     message_id: int
     parent_message: int | None = None

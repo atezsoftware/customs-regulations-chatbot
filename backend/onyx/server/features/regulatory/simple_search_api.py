@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from onyx.auth.permissions import require_permission
 from onyx.configs.constants import PUBLIC_API_TAGS
+from onyx.context.search.models import IndexFilters
 from onyx.db.engine.sql_engine import get_session
 from onyx.db.enums import Permission
 from onyx.db.models import User
@@ -41,6 +42,16 @@ def simple_search(
     _: User = Depends(require_permission(Permission.FULL_ADMIN_PANEL_ACCESS)),
     db_session: Session = Depends(get_session),
 ) -> SimpleSearchResponse:
+    return run_simple_search(request, db_session)
+
+
+def run_simple_search(
+    request: SimpleSearchRequest,
+    db_session: Session,
+    *,
+    scope_filters: IndexFilters | None = None,
+    overview_language: str = "tr",
+) -> SimpleSearchResponse:
     request_id = uuid4()
     summary: str | None = None
     summary_error: str | None = None
@@ -64,6 +75,7 @@ def simple_search(
             db_session,
             adaptive=True,
             scope_query=request.query,
+            **({"scope_filters": scope_filters} if scope_filters is not None else {}),
         )
         try:
             summary = generate_catalog_summary(
@@ -72,6 +84,11 @@ def simple_search(
                 db_session,
                 usage_observer=observe_usage,
                 overview=True,
+                **(
+                    {"overview_language": overview_language}
+                    if overview_language != "tr"
+                    else {}
+                ),
             )
         except CatalogSummaryUnavailable as error:
             summary_error = str(error)

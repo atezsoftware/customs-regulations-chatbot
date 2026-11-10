@@ -36,6 +36,7 @@ class CatalogIndexRequest(BaseModel):
 class CatalogFile(BaseModel):
     id: UUID
     name: str
+    display_name: str | None = None
     folder_path: str
     user_id: UUID | None
     file_id: str

@@ -113,6 +113,9 @@ from onyx.server.features.regulatory.benchmark_api import (
 from onyx.server.features.regulatory.catalog_api import (
     router as regulatory_catalog_router,
 )
+from onyx.server.features.regulatory.library_api import (
+    router as regulatory_library_router,
+)
 from onyx.server.features.regulatory.simple_search_api import (
     router as regulatory_simple_search_router,
 )
@@ -571,6 +574,7 @@ def get_application(lifespan_override: Lifespan | None = None) -> FastAPI:
     include_router_with_global_prefix_prepended(application, targeted_reindex_router)
     include_router_with_global_prefix_prepended(application, projects_router)
     include_router_with_global_prefix_prepended(application, regulatory_router)
+    include_router_with_global_prefix_prepended(application, regulatory_library_router)
     include_router_with_global_prefix_prepended(application, regulatory_catalog_router)
     include_router_with_global_prefix_prepended(
         application, regulatory_simple_search_router

@@ -8,6 +8,7 @@ from sqlalchemy import Row, delete, desc, func, nullsfirst, or_, select, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Session, joinedload, selectinload
 
+from onyx.asv3.research_mode import legislation_research_mode
 from onyx.configs.chat_configs import HARD_DELETE_CHATS
 from onyx.configs.constants import MessageType
 from onyx.context.search.models import InferenceSection, SavedSearchDoc
@@ -1138,6 +1139,7 @@ def translate_db_message_to_chat_message_detail(
         processing_duration_seconds=chat_message.processing_duration_seconds,
         preferred_response_id=chat_message.preferred_response_id,
         model_display_name=chat_message.model_display_name,
+        research_mode=legislation_research_mode(chat_message.workflow),
     )
 
     from onyx.db.regulatory_chat_reads import message_publication_available

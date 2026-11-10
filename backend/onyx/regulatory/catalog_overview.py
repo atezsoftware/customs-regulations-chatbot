@@ -322,6 +322,7 @@ def generate_catalog_overview(
     session: Session,
     *,
     usage_observer: Callable[[CatalogSummaryUsage], None] | None = None,
+    language: str = "tr",
 ) -> str | None:
     if not search.items:
         return None
@@ -330,8 +331,11 @@ def generate_catalog_overview(
         raise CatalogSummaryUnavailable(code=CatalogSummaryRejectionCode.NO_PASSAGES)
     llm = get_catalog_summary_llm(session)
     counter = get_llm_token_counter(llm)
+    response_language = {"en": "İngilizce", "de": "Almanca"}.get(language, "Türkçe")
     messages: list[ChatCompletionMessage] = [
-        SystemMessage(content=OVERVIEW_SYSTEM_PROMPT),
+        SystemMessage(
+            content=OVERVIEW_SYSTEM_PROMPT.replace("Türkçe", response_language, 1)
+        ),
         UserMessage(content=json.dumps(payload, ensure_ascii=False)),
     ]
     while (
