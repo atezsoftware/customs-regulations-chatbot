@@ -1,0 +1,244 @@
+"""Sparse document extraction preserves target-specific legal metadata checks."""
+
+import json
+from typing import Any
+
+import pytest
+
+from onyx.regulatory.document_intake import metadata
+from tests.unit.onyx.regulatory.test_intake_metadata_scope_repair import (
+    _response,
+    _sources,
+)
+
+
+def test_scoped_checkpoint_freezes_mode_without_changing_legacy_serialization() -> None:
+    from onyx.regulatory.document_intake.metadata_checkpoint import MetadataCheckpoint
+
+    legacy = MetadataCheckpoint.build(
+        recipe_sha256="a" * 64,
+        provider_binding={},
+        source_snapshot={},
+        request_hashes={},
+    )
+    assert "extraction_mode" not in legacy.model_dump(mode="json")
+    scoped = MetadataCheckpoint.build(
+        recipe_sha256="a" * 64,
+        provider_binding={},
+        source_snapshot={},
+        request_hashes={},
+        extraction_mode="scoped_v1",
+    )
+    assert scoped.extraction_mode == "scoped_v1"
+    assert scoped.checkpoint_sha256 != legacy.checkpoint_sha256
+    scoped.validate_checksum()
+
+
+def _scoped_response() -> tuple[list[metadata.MetadataChunk], dict[str, Any]]:
+    sources = _sources()
+    indices = {source.chunk_id: i for i, source in enumerate(sources)}
+    aliases = {
+        entry.evidence_id: f"e{i}"
+        for i, entry in enumerate(metadata.build_metadata_evidence_catalog(sources))
+    }
+    validated = json.loads(_response(sources, valid=True))
+    assignments = []
+    for target in validated["chunks"]:
+        fields = []
+        for fact in target["fields"]:
+            fields.append(
+                {
+                    **fact,
+                    "evidence_id": aliases[fact["evidence_id"]],
+                    "reference_evidence_id": aliases.get(
+                        fact["reference_evidence_id"], ""
+                    ),
+                }
+            )
+        assignments.append({"targets": [indices[target["chunk_id"]]], "fields": fields})
+    return sources, {
+        "covered_targets": list(range(len(sources))),
+        "shared_fields": [],
+        "assignments": assignments,
+        "warnings": [],
+    }
+
+
+def test_scoped_extraction_keeps_distinct_dates_and_publication_relative_rules() -> (
+    None
+):
+    from onyx.regulatory.document_intake import metadata_scopes
+
+    sources, response = _scoped_response()
+    request = metadata_scopes.build_scoped_metadata_request(sources)
+    results = metadata_scopes.expand_scoped_metadata_response(
+        json.dumps(response), chunks=sources
+    )
+    facts = {
+        target.chunk_id: {fact.field: fact for fact in target.fields}
+        for result in results
+        for target in result.chunks
+    }
+    expected = json.loads(_response(sources, valid=True))
+    for target in expected["chunks"]:
+        for fact in target["fields"]:
+            assert facts[target["chunk_id"]][fact["field"]].value == fact["value"]
+    assert {fact["validity_start_date"].value for fact in facts.values() if fact} == {
+        "2025-01-05",
+        "2025-07-01",
+    }
+    assert sum(len(result.chunks) for result in results) == len(sources)
+    payload = json.loads(request.prompt)
+    assert payload["input_sha256"] == metadata.metadata_input_hash(sources)
+    assert len(payload["complete_document"]) == len(sources)
+    assert len(request.prompt.encode()) < len(
+        metadata.build_metadata_request(sources, [sources[0].chunk_id]).prompt.encode()
+    )
+
+
+def test_scoped_dates_can_differ_between_articles_and_from_general_commencement() -> (
+    None
+):
+    from onyx.regulatory.document_intake import metadata_scopes
+
+    sources, response = _scoped_response()
+    sources.extend(
+        [
+            metadata.MetadataChunk(
+                chunk_id="article_one",
+                text="MADDE 1-\n(1) Amaç ve kapsam.",
+                heading_path=[sources[0].heading_path[0], "MADDE 1"],
+                chunk_type="paragraph",
+            ),
+            metadata.MetadataChunk(
+                chunk_id="article_three",
+                text="MADDE 3-\n(1) Ürünlerin kapsamı.",
+                heading_path=[sources[0].heading_path[0], "MADDE 3"],
+                chunk_type="paragraph",
+            ),
+        ]
+    )
+    entries = metadata.build_metadata_evidence_catalog(sources)
+
+    def evidence(prefix: str) -> str:
+        return next(
+            f"e{i}"
+            for i, entry in enumerate(entries)
+            if entry.scope == "body" and entry.text.startswith(prefix)
+        )
+
+    response["covered_targets"] = list(range(len(sources)))
+    response["assignments"].extend(
+        [
+            {
+                "targets": [len(sources) - 2],
+                "fields": [
+                    {
+                        "field": "validity_start_date",
+                        "value": "2025-01-05",
+                        "basis": "relative_publication",
+                        "evidence_id": evidence("a) 1 inci,"),
+                        "reference_evidence_id": evidence("5 Ocak"),
+                    }
+                ],
+            },
+            {
+                "targets": [len(sources) - 1],
+                "fields": [
+                    {
+                        "field": "validity_start_date",
+                        "value": "2025-03-01",
+                        "basis": "explicit",
+                        "evidence_id": evidence("b) 3 üncü"),
+                        "reference_evidence_id": "",
+                    }
+                ],
+            },
+        ]
+    )
+    # Appending sources preserves the existing frozen catalog aliases.
+    results = metadata_scopes.expand_scoped_metadata_response(
+        json.dumps(response), chunks=sources
+    )
+    starts = {
+        target.chunk_id: fact.value
+        for result in results
+        for target in result.chunks
+        for fact in target.fields
+        if fact.field == "validity_start_date"
+    }
+    assert starts["article_one"] == "2025-01-05"
+    assert starts["article_three"] == "2025-03-01"
+    assert "2025-07-01" in starts.values()
+
+
+def test_scoped_gateway_replays_its_valid_receipt_without_new_provider_work() -> None:
+    from typing import cast
+
+    from onyx.regulatory.document_intake.metadata_scopes import (
+        build_scoped_metadata_request,
+    )
+    from onyx.regulatory.document_intake.metadata_scopes_job import (
+        extract_scoped_metadata_document,
+    )
+    from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
+    from tests.unit.onyx.regulatory.test_intake_metadata_budget import _envelope
+    from tests.unit.onyx.regulatory.test_intake_metadata_scope_repair import (
+        _CachedGateway,
+    )
+
+    sources, response = _scoped_response()
+    gateway = _CachedGateway(
+        lambda request: _envelope(request, "STOP", json.dumps(response))
+    )
+
+    def extract() -> list[tuple[str, metadata.LegalMetadataResult]]:
+        return extract_scoped_metadata_document(
+            gateway=cast(VertexBatchGateway, gateway),
+            chunks=sources,
+            identity_prefix="sgm4-frozen",
+            heartbeat=lambda: None,
+        )
+
+    result = extract()
+    assert len(gateway.new_requests) == 1
+    assert result == extract()
+    assert len(gateway.new_requests) == 1
+    assert {request_hash for request_hash, _result in result} == {
+        build_scoped_metadata_request(sources).request_hash
+    }
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing", "foreign", "duplicate", "conflict", "body_scope"]
+)
+def test_scoped_extraction_rejects_incomplete_conflicting_or_wrong_scope_facts(
+    defect: str,
+) -> None:
+    from onyx.regulatory.document_intake import metadata_scopes
+
+    sources, response = _scoped_response()
+    if defect == "missing":
+        response["covered_targets"].pop()
+    elif defect == "foreign":
+        response["assignments"][0]["targets"] = [len(sources)]
+    elif defect == "duplicate":
+        response["covered_targets"].append(0)
+    elif defect == "conflict":
+        import copy
+
+        other = copy.deepcopy(response["assignments"][0])
+        other["fields"][0]["value"] = "2030-01-01"
+        response["assignments"].append(other)
+    else:
+        entries = metadata.build_metadata_evidence_catalog(sources)
+        selected = next(
+            i
+            for i, entry in enumerate(entries)
+            if entry.scope == "heading" and "1/7/2025" in entry.text
+        )
+        response["assignments"][0]["fields"][0]["evidence_id"] = f"e{selected}"
+    with pytest.raises(ValueError):
+        metadata_scopes.expand_scoped_metadata_response(
+            json.dumps(response), chunks=sources
+        )
