@@ -33,7 +33,7 @@ from onyx.tracing.flows import LLMFlow
 
 def main() -> None:
     source_root = Path(sys.argv[1])
-    for leaf in ("metadata_scopes", "metadata_scopes_job"):
+    for leaf in ("metadata_structure", "metadata_scopes", "metadata_scopes_job"):
         name = "onyx.regulatory.document_intake." + leaf
         path = source_root / "backend/onyx/regulatory/document_intake" / f"{leaf}.py"
         spec = importlib.util.spec_from_file_location(name, path)
@@ -103,12 +103,30 @@ def main() -> None:
             assert len(rows) == (350 if member.role == "root" else 20)
             views.append((str(member.id), member.role, metadata_chunks(rows)))
         session.rollback()
+    from onyx.regulatory.document_intake.metadata import MetadataChunk
+    from onyx.regulatory.document_intake.metadata_structure import (
+        VerifiedStructuralFact,
+    )
+
+    control = json.loads(
+        (
+            source_root
+            / "backend/tests/unit/onyx/regulatory/fixtures/md_annex_navigation/scoped_temporal_controls.json"
+        ).read_text()
+    )
+    views.append(
+        (
+            "controlled-temporal",
+            "controlled",
+            [MetadataChunk.model_validate(row) for row in control["chunks"]],
+        )
+    )
     submissions = []
     submit = gateway.submit
 
     def measured_submit(requests, **kwargs):
-        if len(submissions) >= 4:
-            raise ValueError("Read-only canary exhausted its four-submission budget")
+        if len(submissions) >= 6:
+            raise ValueError("Read-only canary exhausted its six-submission budget")
         submissions.append([r.request_hash for r in requests])
         return submit(requests, **kwargs)
 
@@ -135,12 +153,33 @@ def main() -> None:
                 identity_prefix=f"scoped-readonly-canary:{batch_id}:{document_id}:{metadata_input_hash(chunks)}",
                 heartbeat=lambda: None,
             )
+            if role == "controlled":
+                starts = {
+                    target.chunk_id: fact.value
+                    for _hash, result in results
+                    for target in result.chunks
+                    for fact in target.fields
+                    if fact.field == "validity_start_date"
+                }
+                for target_id, expected in control["expected_start_dates"].items():
+                    assert starts.get(target_id) == expected, (
+                        target_id,
+                        expected,
+                        starts.get(target_id),
+                    )
+            local_facts = sum(
+                isinstance(fact, VerifiedStructuralFact)
+                for _hash, result in results
+                for target in result.chunks
+                for fact in target.fields
+            )
             report.append(
                 {
                     "role": role,
                     "targets": len(chunks),
                     "elapsed_seconds": round(time.monotonic() - started, 2),
                     "requests": len({h for h, _r in results}),
+                    "locally_verified_facts": local_facts,
                     "validated_facts": sum(
                         len(t.fields) for _h, r in results for t in r.chunks
                     ),

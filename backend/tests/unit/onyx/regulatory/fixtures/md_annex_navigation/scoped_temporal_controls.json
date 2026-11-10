@@ -1,0 +1,140 @@
+{
+  "kind": "controlled public-source excerpt regression; two target paragraphs are test fixtures",
+  "chunks": [
+    {
+      "chunk_id": "rc_4e68923acb6867065486b2aacdf7404082d59556",
+      "text": "23.10.2026 11:14\nresmigazete.gov.tr/eskiler/2025/01/20250105-2.htm\n5 Ocak 2025 PAZAR\nResmî Gazete\nSayı : 32773\nTEBLİĞ\nSanayi ve Teknoloji Bakanlığından:\nEV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN\nENERJİ ETİKETLEMESİNE DAİR TEBLİĞ\n(2023/2534/AB) (SGM-2024/4)\nAmaç, kapsam ve dayanak",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ"
+      ],
+      "chunk_type": "free_text",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_40fa107ddf04c987e81a2030300a2124c3e6b7a6",
+      "text": "MADDE 6-\n(1) Bakanlık bu Tebliğ kapsamındaki ürünler için Enerji Etiketlemesi Çerçeve Yönetmeliğinin 9\nuncu maddesinde belirtilen piyasa gözetimi ve denetimini gerçekleştirirken bu Tebliğin Ek IX’unda belirtilen\ndoğrulama yöntemlerini uygular.\nDanışma kurulu işlemleri",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 6",
+        "(1) Bakanlık bu Tebliğ kapsamındaki ürünler için Enerji Etiketlemesi Çerçeve Yönetmeliğinin 9"
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_e97c59b9d0d8463634bf94146753e6121f536f4f",
+      "text": "MADDE 7-\n(1) Bakanlık; bu Tebliğ ile ilgili olarak Avrupa Komisyonu tarafından ev tipi çamaşır kurutma\nmakinelerinin enerji tüketimi, işlevsel ve çevresel performansına ilişkin iyileştirme potansiyeli, son kullanıcıları daha\nenerji ve kaynak verimli cihazlar satın almaya ve daha enerji ve kaynak verimli programlar kullanmaya teşvik etmek\nve döngüsel ekonomi hususlarında çalışmalar yapmak üzere kurulan danışma kurulu toplantılarına katılım sağlar.\nAB mevzuatına uyum",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 7",
+        "(1) Bakanlık"
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_0634106ccdf8e56b13898d9ba40cb41fd5d44353",
+      "text": "MADDE 8-\n(1) Bu Tebliğ, Avrupa Parlamentosu ve Konseyinin (AB) 2017/1369 sayılı Tüzüğünü ev tipi\nçamaşır kurutma makinelerinin enerji etiketlemesine dair tamamlayan ve (AB) 392/2012 sayılı Yetki Devrine Dayanan\nKomisyon Tüzüğünü yürürlükten kaldıran 13/7/2023 tarihli ve (AB) 2023/2534 sayılı Yetki Devrine Dayanan\nKomisyon Tüzüğü esas alınarak AB mevzuatına uyum çerçevesinde hazırlanmıştır.\nYürürlükten kaldırılan tebliğ",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 8",
+        "(1) Bu Tebliğ, Avrupa Parlamentosu ve Konseyinin (AB) 2017/1369 sayılı Tüzüğünü ev tipi"
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_1dbca5596b6209e59ec6196432ba650b4d1fc6bf",
+      "text": "MADDE 9-\n(1) 15/5/2013 tarihli ve 28648 sayılı Resmî Gazete’de yayımlanan Ev Tipi Çamaşır Kurutma\nMakinelerinin Enerji Etiketlemesine Dair Tebliğ (SGM-2013/6) yürürlükten kaldırılmıştır.\nGeçiş hükümleri",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 9",
+        "(1) 15/5/2013 tarihli ve 28648 sayılı Resmî Gazete’de yayımlanan Ev Tipi Çamaşır Kurutma"
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_ee869704f7c71e4b31d792032dff9a1bc9bec71e",
+      "text": "GEÇİCİ MADDE 1-\n(1) 30/6/2025 tarihine kadar, 9 uncu madde ile yürürlükten kaldırılan Ev Tipi Çamaşır\nKurutma Makinelerinin Enerji Etiketlemesine Dair Tebliğ (SGM-2013/6)’in 5 inci maddesinin birinci fıkrasının (b)\nbendi uyarınca gerekli olan ürün bilgi formu, ürünle birlikte basılı olarak sunulmak yerine ürün veri tabanından veya\ntedarikçinin internet sitesi üzerinden sunulabilir. Ancak, satıcının talep etmesi halinde, tedarikçi ürün bilgi formunun\nbasılı olarak sunulmasını sağlar.\nhttps://www.resmigazete.gov.tr/eskiler/2025/01/20250105-2.htm\n2/3\n23.10.2026 11:14\nresmigazete.gov.tr/eskiler/2025/01/20250105-2.htm\nYürürlük",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "GEÇİCİ MADDE 1",
+        "(1) 30/6/2025 tarihine kadar, 9 uncu madde ile yürürlükten kaldırılan Ev Tipi Çamaşır"
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_a9037babb591412f73a5e6055fc6c6e998acb681",
+      "text": "MADDE 10-\n(1) Bu Tebliğin;\na) 1 inci, geçici 1 inci, 10 uncu ve 11 inci maddeleri yayımı tarihinde,",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 10",
+        "(1) Bu Tebliğin;",
+        "a) 1 inci, geçici 1 inci, 10 uncu ve 11 inci maddeleri yayımı tarihinde,"
+      ],
+      "chunk_type": "clause",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_9df54e1c649c2133e25e065ce8c4a1bfc7e9beb8",
+      "text": "b) 3 üncü maddesinin birinci fıkrasının (a) ve (b) bentleri 1/3/2025 tarihinde,",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 10",
+        "(1) Bu Tebliğin;",
+        "b) 3 üncü maddesinin birinci fıkrasının (a) ve (b) bentleri 1/3/2025 tarihinde,"
+      ],
+      "chunk_type": "clause",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "rc_3ad20a950984e16c37c0a6da05bc8b2697cfc492",
+      "text": "c) Diğer hükümleri 1/7/2025 tarihinde,\nyürürlüğe girer.\nYürütme",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 10",
+        "(1) Bu Tebliğin;",
+        "c) Diğer hükümleri 1/7/2025 tarihinde,"
+      ],
+      "chunk_type": "clause",
+      "structural_metadata": {}
+    },
+    {
+      "chunk_id": "control_article_1",
+      "text": "MADDE 1-\n(1) Amaç ve kapsam hükümleri.",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 1",
+        "(1) Amaç ve kapsam hükümleri."
+      ],
+      "chunk_type": "paragraph",
+      "structural_metadata": {
+        "article_no": "1",
+        "paragraph_no": "1"
+      }
+    },
+    {
+      "chunk_id": "control_article_3_a",
+      "text": "a) Ürünlerin enerji etiketinin gösterilmesi.",
+      "heading_path": [
+        "EV TİPİ ÇAMAŞIR KURUTMA MAKİNELERİNİN ENERJİ ETİKETLEMESİNE DAİR TEBLİĞ",
+        "MADDE 3",
+        "(1) Etiketleme yükümlülükleri",
+        "a) Ürünlerin enerji etiketinin gösterilmesi."
+      ],
+      "chunk_type": "clause",
+      "structural_metadata": {
+        "article_no": "3",
+        "paragraph_no": "1",
+        "clause_label": "a"
+      }
+    }
+  ],
+  "expected_start_dates": {
+    "control_article_1": "2025-01-05",
+    "control_article_3_a": "2025-03-01",
+    "rc_40fa107ddf04c987e81a2030300a2124c3e6b7a6": "2025-07-01"
+  }
+}

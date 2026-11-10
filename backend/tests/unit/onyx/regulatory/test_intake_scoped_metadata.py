@@ -34,6 +34,145 @@ def test_scoped_checkpoint_freezes_mode_without_changing_legacy_serialization() 
     scoped.validate_checksum()
 
 
+def test_invalid_neighbor_does_not_discard_valid_prior_date() -> None:
+    from onyx.regulatory.document_intake.metadata_scopes import (
+        expand_scoped_metadata_response,
+    )
+
+    chunks = [
+        metadata.MetadataChunk(
+            chunk_id="rule",
+            text="Bu Yönetmelik 1/1/2025 tarihinde yürürlüğe girer.",
+            heading_path=[],
+            chunk_type="paragraph",
+        )
+    ]
+    catalog = metadata.build_metadata_evidence_catalog(chunks)
+    evidence = next(f"e{i}" for i, item in enumerate(catalog) if item.scope == "body")
+    prior = {
+        "covered_targets": [0],
+        "shared_fields": [],
+        "assignments": [
+            {
+                "targets": [0],
+                "fields": [
+                    {
+                        "field": "validity_start_date",
+                        "value": "2025-01-01",
+                        "evidence_id": evidence,
+                        "basis": "explicit",
+                        "reference_evidence_id": "",
+                    },
+                    {
+                        "field": "document_type",
+                        "value": "regulation",
+                        "evidence_id": "missing",
+                        "basis": "explicit",
+                        "reference_evidence_id": "",
+                    },
+                ],
+            }
+        ],
+        "warnings": [],
+    }
+    current = {
+        "covered_targets": [0],
+        "shared_fields": [],
+        "assignments": [],
+        "warnings": [],
+    }
+    results = expand_scoped_metadata_response(
+        json.dumps(current),
+        chunks=chunks,
+        previous_attempts=[("a" * 64, json.dumps(prior))],
+    )
+    fact = results[0].chunks[0].fields[0]
+    assert (fact.field, fact.value, fact.retained_request_hash) == (
+        "validity_start_date",
+        "2025-01-01",
+        "a" * 64,
+    )
+
+
+def test_prior_validated_title_precedes_a_shorter_local_hint() -> None:
+    from onyx.regulatory.document_intake.metadata_scopes import (
+        expand_scoped_metadata_response,
+    )
+
+    chunks = [
+        metadata.MetadataChunk(
+            chunk_id="rule",
+            text="Hüküm uygulanır.",
+            heading_path=["Amaç ve kapsam"],
+            structural_metadata={"article_title": "Amaç"},
+            chunk_type="paragraph",
+        )
+    ]
+    catalog = metadata.build_metadata_evidence_catalog(chunks)
+    evidence = next(
+        f"e{i}" for i, item in enumerate(catalog) if item.scope == "heading"
+    )
+    prior = {
+        "covered_targets": [0],
+        "shared_fields": [],
+        "assignments": [
+            {
+                "targets": [0],
+                "fields": [
+                    {
+                        "field": "article_title",
+                        "value": "Amaç ve kapsam",
+                        "evidence_id": evidence,
+                        "basis": "explicit",
+                        "reference_evidence_id": "",
+                    }
+                ],
+            }
+        ],
+        "warnings": [],
+    }
+    current = {
+        "covered_targets": [0],
+        "shared_fields": [],
+        "assignments": [],
+        "warnings": [],
+    }
+    results = expand_scoped_metadata_response(
+        json.dumps(current),
+        chunks=chunks,
+        previous_attempts=[("a" * 64, json.dumps(prior))],
+    )
+    fact = results[0].chunks[0].fields[0]
+    assert (fact.value, fact.retained_request_hash) == ("Amaç ve kapsam", "a" * 64)
+
+
+def test_explicit_own_commencement_cannot_be_silently_omitted() -> None:
+    from onyx.regulatory.document_intake.metadata_scopes import (
+        expand_scoped_metadata_response,
+    )
+
+    chunks = [
+        metadata.MetadataChunk(
+            chunk_id="rule",
+            text="Bu Yönetmelik 1/1/2025 tarihinde yürürlüğe girer.",
+            heading_path=[],
+            chunk_type="paragraph",
+        )
+    ]
+    with pytest.raises(ValueError, match="commencement"):
+        expand_scoped_metadata_response(
+            json.dumps(
+                {
+                    "covered_targets": [0],
+                    "shared_fields": [],
+                    "assignments": [],
+                    "warnings": [],
+                }
+            ),
+            chunks=chunks,
+        )
+
+
 def _scoped_response() -> tuple[list[metadata.MetadataChunk], dict[str, Any]]:
     sources = _sources()
     indices = {source.chunk_id: i for i, source in enumerate(sources)}

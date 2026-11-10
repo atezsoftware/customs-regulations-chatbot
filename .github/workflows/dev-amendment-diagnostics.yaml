@@ -127,7 +127,7 @@ jobs:
           raise SystemExit('No verified DEV worker')
           PY2
           IFS=$'\t' read -r pod container < /tmp/scope-target
-          tar -czf - backend/onyx/regulatory/document_intake/metadata_scopes.py backend/onyx/regulatory/document_intake/metadata_scopes_job.py backend/onyx/db/_scoped_metadata_canary_20261110.py | \
+          tar -czf - backend/onyx/regulatory/document_intake/metadata_structure.py backend/tests/unit/onyx/regulatory/fixtures/md_annex_navigation/scoped_temporal_controls.json backend/onyx/regulatory/document_intake/metadata_scopes.py backend/onyx/regulatory/document_intake/metadata_scopes_job.py backend/onyx/db/_scoped_metadata_canary_20261110.py | \
             kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- sh -ec '
               target=$(mktemp -d /tmp/scoped-metadata-canary.XXXXXX)
               cleanup() { rm -rf -- "$target"; }

@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from threading import Event
 
 from onyx.regulatory.document_intake import metadata
@@ -27,13 +27,16 @@ def extract_scoped_metadata_document(
     identity_prefix: str,
     heartbeat: Callable[[], None],
     target_indices: Sequence[int] | None = None,
+    previous_attempts: Sequence[tuple[str, str]] = (),
+    previous_target_indices: Mapping[str, Sequence[int]] | None = None,
 ) -> MetadataResults:
     targets = (
         list(range(len(chunks))) if target_indices is None else list(target_indices)
     )
     base = build_scoped_metadata_request(chunks, targets)
     request = base
-    previous: list[tuple[str, str]] = []
+    previous: list[tuple[str, str]] = list(previous_attempts)
+    prior_targets = dict(previous_target_indices or {})
     stopped = Event()
     last_error: ValueError = ValueError(
         "Scoped metadata output exhausted its bounded budget"
@@ -55,11 +58,15 @@ def extract_scoped_metadata_document(
                 chunks=chunks,
                 target_indices=targets,
                 previous_attempts=previous,
+                previous_target_indices=prior_targets,
             )
             return [(request.request_hash, result) for result in results]
         except ValueError as error:
             last_error = error
             previous.append((request.request_hash, response))
+            prior_targets[request.request_hash] = targets
+            if attempt == 2:
+                break
             payload = json.loads(base.prompt)
             payload["validation_feedback"] = {
                 "attempt": attempt + 1,
@@ -78,7 +85,11 @@ def extract_scoped_metadata_document(
                 system_instruction=base.system_instruction,
                 generation_config=base.generation_config,
             )
-            metadata._check_metadata_request_budget(request)
+            try:
+                metadata._check_metadata_request_budget(request)
+            except ValueError as budget_error:
+                last_error = budget_error
+                break
     if len(targets) > metadata.TARGETS_PER_REQUEST:
         midpoint = len(targets) // 2
         return [
@@ -90,6 +101,8 @@ def extract_scoped_metadata_document(
                 identity_prefix=identity_prefix,
                 heartbeat=heartbeat,
                 target_indices=group,
+                previous_attempts=previous,
+                previous_target_indices=prior_targets,
             )
         ]
     raise ValueError(
