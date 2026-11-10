@@ -258,7 +258,10 @@ def build_checks(
             for index, resolution in enumerate(need.evidence_gap_resolutions)
         }
         for index, resolution in enumerate(need.evidence_gap_resolutions):
-            if latest_resolution[resolution.gap] != index:
+            if (
+                latest_resolution[resolution.gap] != index
+                or resolution.gap in need.evidence_gaps
+            ):
                 continue
             add(
                 f"gap-resolution:{need.need_id}:{index}",
