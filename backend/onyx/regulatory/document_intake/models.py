@@ -52,6 +52,9 @@ class IntakeSourceContext(BaseModel):
     parent_asset_ids: list[UUID]
     parent_titles: list[str]
     source_links: list[SourceLink]
+    retain_markdown_headings: bool = Field(
+        default=False, strict=True, exclude_if=lambda value: not value
+    )
 
     @model_validator(mode="after")
     def require_matching_policy(self) -> "IntakeSourceContext":

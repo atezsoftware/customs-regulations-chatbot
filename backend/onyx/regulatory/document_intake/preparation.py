@@ -23,6 +23,7 @@ from onyx.regulatory.document_intake.models import (
 )
 from onyx.regulatory.document_intake.text import (
     prepare_intake_text,
+    require_chunk_source_coverage,
     require_resolved_attachment_references,
 )
 from onyx.regulatory.document_intake.versions import IntakeFormatterVersion
@@ -78,6 +79,14 @@ def build_intake_document(
     by_hash = {item.sha256: item for item in package_assets}
     if any(item.package_id != package_id for item in package_assets):
         raise ValueError("Source context contains an asset from another package")
+    retain_headings = False
+    if asset.mime_type == "text/markdown":
+        try:
+            require_chunk_source_coverage(text)
+        except ValueError:
+            # Preparation already proved complete coverage with retained headings.
+            # Existing sources that passed the strict legacy gate keep their semantics.
+            retain_headings = True
     context = IntakeSourceContext(
         chunking_version=chunking_version,
         preparation_policy=preparation_policy,
@@ -92,6 +101,7 @@ def build_intake_document(
             by_hash[digest].display_name for digest in parents if digest in by_hash
         ],
         source_links=incoming,
+        retain_markdown_headings=retain_headings,
     )
     source_url = asset.final_url or asset.original_url
     title = asset.display_name or "source"

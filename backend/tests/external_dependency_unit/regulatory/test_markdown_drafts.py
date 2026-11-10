@@ -2,6 +2,7 @@
 
 import json
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -41,6 +42,102 @@ from tests.external_dependency_unit.regulatory.test_document_intake_markdown imp
 from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
     LabelingDatabase,
 )
+
+
+def test_actual_main_and_numeric_annex_use_lossless_native_chunking(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    native_markdown_runtime: PostgresBackedFileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, store = intake_session, native_markdown_runtime
+    owner, _, model = intake_owner
+    fixtures = (
+        Path(__file__).parents[2] / "unit/onyx/regulatory/fixtures/md_annex_navigation"
+    )
+    originals = [
+        (name, (fixtures / name).read_bytes())
+        for name in ("main.md", "20220618-8-1 (1).md")
+    ]
+    draft = drafts.create_draft(
+        session, user=owner, environment=_ENVIRONMENT, idempotency_key=uuid4()
+    )
+    drafts.add_documents(
+        session,
+        draft,
+        files=originals[:1],
+        expected_revision=0,
+        idempotency_key=uuid4(),
+        store=store,
+    )
+    root = drafts.draft_documents(session, draft)[0]
+    drafts.add_documents(
+        session,
+        draft,
+        files=originals[1:],
+        expected_revision=1,
+        idempotency_key=uuid4(),
+        parent_document_id=root.id,
+        store=store,
+    )
+    package = drafts.prepare_draft(session, draft, expected_revision=2, store=store)
+    batch, _ = intake.create_intake(
+        session,
+        source_package_id=package.id,
+        idempotency_key=uuid4(),
+        labeling_model_configuration_id=model.id,
+        user=owner,
+        environment=_ENVIRONMENT,
+    )
+    batch_id, model_id = batch.id, model.id
+    session.commit()
+    monkeypatch.setattr(
+        intake,
+        "resolve_intake_labeling_provider_binding",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            model="gemini-3.5-flash",
+            model_dump=lambda **_options: {"model_configuration_id": model_id},
+        ),
+    )
+    monkeypatch.setattr(
+        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
+        lambda **_kwargs: None,
+    )
+    assert (
+        intake_job.run_document_intake(
+            intake_id=batch_id, tenant_id=get_current_tenant_id()
+        )
+        is not None
+    )
+    session.expire_all()
+    batch = session.get_one(RegulatoryDocumentIntake, batch_id)
+    members = intake.intake_files(session, batch)
+    assert len(members) == 2 and all(
+        member.status in {"chunked", "labeling", "ready"} for member in members
+    ), (batch.error, [(member.status, member.error) for member in members])
+    root_member = next(member for member in members if member.role == "root")
+    child = next(member for member in members if member.role == "annex")
+    assert child.parent_document_id == root_member.id
+    for member in members:
+        rows = list(
+            session.scalars(
+                select(RegulatoryChunk).where(
+                    RegulatoryChunk.user_file_id == member.user_file_id
+                )
+            )
+        )
+        assert rows
+        delivered = "\n".join(row.text for row in rows)
+        if member is root_member:
+            assert "kapsamaz." in delivered and "MADDE 45" in delivered
+            assert (
+                "https://www.resmigazete.gov.tr/eskiler/2022/06/20220618-8-1.pdf"
+                in delivered
+            )
+        original = originals[0 if member is root_member else 1][1]
+        user_file = session.get_one(UserFile, member.user_file_id)
+        with store.read_file(user_file.file_id) as stream:
+            assert stream.read() == original
 
 
 def test_draft_storage_freeze_and_native_preparation(

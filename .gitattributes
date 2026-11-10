@@ -1,2 +1,4 @@
 # Byte-for-byte copies of deployment files synced by `ods generate-compose --write`.
 cli/internal/deploy/deployfiles/embedded/** linguist-generated=true
+# Preserve captured Markdown originals, including CRLF line endings.
+backend/tests/unit/onyx/regulatory/fixtures/md_annex_navigation/*.md -text whitespace=cr-at-eol

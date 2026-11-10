@@ -68,6 +68,15 @@ def intake_preparation_policy(document: Document) -> IntakePreparationPolicy | N
     return IntakeSourceContext.model_validate(context).preparation_policy
 
 
+def intake_markdown_heading_retention(document: Document) -> bool:
+    context = (document.doc_metadata or {}).get("regulatory_document_intake")
+    return (
+        IntakeSourceContext.model_validate(context).retain_markdown_headings
+        if context is not None
+        else False
+    )
+
+
 def documents_intake_preparation_policy(
     documents: Sequence[Document],
 ) -> IntakePreparationPolicy | None:
