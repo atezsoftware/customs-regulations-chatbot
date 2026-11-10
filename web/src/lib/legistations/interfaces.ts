@@ -47,6 +47,7 @@ export interface ReviewedFileRelations {
 }
 
 export interface LegislationFile {
+  display_name?: string | null;
   id: string;
   name: string;
   folder_path: string;

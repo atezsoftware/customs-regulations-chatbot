@@ -1,0 +1,143 @@
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
+
+import pytest
+from pydantic import ValidationError
+from sqlalchemy.dialects import postgresql
+
+from onyx.db.regulatory_catalog import catalog_file_query
+from onyx.error_handling.exceptions import OnyxError
+from onyx.server.features.regulatory import library_api as api
+from onyx.server.features.regulatory.library_repeals import verified_repeals
+from onyx.server.features.regulatory.library_search_memory import (
+    contextual_library_query,
+)
+
+
+def test_scoped_file_queries_do_not_leak_pending_or_other_document_sets() -> None:
+    query = catalog_file_query(
+        q="Gümrük", folder=None, recursive=True, document_set_id=15
+    )
+    sql = str(
+        query.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "document_set_id = 15" in sql
+    assert "regulatory_document_intake.status !=" in sql
+    assert "official_title" in sql
+
+
+def test_content_outside_corpus_is_denied_before_opening_storage() -> None:
+    identifier = uuid4()
+    with (
+        patch.object(
+            api, "library_scope", return_value=SimpleNamespace(asv3_document_set_id=15)
+        ),
+        patch.object(api, "scoped_library_file_ids", return_value=set()),
+        patch.object(api, "read_document_markdown") as read,
+    ):
+        with pytest.raises(OnyxError):
+            api.get_content(identifier, user=MagicMock(), db_session=MagicMock())
+        read.assert_not_called()
+
+
+def test_full_content_keeps_markdown_and_original_title() -> None:
+    identifier = uuid4()
+    file = SimpleNamespace(id=identifier, name="laws/internal_name.md")
+    with (
+        patch.object(
+            api, "library_scope", return_value=SimpleNamespace(asv3_document_set_id=15)
+        ),
+        patch.object(api, "scoped_library_file_ids", return_value={identifier}),
+        patch.object(api, "get_catalog_file", return_value=file),
+        patch.object(
+            api, "catalog_display_names", return_value={identifier: "Gümrük Kanunu"}
+        ),
+        patch.object(
+            api,
+            "read_document_markdown",
+            return_value="# Başlık\n\n| A | B |\n| - | - |\n| 1 | 2 |",
+        ),
+        patch.object(api, "observe_publication_read"),
+        patch.object(api, "require_publication_files"),
+    ):
+        result = api.get_content(identifier, user=MagicMock(), db_session=MagicMock())
+    assert result.name == "Gümrük Kanunu"
+    assert result.markdown.startswith("# Başlık")
+    assert "| 1 | 2 |" in result.markdown
+    assert len(result.content_sha256) == 64
+    assert result.verified_repeals == []
+
+
+def test_repeal_annotations_require_the_verified_file_and_revision() -> None:
+    file_id = UUID("12328001-2f21-407e-b230-7d50a8dbf28f")
+    revision = "1db892a36effeeb8bf6e56871448b6148a935354fd788f7a8b2e555fe4deff64"
+    assert {
+        item.heading
+        for item in verified_repeals(file_id, revision)
+        if item.kind == "article"
+    } == {
+        "MADDE 42-",
+        "MADDE 43-",
+        "MADDE 44-",
+        "Madde 222. -",
+        "MADDE 240-",
+    }
+    assert [
+        item.heading
+        for item in verified_repeals(file_id, revision)
+        if item.kind == "clause"
+    ] == ["ı)"]
+    assert not verified_repeals(file_id, "0" * 64)
+    assert not verified_repeals(uuid4(), revision)
+
+
+def test_previous_question_is_answered_without_retrieval() -> None:
+    request = api.LibrarySearchRequest(
+        query="Ben az önce ne sordum?",
+        context=[
+            {"question": "Önceki sorgu"},
+            {
+                "question": "4458 sayılı Kanunun 248. maddesi nedir?",
+                "overview": "Özet",
+                "legislations": ["4458 sayılı Gümrük Kanunu"],
+            },
+        ],
+    )
+    with (
+        patch.object(api, "library_scope"),
+        patch.object(api, "run_simple_search") as retrieve,
+    ):
+        result = api.search(request, user=MagicMock(), db_session=MagicMock())
+    assert result.kind == "memory"
+    assert request.context[-1].question in (result.summary or "")
+    assert not result.search.items
+    retrieve.assert_not_called()
+
+
+def test_memory_rejects_chunk_data_and_unbounded_context() -> None:
+    with pytest.raises(ValidationError):
+        api.LibrarySearchRequest(
+            query="Follow up",
+            context=[{"question": "Earlier", "chunks": ["raw text"]}],
+        )
+    with pytest.raises(ValidationError):
+        api.LibrarySearchRequest(
+            query="Follow up", context=[{"question": "Earlier"}] * 4
+        )
+
+
+def test_contextual_article_follow_up_preserves_explicit_legal_identifiers() -> None:
+    context = [
+        {"question": "4458 sayılı Kanun", "legislations": ["4458 Gümrük Kanunu"]}
+    ]
+    follow_up = api.LibrarySearchRequest(query="Peki 42. maddesi?", context=context)
+    assert (
+        contextual_library_query(follow_up) == "4458 Gümrük Kanunu — Peki 42. maddesi?"
+    )
+    explicit = api.LibrarySearchRequest(
+        query="Peki 5607 sayılı Kanun?", context=context
+    )
+    assert contextual_library_query(explicit) == explicit.query

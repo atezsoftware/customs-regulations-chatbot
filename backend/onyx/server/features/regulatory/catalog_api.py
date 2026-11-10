@@ -23,6 +23,8 @@ from onyx.db.models import User, UserFile
 from onyx.db.regulatory_catalog import (
     catalog_chunk_counts,
     catalog_chunk_page_offset,
+    catalog_display_names,
+    catalog_display_path,
     catalog_folder_path,
     catalog_index_requests,
     catalog_search_rows,
@@ -84,6 +86,7 @@ def _file_snapshots(
     db_session: Session, files: Sequence[UserFile]
 ) -> dict[UUID, CatalogFile]:
     file_ids = [file.id for file in files]
+    display_names = catalog_display_names(db_session, files)
     counts = catalog_chunk_counts(db_session, file_ids)
     requests = catalog_index_requests(db_session, file_ids)
     progress = fetch_latest_regulatory_indexing_progress_for_user_files(
@@ -95,7 +98,10 @@ def _file_snapshots(
     return {
         file.id: CatalogFile(
             id=file.id,
-            name=file.name,
+            name=catalog_display_path(
+                file.name, display_names.get(file.id) or file.name.rsplit("/", 1)[-1]
+            ),
+            display_name=display_names.get(file.id),
             folder_path=catalog_folder_path(file.name),
             user_id=file.user_id,
             file_id=file.file_id,
@@ -248,6 +254,7 @@ def search_catalog_chunks(
     *,
     adaptive: bool = False,
     scope_query: str | None = None,
+    scope_filters: IndexFilters | None = None,
 ) -> CatalogSearchPage:
     """Share the same bounded, reranked evidence with both admin search screens."""
     observation = observe_publication_read()
@@ -261,10 +268,14 @@ def search_catalog_chunks(
     index = get_default_document_index(settings, None, db_session)
     # This permission-gated catalog deliberately spans every owner's files.
     # Tenant and publication constraints still apply inside the index adapter.
-    filters = IndexFilters(
-        access_control_list=None,
-        tenant_id=get_current_tenant_id(),
-        regulatory_chunks_only=True,
+    filters = (
+        scope_filters.model_copy(deep=True)
+        if scope_filters is not None
+        else IndexFilters(
+            access_control_list=None,
+            tenant_id=get_current_tenant_id(),
+            regulatory_chunks_only=True,
+        )
     )
     scope: CatalogSearchScope | None = None
     if adaptive:
@@ -275,6 +286,17 @@ def search_catalog_chunks(
                 original_query, catalog_source_titles(db_session, hint)
             )
             file_ids = [title.file_id for title in titles]
+            if (
+                scope_filters is not None
+                and scope_filters.asv3_document_set_id is not None
+            ):
+                from onyx.db.regulatory_library import scoped_library_file_ids
+
+                permitted = scoped_library_file_ids(
+                    db_session, scope_filters.asv3_document_set_id, file_ids
+                )
+                titles = [title for title in titles if title.file_id in permitted]
+                file_ids = [title.file_id for title in titles]
             scope = CatalogSearchScope(source_hint=hint, file_ids=file_ids)
             if not file_ids:
                 return CatalogSearchPage(
@@ -333,6 +355,15 @@ def search_catalog_chunks(
         db_session,
         [chunk.regulatory_chunk_id for chunk in retrieved if chunk.regulatory_chunk_id],
     )
+    if scope_filters is not None and scope_filters.asv3_document_set_id is not None:
+        from onyx.db.regulatory_library import scoped_library_file_ids
+
+        permitted = scoped_library_file_ids(
+            db_session,
+            scope_filters.asv3_document_set_id,
+            [file.id for _, file in rows.values()],
+        )
+        rows = {key: value for key, value in rows.items() if value[1].id in permitted}
     files = {file.id: file for _, file in rows.values()}
     snapshots = _file_snapshots(db_session, list(files.values()))
     candidates: list[InferenceChunk] = []
