@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -8,7 +9,9 @@ from sqlalchemy.dialects import postgresql
 
 from onyx.db.regulatory_catalog import catalog_file_query
 from onyx.error_handling.exceptions import OnyxError
+from onyx.server.features.regulatory import catalog_api
 from onyx.server.features.regulatory import library_api as api
+from onyx.server.features.regulatory.library_models import LibraryLanguage
 from onyx.server.features.regulatory.library_repeals import verified_repeals
 from onyx.server.features.regulatory.library_search_memory import (
     contextual_library_query,
@@ -141,3 +144,86 @@ def test_contextual_article_follow_up_preserves_explicit_legal_identifiers() -> 
         query="Peki 5607 sayılı Kanun?", context=context
     )
     assert contextual_library_query(explicit) == explicit.query
+
+
+@pytest.mark.parametrize(
+    ("query", "language", "answer"),
+    [
+        ("NASILSIN?!", "tr", "İyiyim"),
+        ("Selam, naber?", "tr", "İyiyim"),
+        ("Merhaba!", "tr", "Merhaba"),
+        ("How are you?", "en", "I'm doing well"),
+        ("Hallo, wie geht's?", "de", "Mir geht es gut"),
+    ],
+)
+def test_small_talk_returns_plain_text_without_running_search(
+    query: str, language: LibraryLanguage, answer: str
+) -> None:
+    with (
+        patch.object(api, "library_scope"),
+        patch.object(api, "require_vector_db") as require_index,
+        patch.object(api, "run_simple_search") as retrieve,
+    ):
+        result = api.search(
+            api.LibrarySearchRequest(query=query, language=language),
+            user=MagicMock(),
+            db_session=MagicMock(),
+        )
+    assert result.kind == "memory"
+    assert answer in (result.summary or "")
+    assert not result.search.items
+    require_index.assert_not_called()
+    retrieve.assert_not_called()
+
+
+def test_greeting_with_legal_question_still_runs_search() -> None:
+    query = "Selam, 4458 sayılı Gümrük Kanunu Madde 248"
+    with (
+        patch.object(api, "library_scope"),
+        patch.object(api, "require_vector_db") as require_index,
+        patch.object(
+            api,
+            "run_simple_search",
+            return_value=SimpleNamespace(
+                search=SimpleNamespace(items=[]), summary=None, summary_error=None
+            ),
+        ) as retrieve,
+    ):
+        result = api.search(
+            api.LibrarySearchRequest(query=query),
+            user=MagicMock(),
+            db_session=MagicMock(),
+        )
+    assert result.kind == "search"
+    assert retrieve.call_args.args[0].query == query
+    require_index.assert_called_once_with()
+
+
+def test_library_search_file_snapshot_skips_admin_only_lookups() -> None:
+    file = MagicMock(
+        id=uuid4(),
+        created_at=datetime.now(UTC),
+        file_id="file",
+        file_type="md",
+        user_id=None,
+        status=SimpleNamespace(value="completed"),
+    )
+    file.name = "Kanunlar/gumruk_kanunu"
+    with (
+        patch.object(
+            catalog_api,
+            "catalog_display_names",
+            return_value={file.id: "Gümrük Kanunu"},
+        ),
+        patch.object(catalog_api, "catalog_chunk_counts", return_value={file.id: 52}),
+        patch.object(catalog_api, "catalog_index_requests") as index_requests,
+        patch.object(catalog_api, "load_intake_source_lineages") as source_lineages,
+    ):
+        result = catalog_api._file_snapshots(
+            MagicMock(), [file], include_admin_details=False
+        )[file.id]
+    assert result.display_name == "Gümrük Kanunu"
+    assert result.chunk_count == 52
+    assert not result.document_sets
+    index_requests.assert_not_called()
+    source_lineages.assert_not_called()

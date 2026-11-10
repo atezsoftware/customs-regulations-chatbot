@@ -1,8 +1,28 @@
-"""Resolve follow-ups from the bounded context attached to one library request."""
+"""Handle conversational turns and resolve follow-ups in a library request."""
 
 import re
 
 from onyx.server.features.regulatory.library_models import LibrarySearchRequest
+
+_GREETING = (
+    r"(?:merhaba|selam(?:lar)?|günaydın|iyi (?:günler|akşamlar)|"
+    r"hello|hi|hey|hallo|guten (?:morgen|tag|abend))"
+)
+_WELLBEING = re.compile(
+    rf"(?:{_GREETING} )?(?:nasılsın(?:ız)?|nasilsin(?:iz)?|naber|ne haber|iyi misin|"
+    r"how are you(?: doing)?|how's it going|what's up|wie geht(?:'s|s| es dir| es ihnen))"
+)
+_GREETING_ONLY = re.compile(_GREETING)
+_WELLBEING_REPLY = {
+    "tr": "İyiyim, teşekkürler! Hangi mevzuatı araştırmak istersiniz?",
+    "en": "I'm doing well, thanks! What legislation would you like to look up?",
+    "de": "Mir geht es gut, danke! Welche Rechtsvorschrift möchten Sie suchen?",
+}
+_GREETING_REPLY = {
+    "tr": "Merhaba! Hangi mevzuatı araştırmak istersiniz?",
+    "en": "Hello! What legislation would you like to look up?",
+    "de": "Hallo! Welche Rechtsvorschrift möchten Sie suchen?",
+}
 
 _RECALL_QUESTION = re.compile(
     r"\b(?:ne (?:sordum|sormuştum)|son (?:sorum|sorgum)|önceki (?:sorum|sorgum)|"
@@ -43,6 +63,17 @@ _QUESTION = {
     "en": "Your last question was: “{question}”",
     "de": "Ihre letzte Frage war: „{question}“",
 }
+
+
+def answer_library_small_talk(request: LibrarySearchRequest) -> str | None:
+    query = request.query.casefold().replace("i\u0307", "i").replace("’", "'")
+    words = " ".join(re.sub(r"[.,;:!?…]+", " ", query).split())
+    # Full-turn matching keeps mixed greetings and legal questions on retrieval.
+    if _WELLBEING.fullmatch(words):
+        return _WELLBEING_REPLY[request.language]
+    if _GREETING_ONLY.fullmatch(words):
+        return _GREETING_REPLY[request.language]
+    return None
 
 
 def recall_previous_search(request: LibrarySearchRequest) -> str | None:

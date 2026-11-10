@@ -83,18 +83,27 @@ router = APIRouter(prefix="/regulatory/catalog", tags=PUBLIC_API_TAGS)
 
 
 def _file_snapshots(
-    db_session: Session, files: Sequence[UserFile]
+    db_session: Session,
+    files: Sequence[UserFile],
+    *,
+    include_admin_details: bool = True,
 ) -> dict[UUID, CatalogFile]:
     file_ids = [file.id for file in files]
     display_names = catalog_display_names(db_session, files)
     counts = catalog_chunk_counts(db_session, file_ids)
-    requests = catalog_index_requests(db_session, file_ids)
-    progress = fetch_latest_regulatory_indexing_progress_for_user_files(
-        db_session, user_file_ids=file_ids
-    )
-    pending = pending_intake_file_ids(db_session, file_ids, include_approving=True)
-    lineages = load_intake_source_lineages(db_session, file_ids)
-    reviewed = load_reviewed_file_relations(db_session, file_ids)
+    requests = {}
+    progress = {}
+    pending: set[UUID] = set()
+    lineages = {}
+    reviewed = {}
+    if include_admin_details:
+        requests = catalog_index_requests(db_session, file_ids)
+        progress = fetch_latest_regulatory_indexing_progress_for_user_files(
+            db_session, user_file_ids=file_ids
+        )
+        pending = pending_intake_file_ids(db_session, file_ids, include_approving=True)
+        lineages = load_intake_source_lineages(db_session, file_ids)
+        reviewed = load_reviewed_file_relations(db_session, file_ids)
     return {
         file.id: CatalogFile(
             id=file.id,
@@ -111,7 +120,10 @@ def _file_snapshots(
             chunk_count=counts.get(file.id, 0),
             document_sets=[
                 CatalogDocumentSet(id=item.id, name=item.name)
-                for item in sorted(file.document_sets, key=lambda item: item.id)
+                for item in sorted(
+                    file.document_sets if include_admin_details else [],
+                    key=lambda item: item.id,
+                )
             ],
             pending_review=file.id in pending,
             source_lineage=lineages.get(file.id),
@@ -351,9 +363,11 @@ def search_catalog_chunks(
         num_to_retrieve=CATALOG_SEARCH_CANDIDATES,
     )[:CATALOG_SEARCH_CANDIDATES]
 
+    library_search = scope_filters is not None
     rows = catalog_search_rows(
         db_session,
         [chunk.regulatory_chunk_id for chunk in retrieved if chunk.regulatory_chunk_id],
+        **({"include_document_sets": False} if library_search else {}),
     )
     if scope_filters is not None and scope_filters.asv3_document_set_id is not None:
         from onyx.db.regulatory_library import scoped_library_file_ids
@@ -365,7 +379,11 @@ def search_catalog_chunks(
         )
         rows = {key: value for key, value in rows.items() if value[1].id in permitted}
     files = {file.id: file for _, file in rows.values()}
-    snapshots = _file_snapshots(db_session, list(files.values()))
+    snapshots = _file_snapshots(
+        db_session,
+        list(files.values()),
+        **({"include_admin_details": False} if library_search else {}),
+    )
     candidates: list[InferenceChunk] = []
     hits: dict[str, CatalogSearchHit] = {}
     seen: set[str] = set()

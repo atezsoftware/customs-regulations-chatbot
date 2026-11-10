@@ -42,6 +42,7 @@ from onyx.server.features.regulatory.library_models import (
 )
 from onyx.server.features.regulatory.library_repeals import verified_repeals
 from onyx.server.features.regulatory.library_search_memory import (
+    answer_library_small_talk,
     contextual_library_query,
     recall_previous_search,
 )
@@ -151,21 +152,22 @@ def get_content(
     )
 
 
-@router.post("/simple-search", dependencies=[Depends(require_vector_db)])
+@router.post("/simple-search")
 def search(
     request: LibrarySearchRequest,
     user: User = Depends(current_user),
     db_session: Session = Depends(get_session),
 ) -> LibrarySearchResponse:
     scope = library_scope(db_session, user)
-    recalled = recall_previous_search(request)
-    if recalled is not None:
+    reply = answer_library_small_talk(request) or recall_previous_search(request)
+    if reply is not None:
         return LibrarySearchResponse(
             kind="memory",
             search=LibrarySearchResults(items=[]),
-            summary=recalled,
+            summary=reply,
             summary_error=None,
         )
+    require_vector_db()
     result = run_simple_search(
         SimpleSearchRequest(query=contextual_library_query(request)),
         db_session,

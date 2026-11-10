@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy import Select, exists, func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, lazyload, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from onyx.db.enums import RegulatoryChunkStatus, UserFileStatus
@@ -78,13 +78,12 @@ def catalog_display_names(
 ) -> dict[UUID, str]:
     if not files:
         return {}
-    return dict(
-        db_session.execute(
-            select(UserFile.id, catalog_display_name_expression()).where(
-                UserFile.id.in_([file.id for file in files])
-            )
-        ).all()
+    rows = db_session.execute(
+        select(UserFile.id, catalog_display_name_expression()).where(
+            UserFile.id.in_([file.id for file in files])
+        )
     )
+    return {file_id: display_name for file_id, display_name in rows}
 
 
 def _name_matches(q: str) -> ColumnElement[bool]:
@@ -256,7 +255,10 @@ def list_catalog_folders(
 
 
 def catalog_search_rows(
-    db_session: Session, chunk_ids: Sequence[str]
+    db_session: Session,
+    chunk_ids: Sequence[str],
+    *,
+    include_document_sets: bool = True,
 ) -> dict[str, tuple[RegulatoryChunk, UserFile]]:
     if not chunk_ids:
         return {}
@@ -264,7 +266,12 @@ def catalog_search_rows(
         select(RegulatoryChunk, UserFile)
         .join(UserFile, UserFile.id == RegulatoryChunk.user_file_id)
         .where(RegulatoryChunk.id.in_(chunk_ids))
-        .options(selectinload(UserFile.document_sets))
+        .options(
+            lazyload(UserFile.projects),
+            selectinload(UserFile.document_sets)
+            if include_document_sets
+            else lazyload(UserFile.document_sets),
+        )
         .execution_options(populate_existing=True)
     ).all()
     return {chunk.id: (chunk, file) for chunk, file in rows}
