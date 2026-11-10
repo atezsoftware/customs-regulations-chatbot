@@ -11,7 +11,14 @@ from mistune import BlockParser, BlockState, InlineParser, InlineState
 from mistune.helpers import unescape_char
 
 from onyx.regulatory.amendments.annexes.models import SourceLink
-from onyx.regulatory.chunker import RegulatoryChunker
+from onyx.regulatory.chunker import (
+    DocumentMetadata,
+    RegulatoryChunker,
+    SourceBlock,
+    StructureNode,
+    _ChunkDraft,
+)
+from onyx.regulatory.document_intake.heading_coverage import retain_markdown_headings
 from onyx.regulatory.document_intake.models import IntakeSourceAsset
 
 _INLINE_ARTICLE = re.compile(
@@ -158,10 +165,15 @@ def _apply_replacements(text: str, replacements: list[tuple[int, int, str]]) -> 
 
 class _NavigationLinks(InlineParser):
     def __init__(
-        self, links: dict[str, SourceLink], assets: dict[str, IntakeSourceAsset]
+        self,
+        links: dict[str, SourceLink],
+        assets: dict[str, IntakeSourceAsset],
+        *,
+        declared_attachments: bool = False,
     ) -> None:
         super().__init__()
         self.links, self.assets = links, assets
+        self.declared_attachments = declared_attachments
         self.replacements: list[tuple[int, int, str]] = []
 
     def parse_link(self, m: Match[str], state: InlineState) -> int | None:
@@ -176,6 +188,8 @@ class _NavigationLinks(InlineParser):
             return end
         target = self.links.get(_reference_key(token["attrs"]["url"]))
         if target is None:
+            if self.declared_attachments:
+                return end
             raise ValueError(
                 "Attachment navigation does not match a resolved source asset"
             )
@@ -204,11 +218,14 @@ class _NavigationHtml(HTMLParser):
         text: str,
         links: dict[str, SourceLink],
         assets: dict[str, IntakeSourceAsset],
+        *,
+        declared_attachments: bool = False,
     ) -> None:
         super().__init__(convert_charrefs=True)
         self.lines = [0]
         self.lines.extend(match.end() for match in re.finditer("\n", text))
         self.links, self.assets = links, assets
+        self.declared_attachments = declared_attachments
         self.anchor: tuple[int, str, list[str]] | None = None
         self.replacements: list[tuple[int, int, str]] = []
 
@@ -239,6 +256,8 @@ class _NavigationHtml(HTMLParser):
             return
         target = self.links.get(_reference_key(href))
         if target is None:
+            if self.declared_attachments:
+                return
             raise ValueError(
                 "Attachment navigation does not match a resolved source asset"
             )
@@ -265,6 +284,14 @@ def normalize_attachment_navigation(
         and link.target_asset_hash != asset_sha256
     ]
     assets = {asset.sha256: asset for asset in package_assets}
+    # Explicit upload ownership does not assert that an old PDF URL identifies
+    # the uploaded Markdown. Preserve unmatched source links rather than inventing one.
+    declared_attachments = any(
+        link.kind == "embedded"
+        and link.source_field.startswith("markdown-draft:")
+        and not (link.original_url or link.requested_url or link.final_url)
+        for link in outgoing
+    )
     by_url = {
         _reference_key(url): link
         for link in outgoing
@@ -272,13 +299,15 @@ def normalize_attachment_navigation(
         if url
     }
     masked, environment = _mask_code(text)
-    parser = _NavigationLinks(by_url, assets)
+    parser = _NavigationLinks(by_url, assets, declared_attachments=declared_attachments)
     state = InlineState(environment)
     state.src = masked
     parser.parse(state)
     text = _apply_replacements(text, parser.replacements)
     masked, _environment = _mask_code(text)
-    html = _NavigationHtml(masked, by_url, assets)
+    html = _NavigationHtml(
+        masked, by_url, assets, declared_attachments=declared_attachments
+    )
     html.feed(masked)
     html.close()
     text = _apply_replacements(text, html.replacements)
@@ -383,9 +412,26 @@ def normalize_wrapped_article_headings(text: str) -> str:
     )
 
 
-def require_chunk_source_coverage(text: str) -> None:
+class _CoverageChunker(RegulatoryChunker):
+    def _build_drafts(
+        self, blocks: list[SourceBlock], *, metadata: DocumentMetadata
+    ) -> tuple[list[_ChunkDraft], list[StructureNode]]:
+        drafts, structure = super()._build_drafts(blocks, metadata=metadata)
+        return (
+            retain_markdown_headings(
+                drafts, structure, blocks=blocks, metadata=metadata
+            ),
+            structure,
+        )
+
+
+def require_chunk_source_coverage(
+    text: str, *, retain_markdown_headings: bool = False
+) -> None:
     """Every source letter/digit must reach a chunk or one of its delivered headings."""
-    chunked = RegulatoryChunker().chunk_text(text)
+    chunked = (
+        _CoverageChunker() if retain_markdown_headings else RegulatoryChunker()
+    ).chunk_text(text)
     if not chunked.chunks:
         raise ValueError("The source has no reviewable canonical chunks")
     intervals = [
@@ -402,7 +448,7 @@ def require_chunk_source_coverage(text: str) -> None:
             intervals.append((block.start_char, block.end_char))
     title = chunked.metadata.title
     first_line = chunked.content.split("\n", 1)[0]
-    visible_first_line = first_line.lstrip("# \t").strip("*_ \t")
+    visible_first_line = first_line.lstrip("# \t").strip("*_ \t\r")
     if title == visible_first_line and any(
         title in chunk.metadata.heading_path for chunk in chunked.chunks
     ):
@@ -443,5 +489,7 @@ def prepare_intake_text(
         normalized = normalize_wrapped_annex_references(normalized)
     if "".join(text.split()) != "".join(normalized.split()):
         raise ValueError("New document normalization changed the source wording")
-    require_chunk_source_coverage(normalized)
+    require_chunk_source_coverage(
+        normalized, retain_markdown_headings=preserve_markdown_headings
+    )
     return normalized

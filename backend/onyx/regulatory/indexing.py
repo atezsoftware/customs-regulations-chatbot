@@ -38,6 +38,7 @@ from onyx.regulatory.contextual import (
 from onyx.regulatory.document_intake.chunking_profile import (
     documents_intake_chunking_version,
     intake_chunking_version,
+    intake_markdown_heading_retention,
     intake_preparation_policy,
 )
 from onyx.regulatory.document_intake.embedding_policy import (
@@ -188,6 +189,7 @@ class RegulatoryIndexingChunker:
             source_file=source_file,
             intake_version=intake_version,
             preparation_policy=policy,
+            retain_markdown_headings=intake_markdown_heading_retention(document),
         )
         for warning in chunked.warnings:
             logger.warning(
@@ -294,6 +296,7 @@ class RegulatoryIndexingChunker:
         source_file: str,
         intake_version: str | None = None,
         preparation_policy: IntakePreparationPolicy | None = None,
+        retain_markdown_headings: bool = False,
     ) -> tuple[ChunkedDocument, list[int]]:
         """Keep legal text intact while reserving room for contextual summaries."""
 
@@ -317,6 +320,7 @@ class RegulatoryIndexingChunker:
                 )
 
                 structural_chunker = IntakeRegulatoryChunker(
+                    retain_markdown_headings=retain_markdown_headings,
                     chunking_version=intake_version,
                     tokenizer=self.tokenizer,
                     content_token_limit=max(

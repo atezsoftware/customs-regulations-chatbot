@@ -35,6 +35,7 @@ from onyx.regulatory.document_intake.chunking_profile import (
     is_multi_cell_table_row,
 )
 from onyx.regulatory.document_intake.document_profile import intake_document_profile
+from onyx.regulatory.document_intake.heading_coverage import retain_markdown_headings
 from onyx.regulatory.document_intake.headings import promote_plain_article_titles
 from onyx.regulatory.document_intake.logical_tables import (
     LogicalTable,
@@ -105,6 +106,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         chunking_version: str = INTAKE_CHUNKING_CODE_VERSION,
         whole_table_row_token_limit: int | None = None,
         table_content_token_limit: int | None = None,
+        retain_markdown_headings: bool = False,
     ) -> None:
         if content_token_limit < 1:
             raise ValueError("Intake content token limit must be positive")
@@ -116,6 +118,7 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
         self.tokenizer = tokenizer
         self.content_token_limit = content_token_limit
         self.chunking_version = chunking_version
+        self.retain_markdown_headings = retain_markdown_headings
         if chunking_version in {"4", "5"} and table_content_token_limit is None:
             raise ValueError("Intake v4 requires its frozen table content budget")
         self.table_content_token_limit = table_content_token_limit
@@ -434,7 +437,16 @@ class IntakeRegulatoryChunker(RegulatoryChunker):
             retained, structure = self._bind_table_captions(
                 retained, structure, blocks, metadata
             )
-        return retained, structure
+        return (
+            (
+                retain_markdown_headings(
+                    retained, structure, blocks=blocks, metadata=metadata
+                )
+                if self.retain_markdown_headings
+                else retained
+            ),
+            structure,
+        )
 
     def _bind_table_captions(
         self,
