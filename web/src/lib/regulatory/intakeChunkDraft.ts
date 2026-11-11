@@ -98,8 +98,6 @@ export function intakeChunkDraftUpdate(
 export function hasIntakeLabelingProblem(chunk: RegulatoryChunk): boolean {
   return (
     Boolean(chunk.labeling_error) ||
-    ["failed", "abstained", "abstain", "stale", "cancelled"].includes(
-      chunk.labeling_status ?? ""
-    )
+    ["failed", "stale", "cancelled"].includes(chunk.labeling_status ?? "")
   );
 }

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from onyx.regulatory.labeling.abstention import ProviderAbstentionReceipt
 from onyx.regulatory.labeling.article_lead_in import SourceOnlyArticleLeadInReceipt
 from onyx.regulatory.labeling.chapter_caption import SourceOnlyChapterCaptionReceipt
 from onyx.regulatory.labeling.intake_abstention_repair import AbstentionRepairAudit
@@ -11,6 +12,11 @@ from onyx.regulatory.labeling.intake_duplicate_label_repair import (
 from onyx.regulatory.labeling.provider import LabelingOutcome
 from onyx.regulatory.labeling.reviewed_fragment import SourceOnlyReviewedFragmentReceipt
 from onyx.regulatory.labeling.self_repeal import SourceOnlySelfRepealReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedProviderAbstention:
+    receipt: ProviderAbstentionReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,7 @@ class SourceOnlyReviewedFragment:
 
 LabelingApplyOutcome = (
     tuple[list[str], list[dict[str, object]]]
+    | AcceptedProviderAbstention
     | AcceptedIntakeRepair
     | AcceptedDuplicateLabelRepair
     | SourceOnlySelfRepeal

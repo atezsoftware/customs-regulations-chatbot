@@ -216,13 +216,19 @@ def background_label_snapshot(
     run = (
         session.get(RegulatoryLabelingRun, batch.labeling_run_id)
         if batch.labeling_run_id
+        and batch.background_label_status not in {"pending", "waiting"}
         else None
+    )
+    classified, unlabelled = (
+        labeling.completed_classification_counts(session, run.id) if run else (0, 0)
     )
     return {
         "status": batch.background_label_status,
         "error": batch.background_label_error,
         "total_chunks": run.total_chunks if run else 0,
         "completed_chunks": run.completed_chunks if run else 0,
+        "classified_chunks": classified,
+        "unlabelled_chunks": unlabelled,
         "failed_chunks": run.failed_chunks if run else 0,
     }
 

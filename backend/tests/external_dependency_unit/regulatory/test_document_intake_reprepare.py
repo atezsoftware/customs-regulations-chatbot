@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
-from onyx.db import document_intake_metadata
+from onyx.db import document_intake_metadata, document_intake_preparation_lease
 from onyx.db import document_intake_reprepare as repository
 from onyx.db.document_intake_sources import create_markdown_source_package
 from onyx.db.models import (
@@ -85,6 +85,9 @@ def _fixture(
         user=user,
         environment=_ENVIRONMENT,
     )
+    # This fixture exercises the legacy blocking-label preparation contract.
+    batch.background_labeling_enabled = False
+    batch.metadata_extraction_mode = None
     batch_id, model_id = batch.id, model.id
     session.commit()
     from types import SimpleNamespace
@@ -524,3 +527,45 @@ def test_stale_request_does_not_detach_old_run_and_idempotency_preserves_request
         ).id
         == request.id
     )
+
+
+def test_reprepare_renews_inside_long_batch_locked_canonical_transaction(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    native_markdown_runtime: PostgresBackedFileStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from onyx.regulatory import indexing
+
+    batch, _old_run_id = _fixture(
+        intake_session, intake_owner, native_markdown_runtime, monkeypatch
+    )
+    request = _request(intake_session, batch)
+    batch_id, request_id = batch.id, request.id
+    clock = [datetime.now(timezone.utc)]
+    original_chunk = indexing.documents_to_regulatory_chunks
+    completed_transactions = []
+
+    class PreparationClock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            return clock[0].astimezone(tz)
+
+    def slow_chunk(*args: Any, **kwargs: Any) -> Any:
+        chunks = original_chunk(*args, **kwargs)
+        clock[0] += timedelta(minutes=11)
+        completed_transactions.append(clock[0])
+        return chunks
+
+    monkeypatch.setattr(repository, "datetime", PreparationClock)
+    monkeypatch.setattr(document_intake_preparation_lease, "datetime", PreparationClock)
+    monkeypatch.setattr(indexing, "documents_to_regulatory_chunks", slow_chunk)
+    run_id = reprepare_job.run_document_intake_reprepare(
+        intake_id=batch_id, request_id=request_id, tenant_id=get_current_tenant_id()
+    )
+    assert run_id is not None
+    intake_session.expire_all()
+    request = intake_session.get_one(RegulatoryDocumentIntakeReprepare, request_id)
+    assert request.status == "prepared"
+    assert len(completed_transactions) == len(request.documents)
+    assert all(entry["status"] == "prepared" for entry in request.documents.values())

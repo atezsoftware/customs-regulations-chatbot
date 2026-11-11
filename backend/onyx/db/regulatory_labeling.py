@@ -78,6 +78,7 @@ from onyx.regulatory.indexing_jobs.vertex_batch import (
 from onyx.regulatory.labeling.accepted_result import (
     AcceptedDuplicateLabelRepair,
     AcceptedIntakeRepair,
+    AcceptedProviderAbstention,
     LabelingApplyOutcome,
     SourceOnlyArticleLeadIn,
     SourceOnlyChapterCaption,
@@ -2305,7 +2306,23 @@ def _apply_frozen_window_results(
             item.status = "failed"
             item.error = outcome[:4000]
             continue
-        if isinstance(outcome, SourceOnlyReviewedFragment):
+        if isinstance(outcome, AcceptedProviderAbstention):
+            from onyx.regulatory.labeling.abstention import (
+                ABSTENTION_KEY,
+                ProviderAbstentionReceipt,
+            )
+
+            receipt = ProviderAbstentionReceipt.model_validate(
+                outcome.receipt.model_dump()
+            )
+            if receipt.request_hash != item.request_hash:
+                raise ValueError("The provider abstention request changed")
+            item.source_snapshot = {
+                **item.source_snapshot,
+                ABSTENTION_KEY: receipt.model_dump(mode="json"),
+            }
+            labels, assignments = [], []
+        elif isinstance(outcome, SourceOnlyReviewedFragment):
             from onyx.db.regulatory_labeling_reviewed_fragment import (
                 validate_item_reviewed_fragment_receipt,
             )
@@ -2550,6 +2567,23 @@ def _refresh_counts(session: Session, run: RegulatoryLabelingRun) -> None:
     run.completed_chunks = int(counts.get("completed", 0))
     run.failed_chunks = int(counts.get("failed", 0))
     run.stale_chunks = int(counts.get("stale", 0))
+
+
+def completed_classification_counts(session: Session, run_id: UUID) -> tuple[int, int]:
+    classified, unlabelled = session.execute(
+        select(
+            func.count().filter(
+                func.jsonb_array_length(RegulatoryLabelingItem.labels) > 0
+            ),
+            func.count().filter(
+                func.jsonb_array_length(RegulatoryLabelingItem.labels) == 0
+            ),
+        ).where(
+            RegulatoryLabelingItem.run_id == run_id,
+            RegulatoryLabelingItem.status == "completed",
+        )
+    ).one()
+    return int(classified), int(unlabelled)
 
 
 def _projection_item_query() -> Select[tuple[RegulatoryLabelingItem]]:

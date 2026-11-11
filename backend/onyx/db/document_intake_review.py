@@ -386,7 +386,24 @@ def validate_publication_review(
 def publication_review_digest(
     session: Session, batch: RegulatoryDocumentIntake
 ) -> str | None:
+    from onyx.db.document_intake_background_labels import uses_background_labels
     from onyx.db.document_intake_edit import edit_review_digest
+
+    if (
+        uses_background_labels(batch)
+        and batch.status == "ready"
+        and batch.stage == "review"
+    ):
+        from onyx.db.document_intake import review_digest
+
+        current = review_digest(session, batch)
+        return (
+            compose_intake_publication_review_digest(
+                current, publication_decision_payload(session, batch)
+            )
+            if current == batch.review_sha256
+            else None
+        )
 
     receipt = edit_review_digest(session, batch)
     if receipt is None:
@@ -489,10 +506,37 @@ def parent_labeling_context(session: Session, file_id: UUID) -> dict[str, Any] |
 
 def _replace_labels(
     session: Session, batch: RegulatoryDocumentIntake, changed_file_ids: set[UUID]
-) -> UUID:
+) -> UUID | None:
     from onyx.db import document_intake as intake
     from onyx.db import regulatory_labeling as labeling
+    from onyx.db.document_intake_background_labels import (
+        schedule_background_labels,
+        uses_background_labels,
+    )
     from onyx.db.document_intake_edit import _copy_unchanged_label_results
+
+    if uses_background_labels(batch):
+        if batch.labeling_run_id is not None:
+            previous = session.get(
+                RegulatoryLabelingRun, batch.labeling_run_id, with_for_update=True
+            )
+            if (
+                previous is None
+                or previous.document_set_id != batch.document_set_id
+                or previous.requested_by_id != batch.created_by
+            ):
+                raise intake.IntakeConflictError(
+                    "The background labeling owner changed"
+                )
+            labeling.request_cancellation(
+                session, document_set_id=batch.document_set_id, run_id=previous.id
+            )
+        batch.status, batch.stage, batch.error = "ready", "review", None
+        for member in effective_intake_files(session, batch):
+            member.status, member.error = "ready", None
+        schedule_background_labels(session, batch)
+        session.flush()
+        return None
 
     previous = session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
     user = session.get_one(User, batch.created_by)
@@ -549,11 +593,14 @@ def set_publication_review(
     user: User,
 ) -> UUID | None:
     from onyx.db import document_intake as intake
+    from onyx.db.document_intake_background_labels import uses_background_labels
 
     with session.begin_nested():
         session.refresh(batch, with_for_update=True)
         session.get_one(DocumentSet, batch.document_set_id, with_for_update=True)
         intake.refresh_intake(session, batch)
+        background = uses_background_labels(batch)
+        previous_canonical_review = batch.review_sha256
         if (
             user.id != batch.created_by
             or not expected_review_sha256
@@ -669,6 +716,8 @@ def set_publication_review(
             and disposition == "source_evidence"
             or previous is not None
             and previous.disposition != disposition
+            or previous is not None
+            and previous.duplicate_of_document_id != duplicate_of_document_id
         )
         parent_changed = existing_parent_file_id is not None or (
             previous is not None and previous.existing_parent_file_id is not None
@@ -677,15 +726,24 @@ def set_publication_review(
             _replace_labels(
                 session, batch, {member.user_file_id} if parent_changed else set()
             )
-            if target_changed or parent_changed
+            if target_changed
+            or parent_changed
+            or (
+                background
+                and batch.background_label_source_sha256 != previous_canonical_review
+            )
             else None
         )
         if disposition == "source_evidence":
             member.status, member.error = "source_evidence", None
         elif previous is not None and previous.disposition == "source_evidence":
-            member.status = "labeling"
+            from onyx.db.document_intake_background_labels import uses_background_labels
+
+            member.status = "ready" if uses_background_labels(batch) else "labeling"
         if run_id is None and batch.status == "ready":
             batch.review_sha256 = intake.review_digest(session, batch)
+            if background:
+                batch.background_label_source_sha256 = batch.review_sha256
         session.flush()
         return run_id
 

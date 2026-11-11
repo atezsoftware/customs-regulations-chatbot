@@ -1,5 +1,7 @@
 "use client";
 
+import { intakeDocumentCaption } from "@/lib/regulatory/intakeDocumentDisplay";
+
 import { useEffect, useState } from "react";
 import useSWR from "swr";
 import {
@@ -118,7 +120,7 @@ export default function IntakePredecessorReview({
 
   return (
     <section
-      aria-label={`Previous legislation for ${document.display_name}`}
+      aria-label={`Previous legislation for ${intakeDocumentCaption(document)}`}
       className="flex flex-col gap-2 rounded-12 border border-border-02 p-3"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -172,7 +174,7 @@ export default function IntakePredecessorReview({
         <>
           <div className="flex flex-wrap items-center gap-2">
             <InputTypeIn
-              aria-label={`Search previous legislation for ${document.display_name}`}
+              aria-label={`Search previous legislation for ${intakeDocumentCaption(document)}`}
               placeholder="Search by legislation title or number"
               value={query}
               onChange={(event) => setQuery(event.target.value)}

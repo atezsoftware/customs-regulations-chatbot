@@ -15,6 +15,10 @@ import IntakePublicationReview, {
 import IntakeSourceIssues from "@/views/admin/IntakeSourceIssues";
 import MarkdownDraftStaging from "@/sections/admin/MarkdownDraftStaging";
 import {
+  intakeDocumentCaption,
+  intakeLegalTitleUnresolved,
+} from "@/lib/regulatory/intakeDocumentDisplay";
+import {
   type AmendmentSourcePackage,
   createAmendmentSourcePackage,
   getAmendmentSourcePackage,
@@ -276,12 +280,12 @@ function DocumentPreview({
       ref={cardRef}
       id={documentCardId(document.id)}
       tabIndex={-1}
-      aria-label={`${document.display_name}${document.mime_type ? ` · ${document.mime_type}` : ""}`}
+      aria-label={`${intakeDocumentCaption(document)}${document.mime_type ? ` · ${document.mime_type}` : ""}`}
       className="flex flex-col gap-3 rounded-12 border border-border-02 p-4"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <Text as="h3" font="main-ui-action">
-          {document.display_name}
+          {intakeDocumentCaption(document)}
         </Text>
         <div className="flex flex-wrap gap-2">
           <Tag
@@ -291,14 +295,19 @@ function DocumentPreview({
           <Tag title={document.status.replaceAll("_", " ")} />
         </div>
       </div>
+      {intakeLegalTitleUnresolved(document) && (
+        <Text as="p" font="secondary-body" color="text-03">
+          Legal title unresolved.
+        </Text>
+      )}
       <Text font="secondary-body" color="text-03">
         {sourceEvidence
-          ? `Another rendition of ${duplicateOf?.display_name ?? "the selected document"}`
+          ? `Another rendition of ${duplicateOf ? intakeDocumentCaption(duplicateOf) : "the selected document"}`
           : document.existing_parent
             ? `Attachment to existing legislation: ${document.existing_parent.display_name}`
             : document.role === "root"
               ? "Main document"
-              : `Attachment to ${parent?.display_name ?? "main document"}`}
+              : `Attachment to ${parent ? intakeDocumentCaption(parent) : "main document"}`}
       </Text>
       {document.source_display_name && (
         <Text
@@ -325,7 +334,7 @@ function DocumentPreview({
                 href={`#${documentCardId(duplicateOf.id)}`}
                 disabled={busy}
                 onClick={() => onNavigate(duplicateOf.id)}
-              >{`Open legislation ${duplicateOf.display_name}`}</Button>
+              >{`Open legislation ${intakeDocumentCaption(duplicateOf)}`}</Button>
             </div>
           )}
         </div>
@@ -339,7 +348,7 @@ function DocumentPreview({
               onClick={() => onNavigate(parent.id)}
               disabled={busy}
             >
-              {`Back to ${parent.display_name}`}
+              {`Back to ${intakeDocumentCaption(parent)}`}
             </Button>
           )}
           {relatedDocuments.map((link) => (
@@ -414,7 +423,7 @@ function DocumentPreview({
               <IntakeChunkReviewCard
                 key={`${chunk.id}:${draftEpoch}`}
                 chunk={chunk}
-                documentName={document.display_name}
+                documentName={intakeDocumentCaption(document)}
                 sourceUrl={document.source_url}
                 reviewSha256={editReceipt}
                 editable={canReviewChunks(batch) && !isLoading && !error}
@@ -1112,7 +1121,7 @@ export default function NewDocumentIntake() {
                 setBusy(false);
                 setRequestError(null);
               }}
-            >{`${item.documents[0]?.display_name ?? "New documents"} (${item.status})`}</Button>
+            >{`${item.documents[0] ? intakeDocumentCaption(item.documents[0]) : "New documents"} (${item.status})`}</Button>
           ))}
         </div>
       )}
@@ -1145,7 +1154,20 @@ export default function NewDocumentIntake() {
               className="flex flex-col gap-2 rounded-08 border border-border-02 p-3"
             >
               <Text font="main-ui-action">{`Labeling: ${batch.background_labeling.status}`}</Text>
-              <Text font="secondary-body">{`${batch.background_labeling.completed_chunks} of ${batch.background_labeling.total_chunks} chunks labeled · ${batch.background_labeling.failed_chunks} failed`}</Text>
+              <Text font="secondary-body">
+                {[
+                  `${batch.background_labeling.completed_chunks} of ${batch.background_labeling.total_chunks} chunks processed`,
+                  ...(batch.background_labeling.classified_chunks !==
+                    undefined &&
+                  batch.background_labeling.unlabelled_chunks !== undefined
+                    ? [
+                        `${batch.background_labeling.classified_chunks} classified`,
+                        `${batch.background_labeling.unlabelled_chunks} no applicable label`,
+                      ]
+                    : []),
+                  `${batch.background_labeling.failed_chunks} failed`,
+                ].join(" · ")}
+              </Text>
               <Text as="p" font="secondary-body" color="text-03">
                 Labeling runs separately from legal metadata review. Approval
                 becomes available when the legal metadata review is ready.
