@@ -264,3 +264,49 @@ test("shows the failed labeling reason on its chunk while keeping partial review
     screen.queryByRole("button", { name: "Save chunk changes" })
   ).not.toBeInTheDocument();
 });
+
+test.each(["abstain", "abstained"])(
+  "does not show an error for a successful %s outcome without a label",
+  (status) => {
+    render(
+      <IntakeChunkReviewCard
+        chunk={{ ...chunk, labeling_status: status, labeling_error: null }}
+        reviewSha256={"f".repeat(64)}
+        editable
+        disabled={false}
+        onSave={jest.fn()}
+      >
+        No applicable labels.
+      </IntakeChunkReviewCard>
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("After text")).not.toHaveAttribute("readonly");
+  }
+);
+
+test.each([
+  { status: "abstained", error: "Provider request failed." },
+  { status: "failed", error: null },
+  { status: "stale", error: null },
+  { status: "cancelled", error: null },
+])("keeps actual labeling errors visible for $status", ({ status, error }) => {
+  render(
+    <IntakeChunkReviewCard
+      chunk={{ ...chunk, labeling_status: status, labeling_error: error }}
+      reviewSha256={"f".repeat(64)}
+      editable
+      disabled={false}
+      onSave={jest.fn()}
+    >
+      Preview
+    </IntakeChunkReviewCard>
+  );
+  const alert = screen.getByRole("alert");
+  expect(within(alert).getByText(`Labeling: ${status}`)).toBeVisible();
+  expect(within(alert).queryByText(/before approval/i)).not.toBeInTheDocument();
+  if (error) expect(within(alert).getByText(error)).toBeVisible();
+  else
+    expect(
+      within(alert).getByText(/legal metadata review remains available/i)
+    ).toBeVisible();
+});

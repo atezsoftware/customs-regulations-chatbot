@@ -1,4 +1,4 @@
-"""Reader-only structural projection must preserve ordinary classifier failures."""
+"""Optional abstentions complete without manufacturing labels or extra calls."""
 
 import json
 from types import SimpleNamespace
@@ -14,6 +14,7 @@ from onyx.db.models import RegulatoryLabelingItem
 from onyx.db.regulatory_labeling import RunLease
 from onyx.regulatory.indexing_jobs.vertex_batch import VertexBatchGateway
 from onyx.regulatory.labeling import orchestrator
+from onyx.regulatory.labeling.accepted_result import AcceptedProviderAbstention
 from onyx.regulatory.labeling.provider import (
     LabelDefinition,
     TaxonomyDefinition,
@@ -21,7 +22,7 @@ from onyx.regulatory.labeling.provider import (
 )
 
 
-def test_ordinary_body_abstention_stays_a_failure_outcome(
+def test_ordinary_body_abstention_is_a_valid_empty_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     text = "İthalatçı menşe belgelerini gümrük idaresine ibraz eder."
@@ -96,8 +97,12 @@ def test_ordinary_body_abstention_stays_a_failure_outcome(
 
     orchestrator._read_and_apply_results(lease, shard_id, gateway, "retained-ack")
 
-    assert apply.call_args.kwargs["outcomes"] == {
-        request.request_hash: "Model abstained: insufficient evidence"
+    outcome = apply.call_args.kwargs["outcomes"][request.request_hash]
+    assert isinstance(outcome, AcceptedProviderAbstention)
+    assert outcome.receipt.request_hash == request.request_hash
+    assert json.loads(outcome.receipt.response_text) == {
+        "labels": [],
+        "abstained": True,
     }
     assert apply.call_args.kwargs["item_ids"] == [item.id]
     repair.assert_not_called()

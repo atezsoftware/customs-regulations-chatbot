@@ -411,6 +411,11 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             )
         )
     )
+    preparation_owned_expiry = (
+        batch.stage in {"chunking", "reprepare"}
+        and batch.lease_token is not None
+        and batch.lease_expires_at is not None
+    )
     if (
         batch.status == "preparing"
         and batch.stage
@@ -425,6 +430,7 @@ def refresh_intake(session: Session, batch: RegulatoryDocumentIntake) -> None:
             and batch.lease_expires_at is None
         )
         and not checkpoint_owned_expiry
+        and not preparation_owned_expiry
     ):
         deadline = batch.lease_expires_at or (
             batch.updated_at + datetime.timedelta(seconds=INTAKE_DELIVERY_SECONDS)

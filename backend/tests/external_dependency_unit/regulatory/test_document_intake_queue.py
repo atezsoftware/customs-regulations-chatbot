@@ -12,6 +12,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
+from onyx.db import document_intake_preparation_lease as preparation
 from onyx.db import document_intake_queue as queue
 from onyx.db import document_intake_reprepare as reprepare
 from onyx.db import regulatory_labeling as labeling
@@ -27,6 +28,7 @@ from onyx.db.models import (
     User,
     UserRole,
 )
+from onyx.regulatory.document_intake.metadata_checkpoint import MetadataLeaseLost
 from tests.external_dependency_unit.regulatory.test_document_intake import (
     _ENVIRONMENT,
     _admitted,
@@ -89,14 +91,15 @@ def test_only_due_unclaimed_scoped_intents_are_reserved(
         intake_session, environment=_ENVIRONMENT, now=now
     )
     assert [delivery.batch_id for delivery in deliveries] == (
-        [batch.id] if case == "queued" else []
+        [batch.id] if case in {"queued", "expired_claim"} else []
     )
     assert all(delivery.reprepare_request_id is None for delivery in deliveries)
     assert [
         (row.id, row.text) for row in intake_session.scalars(select(RegulatoryChunk))
     ] == before_chunks
     assert len(members) == 2
-    if case == "queued":
+    if case in {"queued", "expired_claim"}:
+        assert batch.lease_token is None and batch.lease_expires_at is None
         intake.refresh_intake(intake_session, batch)
         assert batch.status == "preparing"
         assert intake.intake_snapshot(intake_session, batch)["stage"] == "queued"
@@ -123,7 +126,7 @@ def test_only_due_unclaimed_scoped_intents_are_reserved(
 
 
 @pytest.mark.parametrize("kind", ["initial", "reprepare"])
-def test_late_deliveries_never_reclaim_expired_paid_work(
+def test_late_deliveries_require_mutex_fenced_recovery_before_new_source_claim(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
     kind: str,
@@ -151,13 +154,16 @@ def test_late_deliveries_never_reclaim_expired_paid_work(
     ) is None
     assert batch.lease_token == old_token
     intake.refresh_intake(intake_session, batch)
-    assert batch.status == "failed"
+    assert batch.status == "preparing" and batch.lease_token == old_token
     assert (
         reprepare.claim_reprepare(intake_session, batch.id, request.id)
         if request
         else intake.claim_intake(intake_session, batch.id)
     ) is None
-    intake.retry_intake(intake_session, batch)
+    deliveries = queue.reserve_intake_preparation_deliveries(
+        intake_session, environment=_ENVIRONMENT
+    )
+    assert [delivery.batch_id for delivery in deliveries] == [batch.id]
     assert (
         reprepare.claim_reprepare(intake_session, batch.id, request.id)
         if request
@@ -367,3 +373,140 @@ def test_cached_preclaim_row_cannot_overwrite_another_delivery_claim(
         assert token is not None
         assert intake.claim_intake(stale, ids[0]) is None
         assert cached.lease_token == token
+
+
+@pytest.mark.parametrize("stage", ["chunking", "reprepare"])
+def test_live_source_mutex_blocks_expired_claim_recovery_until_worker_exits(
+    committed_queue: tuple[Engine, str, list[UUID]],
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    engine, environment, ids = committed_queue
+    monkeypatch.setattr(preparation, "get_sqlalchemy_engine", lambda: engine)
+    old_token = uuid4()
+    with Session(engine) as session:
+        batch = session.get_one(RegulatoryDocumentIntake, ids[0])
+        batch.stage = stage
+        batch.lease_token = old_token
+        batch.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        batch.metadata_checkpoint = {"source": "preserved"}
+        request = None
+        if stage == "reprepare":
+            request = RegulatoryDocumentIntakeReprepare(
+                intake_id=batch.id,
+                idempotency_key=uuid4(),
+                expected_sha256="a" * 64,
+                status="running",
+                documents={"reviewed-document": {"status": "prepared"}},
+            )
+            session.add(request)
+        session.commit()
+        request_id = request.id if request is not None else None
+    with preparation.preparation_execution_lock(ids[0]) as acquired:
+        assert acquired
+        with Session(engine) as session:
+            deliveries = queue.reserve_intake_preparation_deliveries(
+                session, environment=environment
+            )
+            session.commit()
+            assert ids[0] not in {item.batch_id for item in deliveries}
+            batch = session.get_one(RegulatoryDocumentIntake, ids[0])
+            assert batch.lease_token == old_token
+            assert batch.metadata_checkpoint == {"source": "preserved"}
+    with Session(engine) as session:
+        deliveries = queue.reserve_intake_preparation_deliveries(
+            session, environment=environment
+        )
+        assert deliveries == [queue.IntakePreparationDelivery(ids[0], request_id)]
+        session.commit()
+        batch = session.get_one(RegulatoryDocumentIntake, ids[0])
+        assert batch.lease_token is None and batch.lease_expires_at is None
+        assert batch.metadata_checkpoint == {"source": "preserved"}
+        if request_id is not None:
+            request = session.get_one(RegulatoryDocumentIntakeReprepare, request_id)
+            assert request.status == "queued"
+            assert request.documents == {"reviewed-document": {"status": "prepared"}}
+        with pytest.raises(MetadataLeaseLost):
+            preparation.heartbeat_preparation(session, ids[0], old_token)
+
+
+@pytest.mark.parametrize("stage", ["chunking", "reprepare"])
+def test_preparation_heartbeat_renews_only_current_live_source_claim(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+    stage: str,
+) -> None:
+    batch, members = _admitted(intake_session, *intake_owner)
+    token = intake.claim_intake(intake_session, batch.id)
+    assert token is not None
+    batch.stage = stage
+    now = datetime.now(timezone.utc)
+    batch.lease_expires_at = now + timedelta(seconds=1)
+    batch.metadata_checkpoint = {"review": "unchanged"}
+    intake_session.flush()
+    preparation.heartbeat_preparation(intake_session, batch.id, token)
+    assert batch.lease_expires_at is not None
+    assert batch.lease_expires_at > now + timedelta(seconds=500)
+    assert batch.stage == stage
+    assert batch.metadata_checkpoint == {"review": "unchanged"}
+    assert len(members) == 2
+    valid_deadline = batch.lease_expires_at
+    with pytest.raises(MetadataLeaseLost):
+        preparation.heartbeat_preparation(intake_session, batch.id, uuid4())
+    assert batch.lease_expires_at == valid_deadline
+    batch.lease_expires_at = now - timedelta(seconds=1)
+    intake_session.flush()
+    with pytest.raises(MetadataLeaseLost):
+        preparation.heartbeat_preparation(intake_session, batch.id, token)
+    assert batch.lease_expires_at is not None
+    assert batch.lease_expires_at < now
+
+
+def test_background_renewal_defers_to_batch_locked_canonical_transaction(
+    committed_queue: tuple[Engine, str, list[UUID]],
+) -> None:
+    engine, _environment, ids = committed_queue
+    token = uuid4()
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=1)
+    with Session(engine) as session:
+        batch = session.get_one(RegulatoryDocumentIntake, ids[0])
+        batch.stage, batch.lease_token, batch.lease_expires_at = (
+            "reprepare",
+            token,
+            deadline,
+        )
+        session.commit()
+    with Session(engine) as writer:
+        batch = writer.get_one(RegulatoryDocumentIntake, ids[0], with_for_update=True)
+        with Session(engine) as renewal:
+            preparation.heartbeat_preparation(renewal, ids[0], token, skip_locked=True)
+            renewal.commit()
+        assert batch.lease_expires_at == deadline
+        # The canonical writer commits its own renewal before releasing this lock.
+        batch.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+        writer.commit()
+    with Session(engine) as renewal:
+        preparation.heartbeat_preparation(renewal, ids[0], token)
+        assert (
+            renewal.get_one(RegulatoryDocumentIntake, ids[0]).lease_expires_at
+            != deadline
+        )
+
+
+def test_snapshot_poll_preserves_expired_claim_for_durable_recovery(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+) -> None:
+    user, target, model = intake_owner
+    batch, _members = _admitted(intake_session, user, target, model)
+    token = uuid4()
+    batch.lease_token = token
+    batch.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    intake_session.flush()
+    intake.refresh_intake(intake_session, batch)
+    assert batch.status == "preparing" and batch.lease_token == token
+    deliveries = queue.reserve_intake_preparation_deliveries(
+        intake_session, environment=_ENVIRONMENT
+    )
+    assert [row.batch_id for row in deliveries] == [batch.id]
+    assert batch.lease_token is None

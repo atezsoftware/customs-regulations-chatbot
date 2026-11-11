@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
 from onyx.db import regulatory_labeling
+from onyx.db.document_intake_preparation_lease import try_reserve_preparation_execution
 from onyx.db.document_intake_reprepare import latest_reprepare
 from onyx.db.models import AmendmentSourcePackage, RegulatoryDocumentIntake
 from onyx.regulatory.document_intake.models import INTAKE_DELIVERY_SECONDS
@@ -37,7 +38,7 @@ def reserve_intake_preparation_deliveries(
     limit: int = 10,
     now: datetime | None = None,
 ) -> list[IntakePreparationDelivery]:
-    """Commit reservations before sending hints; an existing claim is never replayed."""
+    """Redeliver abandoned claims only after excluding a live source worker."""
     _require_limit(limit)
     current = now or datetime.now(timezone.utc)
     batches = list(
@@ -51,12 +52,22 @@ def reserve_intake_preparation_deliveries(
                 AmendmentSourcePackage.environment == environment,
                 RegulatoryDocumentIntake.status == "preparing",
                 RegulatoryDocumentIntake.stage.in_(("chunking", "reprepare")),
-                RegulatoryDocumentIntake.lease_token.is_(None),
-                RegulatoryDocumentIntake.lease_expires_at.is_(None),
-                RegulatoryDocumentIntake.updated_at
-                < current
-                - timedelta(
-                    seconds=INTAKE_DELIVERY_SECONDS + INTAKE_REDELIVERY_GRACE_SECONDS
+                or_(
+                    and_(
+                        RegulatoryDocumentIntake.lease_token.is_(None),
+                        RegulatoryDocumentIntake.lease_expires_at.is_(None),
+                        RegulatoryDocumentIntake.updated_at
+                        < current
+                        - timedelta(
+                            seconds=INTAKE_DELIVERY_SECONDS
+                            + INTAKE_REDELIVERY_GRACE_SECONDS
+                        ),
+                    ),
+                    and_(
+                        RegulatoryDocumentIntake.lease_token.is_not(None),
+                        RegulatoryDocumentIntake.lease_expires_at.is_not(None),
+                        RegulatoryDocumentIntake.lease_expires_at < current,
+                    ),
                 ),
             )
             .order_by(RegulatoryDocumentIntake.updated_at, RegulatoryDocumentIntake.id)
@@ -67,6 +78,8 @@ def reserve_intake_preparation_deliveries(
     )
     deliveries = []
     for batch in batches:
+        if not try_reserve_preparation_execution(session, batch.id):
+            continue
         request_id = None
         if batch.stage == "reprepare":
             request = latest_reprepare(session, batch.id)
@@ -79,6 +92,9 @@ def reserve_intake_preparation_deliveries(
                 )
                 continue
             request_id = request.id
+            if batch.lease_token is not None:
+                request.status, request.error = "queued", None
+        batch.lease_token, batch.lease_expires_at = None, None
         batch.updated_at = current
         deliveries.append(IntakePreparationDelivery(batch.id, request_id))
     session.flush()

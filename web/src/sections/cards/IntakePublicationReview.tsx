@@ -21,6 +21,7 @@ import { documentPdfUrl, fetchChunkPageForFile } from "@/lib/regulatory/svc";
 import type { RegulatoryChunk } from "@/lib/regulatory/interfaces";
 import { ChunkContent } from "@/sections/cards/ChunkChangeCard";
 import { ReadOnlyFieldValue } from "@/sections/cards/ChunkFieldsReview";
+import { intakeDocumentCaption } from "@/lib/regulatory/intakeDocumentDisplay";
 
 interface RetainedSourceChunkProps {
   chunk: RegulatoryChunk;
@@ -283,7 +284,7 @@ export default function IntakePublicationReview({
 
   return (
     <section
-      aria-label={`Document identity for ${document.display_name}`}
+      aria-label={`Document identity for ${intakeDocumentCaption(document)}`}
       className="flex flex-col gap-2 rounded-12 border border-border-02 p-3"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -361,7 +362,9 @@ export default function IntakePublicationReview({
               key={target.id}
               className="flex flex-col gap-1 border-t border-border-02 pt-2"
             >
-              <Text font="secondary-action">{target.display_name}</Text>
+              <Text font="secondary-action">
+                {intakeDocumentCaption(target)}
+              </Text>
               {(target.source_display_name || target.mime_type) && (
                 <Text font="secondary-body" color="text-03">
                   {[target.mime_type, target.source_display_name]
@@ -376,7 +379,7 @@ export default function IntakePublicationReview({
               )}
               <div>
                 <Button
-                  aria-label={`Keep as source evidence of ${target.display_name}${target.mime_type ? ` (${target.mime_type})` : ""}`}
+                  aria-label={`Keep as source evidence of ${intakeDocumentCaption(target)}${target.mime_type ? ` (${target.mime_type})` : ""}`}
                   prominence={
                     selection.duplicate_of_document_id === target.id
                       ? "primary"
@@ -413,7 +416,7 @@ export default function IntakePublicationReview({
                 </Text>
                 <div className="flex flex-wrap gap-2">
                   <InputTypeIn
-                    aria-label={`Search existing parent for ${document.display_name}`}
+                    aria-label={`Search existing parent for ${intakeDocumentCaption(document)}`}
                     placeholder="Search by legislation title"
                     maxLength={500}
                     value={query}
@@ -503,7 +506,7 @@ export default function IntakePublicationReview({
           {dirty && (
             <>
               <InputTextArea
-                aria-label={`Document identity review reason for ${document.display_name}`}
+                aria-label={`Document identity review reason for ${intakeDocumentCaption(document)}`}
                 value={selection.reason}
                 rows={3}
                 variant={disabled || saving ? "disabled" : "primary"}

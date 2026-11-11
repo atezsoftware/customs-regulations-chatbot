@@ -15,7 +15,11 @@ from sqlalchemy.orm import Session
 
 from onyx.configs.constants import FileOrigin
 from onyx.db import document_intake as repository
-from onyx.db import regulatory_publication, regulatory_writer_publication
+from onyx.db import (
+    document_intake_preparation_lease,
+    regulatory_publication,
+    regulatory_writer_publication,
+)
 from onyx.db.enums import UserFileStatus
 from onyx.db.models import (
     AmendmentBatch,
@@ -165,6 +169,9 @@ def test_job_chunks_independent_originals_and_freezes_only_new_label_scope(
         user=owner,
         environment="document-intake-regression",
     )
+    # This fixture exercises the legacy blocking-label preparation contract.
+    batch.background_labeling_enabled = False
+    batch.metadata_extraction_mode = None
     intake_id, model_id = batch.id, model.id
     intake_session.commit()
     connection = intake_session.connection()
@@ -190,6 +197,11 @@ def test_job_chunks_independent_originals_and_freezes_only_new_label_scope(
 
     monkeypatch.setattr(
         job, "get_session_with_current_tenant", shared_connection_session
+    )
+    monkeypatch.setattr(
+        document_intake_preparation_lease,
+        "get_session_with_current_tenant",
+        shared_connection_session,
     )
     monkeypatch.setattr(
         regulatory_publication, "get_session_with_tenant", shared_connection_session

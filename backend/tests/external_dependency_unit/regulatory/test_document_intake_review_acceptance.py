@@ -198,6 +198,8 @@ def _three_document_review(
         user=user,
         environment=package.environment,
     )
+    batch.metadata_extraction_mode = None
+    batch.background_labeling_enabled = False
     members = intake.admit_intake_assets(
         session,
         batch,

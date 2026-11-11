@@ -14,7 +14,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as repository
-from onyx.db import regulatory_publication, regulatory_writer_publication
+from onyx.db import (
+    document_intake_preparation_lease,
+    regulatory_publication,
+    regulatory_writer_publication,
+)
 from onyx.db.amendment_sources import list_source_assets
 from onyx.db.document_intake_sources import create_markdown_source_package
 from onyx.db.models import (
@@ -133,6 +137,7 @@ def native_markdown_runtime(
     for module, method in (
         (source_job, "get_session_with_current_tenant"),
         (intake_job, "get_session_with_current_tenant"),
+        (document_intake_preparation_lease, "get_session_with_current_tenant"),
         (regulatory_publication, "get_session_with_tenant"),
         (regulatory_writer_publication, "get_session_with_tenant"),
         (postgres_file_store, "get_session_with_current_tenant"),
@@ -236,6 +241,9 @@ def test_native_markdown_source_and_independent_intakes_skip_conversion(
         user=owner,
         environment=_ENVIRONMENT,
     )
+    # This fixture exercises the legacy blocking-label preparation contract.
+    batch.background_labeling_enabled = False
+    batch.metadata_extraction_mode = None
     batch_id, model_id = batch.id, model.id
     intake_session.commit()
     monkeypatch.setattr(

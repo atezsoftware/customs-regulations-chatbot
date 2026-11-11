@@ -192,6 +192,8 @@ class IntakeBackgroundLabelSnapshot(BaseModel):
     status: Literal["pending", "waiting", "running", "completed", "failed", "cancelled"]
     total_chunks: int = Field(ge=0)
     completed_chunks: int = Field(ge=0)
+    classified_chunks: int = Field(default=0, ge=0)
+    unlabelled_chunks: int = Field(default=0, ge=0)
     failed_chunks: int = Field(ge=0)
     error: str | None = None
 
