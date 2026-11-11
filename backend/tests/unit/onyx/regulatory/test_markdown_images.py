@@ -204,3 +204,104 @@ def test_oversized_dimensions_fail_source_image_validator() -> None:
         EmbeddedMarkdownImageError, match="invalid_embedded_markdown_image"
     ):
         embedded_markdown_images(f"![alt]({uri})", path="ek.md")
+
+
+def test_reference_definition_span_and_title_are_preserved() -> None:
+    from onyx.regulatory.document_intake.markdown_images import embedded_markdown_images
+
+    definition = f'[resim]: <{_image_uri()}> "Takvim &amp; kapsam"\r\n'
+    text = f"Önce ![Şema][resim] sonra.\r\n\r\n{definition}\r\nSon kural.\r\n"
+    (image,) = embedded_markdown_images(text, path="ek.md")
+    assert image.alt == "Şema"
+    assert image.title == "Takvim & kapsam"
+    assert image.resource_spans == (
+        (text.index(definition), text.index(definition) + len(definition)),
+    )
+    assert text[image.resource_spans[0][0] : image.resource_spans[0][1]] == definition
+
+
+def test_inline_image_title_has_no_definition_resource_span() -> None:
+    from onyx.regulatory.document_intake.markdown_images import embedded_markdown_images
+
+    (image,) = embedded_markdown_images(
+        f'![Şema]({_image_uri()} "Yıllık takvim")', path="ek.md"
+    )
+    assert image.title == "Yıllık takvim"
+    assert image.resource_spans == ()
+
+
+def test_repeated_reference_images_share_only_active_definition_span() -> None:
+    from onyx.regulatory.document_intake.markdown_images import embedded_markdown_images
+
+    definition = f'[resim]: {_image_uri()} "Takvim"\n'
+    prefix = f"```md\n{definition}```\n\n`{definition.rstrip()}`\n\n\\{definition}\n"
+    text = prefix + "![A][resim] ve ![B][resim]\n\n" + definition
+    images = embedded_markdown_images(text, path="ek.md")
+    assert len(images) == 2
+    span = (text.rindex(definition), len(text))
+    assert images[0].resource_spans == images[1].resource_spans == (span,)
+    assert all(item.title == "Takvim" for item in images)
+
+
+def test_multiline_definition_resource_span_includes_title_only() -> None:
+    from onyx.regulatory.document_intake.markdown_images import embedded_markdown_images
+
+    definition = f'[resim]:\n  <{_image_uri()}>\n  "Satır takvimi"\n'
+    text = f"![Şema][resim]\n\n{definition}\nSon kural.\n"
+    (image,) = embedded_markdown_images(text, path="ek.md")
+    assert image.title == "Satır takvimi"
+    assert image.resource_spans == (
+        (text.index(definition), text.index(definition) + len(definition)),
+    )
+
+
+def test_definition_shared_with_normal_link_fails_explicitly() -> None:
+    from onyx.regulatory.document_intake.markdown_images import (
+        EmbeddedMarkdownImageError,
+        embedded_markdown_images,
+    )
+
+    text = f"![Şema][resim] ve [indirme][resim]\n\n[resim]: {_image_uri()}\n"
+    with pytest.raises(
+        EmbeddedMarkdownImageError, match="shared_markdown_image_reference"
+    ):
+        embedded_markdown_images(text, path="ek.md")
+
+
+def test_unmappable_quote_reference_definition_fails_explicitly() -> None:
+    from onyx.regulatory.document_intake.markdown_images import (
+        EmbeddedMarkdownImageError,
+        embedded_markdown_images,
+    )
+
+    text = f"> ![Şema][resim]\n>\n> [resim]: {_image_uri()}\n"
+    with pytest.raises(
+        EmbeddedMarkdownImageError, match="unsupported_markdown_image_resource_span"
+    ):
+        embedded_markdown_images(text, path="ek.md")
+
+
+def test_multiple_image_reference_definitions_can_be_removed_together() -> None:
+    from onyx.regulatory.document_intake.markdown_images import embedded_markdown_images
+
+    first = f'[first]: <{_image_uri()}> "Birinci"\n'
+    second = f'[second]: <{_image_uri()}> "İkinci"'
+    text = f"Önce ![A][first] ve ![B][second].\n\n{first}{second}"
+    first_image, second_image = embedded_markdown_images(text, path="ek.md")
+    assert first_image.title == "Birinci"
+    assert second_image.title == "İkinci"
+    assert first_image.resource_spans == (
+        (text.index(first), text.index(first) + len(first)),
+    )
+    assert second_image.resource_spans == ((text.index(second), len(text)),)
+    edits = [
+        (image.start, image.end, image.alt) for image in (first_image, second_image)
+    ]
+    edits += [
+        (start, end, "")
+        for image in (first_image, second_image)
+        for start, end in image.resource_spans
+    ]
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    assert text == "Önce A ve B.\n\n"

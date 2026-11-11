@@ -3,11 +3,13 @@
 import base64
 import binascii
 import re
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from html import unescape
 from typing import Match, TypedDict, cast
 
-from mistune import InlineState, Markdown
+from mistune import BlockState, InlineState, Markdown
 from mistune.helpers import parse_link_label
 from mistune.inline_parser import _parse_link_text
 
@@ -41,6 +43,9 @@ class EmbeddedMarkdownImage:
     alt: str
     content: bytes
     descriptor: SourceImageDescriptor
+    title: str | None = None
+    # Image-only reference definitions may be omitted from derived text, never raw source.
+    resource_spans: tuple[tuple[int, int], ...] = ()
 
 
 class _Node(TypedDict, total=False):
@@ -48,6 +53,7 @@ class _Node(TypedDict, total=False):
     attrs: dict[str, object]
     children: list["_Node"]
     raw: str
+    ref: str
 
 
 def _image_nodes(nodes: list[_Node]) -> list[_Node]:
@@ -59,16 +65,22 @@ def _image_nodes(nodes: list[_Node]) -> list[_Node]:
     return result
 
 
-def _canonical(nodes: list[_Node]) -> list[dict[str, object]]:
+def _canonical(
+    nodes: list[_Node], *, ignore_blank_lines: bool = False
+) -> list[dict[str, object]]:
     """Reference and inline forms render identically; retain every other AST field."""
     result: list[dict[str, object]] = []
     for node in nodes:
+        if ignore_blank_lines and node.get("type") == "blank_line":
+            continue
         item: dict[str, object] = {key: value for key, value in node.items()}
         if node.get("type") in {"image", "link"}:
             for key in ("literal_url", "ref", "label"):
                 item.pop(key, None)
         if "children" in node:
-            item["children"] = _canonical(node["children"])
+            item["children"] = _canonical(
+                node["children"], ignore_blank_lines=ignore_blank_lines
+            )
         result.append(item)
     return result
 
@@ -100,6 +112,116 @@ def _decode_image(url: object, *, path: str) -> tuple[bytes, SourceImageDescript
             "invalid_embedded_markdown_image", path=path
         ) from None
     return content, descriptor
+
+
+def _link_references(nodes: list[_Node]) -> set[str]:
+    result: set[str] = set()
+    for node in nodes:
+        if node.get("type") == "link" and isinstance(node.get("ref"), str):
+            result.add(node["ref"])
+        result.update(_link_references(node.get("children", [])))
+    return result
+
+
+def _edit_source(text: str, edits: list[tuple[int, int, str]]) -> str:
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def _resource_spans(
+    text: str,
+    nodes: list[_Node],
+    images: list[EmbeddedMarkdownImage],
+    image_references: list[str | None],
+    original_references: dict[str, dict[str, object]],
+    parser: Callable[[], Markdown],
+    *,
+    path: str,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    references = {key for key in image_references if key is not None}
+    if not references:
+        return {}
+    if references & _link_references(nodes):
+        raise EmbeddedMarkdownImageError("shared_markdown_image_reference", path=path)
+
+    # Work in Mistune's normalized coordinates, retaining exact original offsets.
+    crlf_positions = [
+        match.start() - index for index, match in enumerate(re.finditer("\r\n", text))
+    ]
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    source = normalized if normalized.endswith("\n") else normalized + "\n"
+
+    def original_offset(position: int) -> int:
+        return min(len(text), position + bisect_left(crlf_positions, position))
+
+    image_edits = [
+        (image.start, image.end, f"ONYX_IMAGE_{index}")
+        for index, image in enumerate(images)
+    ]
+    marker_tokens = cast(list[_Node], parser()(_edit_source(text, image_edits)))
+    marker_ast = _canonical(marker_tokens, ignore_blank_lines=True)
+    result: dict[str, tuple[tuple[int, int], ...]] = {}
+    block = parser().block
+    candidates = 0
+    for match in block.compile_sc(["ref_link"]).finditer(source):
+        candidates += 1
+        if candidates > MAX_MARKDOWN_IMAGE_CANDIDATES:
+            raise EmbeddedMarkdownImageError(
+                "markdown_image_candidate_limit", path=path
+            )
+        candidate = BlockState()
+        candidate.process(source)
+        candidate.cursor = match.start()
+        end = block.parse_ref_link(match, candidate)
+        candidate_references = cast(
+            dict[str, dict[str, object]], candidate.env["ref_links"]
+        )
+        if end is None or len(candidate_references) != 1:
+            continue
+        key = next(iter(candidate_references))
+        if (
+            key not in references
+            or candidate_references[key] != original_references[key]
+        ):
+            continue
+        start, finish = original_offset(match.start()), original_offset(end)
+        # Removing a definition-looking string in code must not count as removing
+        # the active binding. The remaining reference environment must be identical.
+        _removed_tokens, removed_state = parser().parse(
+            _edit_source(text, [(start, finish, "")])
+        )
+        remaining = cast(dict[str, dict[str, object]], removed_state.env["ref_links"])
+        if remaining != {
+            ref: value for ref, value in original_references.items() if ref != key
+        }:
+            continue
+        if any(start < image.end and finish > image.start for image in images):
+            continue
+        removed = _edit_source(text, image_edits + [(start, finish, "")])
+        removed_tokens = cast(list[_Node], parser()(removed))
+        if _canonical(removed_tokens, ignore_blank_lines=True) != marker_ast:
+            continue
+        if key in result:
+            raise EmbeddedMarkdownImageError(
+                "unsupported_markdown_image_resource_span", path=path
+            )
+        result[key] = ((start, finish),)
+    if set(result) != references:
+        raise EmbeddedMarkdownImageError(
+            "unsupported_markdown_image_resource_span", path=path
+        )
+    definition_edits = [
+        (start, end, "") for spans in result.values() for start, end in spans
+    ]
+    combined_tokens = cast(
+        list[_Node], parser()(_edit_source(text, image_edits + definition_edits))
+    )
+    if _canonical(combined_tokens, ignore_blank_lines=True) != marker_ast:
+        raise EmbeddedMarkdownImageError(
+            "unsupported_markdown_image_resource_span", path=path
+        )
+    return result
 
 
 def embedded_markdown_images(
@@ -154,6 +276,7 @@ def embedded_markdown_images(
         expected_images = [_canonical([node]) for node in nodes]
         inline = _LiteralInlineParser()
         images: list[EmbeddedMarkdownImage] = []
+        image_references: list[str | None] = []
         candidates: list[Match[str]] = []
         for match in _IMAGE_START.finditer(text):
             candidates.append(match)
@@ -195,6 +318,8 @@ def embedded_markdown_images(
             if not isinstance(url, str) or url not in validated:
                 continue
             content, descriptor = validated[url]
+            title = node.get("attrs", {}).get("title")
+            image_references.append(node.get("ref"))
             images.append(
                 EmbeddedMarkdownImage(
                     start=match.start(),
@@ -202,6 +327,7 @@ def embedded_markdown_images(
                     alt=_alt(node),
                     content=content,
                     descriptor=descriptor,
+                    title=unescape(title) if isinstance(title, str) else None,
                 )
             )
         if len(images) != len(nodes) or any(
@@ -210,7 +336,21 @@ def embedded_markdown_images(
             raise EmbeddedMarkdownImageError(
                 "unsupported_markdown_image_source_span", path=path
             )
-        return tuple(images)
+        resources = _resource_spans(
+            text,
+            tokens,
+            images,
+            image_references,
+            cast(dict[str, dict[str, object]], state.env["ref_links"]),
+            parser,
+            path=path,
+        )
+        return tuple(
+            replace(
+                image, resource_spans=resources.get(reference, ()) if reference else ()
+            )
+            for image, reference in zip(images, image_references)
+        )
     except MarkdownPackageError as error:
         raise EmbeddedMarkdownImageError(error.code, path=path) from None
     except (RecursionError, ValueError) as error:
