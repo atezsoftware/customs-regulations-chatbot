@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from sqlalchemy import Select, exists, func, select
-from sqlalchemy.orm import Session, lazyload, selectinload
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from onyx.db.enums import RegulatoryChunkStatus, UserFileStatus
@@ -255,10 +255,7 @@ def list_catalog_folders(
 
 
 def catalog_search_rows(
-    db_session: Session,
-    chunk_ids: Sequence[str],
-    *,
-    include_document_sets: bool = True,
+    db_session: Session, chunk_ids: Sequence[str]
 ) -> dict[str, tuple[RegulatoryChunk, UserFile]]:
     if not chunk_ids:
         return {}
@@ -266,12 +263,7 @@ def catalog_search_rows(
         select(RegulatoryChunk, UserFile)
         .join(UserFile, UserFile.id == RegulatoryChunk.user_file_id)
         .where(RegulatoryChunk.id.in_(chunk_ids))
-        .options(
-            lazyload(UserFile.projects),
-            selectinload(UserFile.document_sets)
-            if include_document_sets
-            else lazyload(UserFile.document_sets),
-        )
+        .options(selectinload(UserFile.document_sets))
         .execution_options(populate_existing=True)
     ).all()
     return {chunk.id: (chunk, file) for chunk, file in rows}

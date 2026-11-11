@@ -22,6 +22,7 @@ from onyx.regulatory.publication_reads import (
     observe_publication_read,
     require_publication_files,
 )
+from onyx.reranking.staged import RerankCall
 from onyx.server.features.regulatory.catalog_api import search_catalog_chunks
 from onyx.server.features.regulatory.catalog_models import CatalogSearchRequest
 from onyx.server.features.regulatory.simple_search_models import (
@@ -51,6 +52,7 @@ def run_simple_search(
     *,
     scope_filters: IndexFilters | None = None,
     overview_language: str = "tr",
+    rerank_candidates: RerankCall | None = None,
 ) -> SimpleSearchResponse:
     request_id = uuid4()
     summary: str | None = None
@@ -75,7 +77,12 @@ def run_simple_search(
             db_session,
             adaptive=True,
             scope_query=request.query,
-            **({"scope_filters": scope_filters} if scope_filters is not None else {}),
+            scope_filters=scope_filters,
+            **(
+                {"rerank_candidates": rerank_candidates}
+                if rerank_candidates is not None
+                else {}
+            ),
         )
         try:
             summary = generate_catalog_summary(

@@ -182,6 +182,15 @@ def test_provider_failures_preserve_all_chunks(
     assert result.outcome is expected
     assert result.fallback_used is True
     assert result.result_count == 0
+    if expected is RerankOutcome.RATE_LIMITED:
+        assert result.retry_after_seconds is not None
+        assert 29 <= result.retry_after_seconds <= 30
+        blocked = service.rerank_chunks(
+            query="secret-query", chunks=chunks, config=_config()
+        )
+        assert blocked.outcome is RerankOutcome.CIRCUIT_OPEN
+        assert blocked.retry_after_seconds is not None
+        assert 29 <= blocked.retry_after_seconds <= 30
 
 
 def test_immediate_provider_error_opens_only_current_tenant_and_fingerprint(

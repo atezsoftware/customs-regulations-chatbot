@@ -54,6 +54,13 @@ class RerankCircuitBreaker:
         with self._lock:
             self._states.pop(key, None)
 
+    def remaining_cooldown_seconds(self, key: RerankCircuitKey) -> float | None:
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.open_until is None:
+                return None
+            return max(0.0, state.open_until - self._clock())
+
     def record_failure(
         self,
         key: RerankCircuitKey,
