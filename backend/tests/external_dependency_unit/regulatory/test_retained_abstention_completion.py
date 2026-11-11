@@ -33,7 +33,7 @@ from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
 )
 
 
-@pytest.mark.parametrize("tamper", ["none", "source", "ack"])
+@pytest.mark.parametrize("tamper", ["none", "source", "ack", "pending"])
 def test_retained_abstention_normalizes_without_provider_or_source_changes(
     labeling_data: LabelingData, tamper: str
 ) -> None:
@@ -113,8 +113,40 @@ def test_retained_abstention_normalizes_without_provider_or_source_changes(
         if tamper == "source":
             s.get_one(RegulatoryChunk, labeling_data.first_id).text += " Changed"
         s.flush()
+        pending = None
+        if tamper == "pending":
+            from uuid import uuid4
+
+            from onyx.db.models import AmendmentSourcePackage, RegulatoryDocumentIntake
+
+            package = AmendmentSourcePackage(
+                document_set_id=run.document_set_id,
+                created_by=run.requested_by_id,
+                environment="test",
+                idempotency_key=str(uuid4()),
+                request_hash="a" * 64,
+                input_spec={},
+                status="ready",
+            )
+            s.add(package)
+            s.flush()
+            pending = RegulatoryDocumentIntake(
+                source_package_id=package.id,
+                document_set_id=run.document_set_id,
+                created_by=run.requested_by_id,
+                labeling_model_configuration_id=run.model_configuration_id,
+                idempotency_key=uuid4(),
+                status="ready",
+                stage="review",
+                labeling_run_id=run.id,
+                background_labeling_enabled=True,
+                background_label_status="pending",
+                background_label_source_sha256="a" * 64,
+            )
+            s.add(pending)
+            s.flush()
         before = s.get_one(RegulatoryChunk, labeling_data.first_id).text
-        if tamper != "none":
+        if tamper in {"source", "ack"}:
             with pytest.raises(ValueError):
                 complete_retained_abstentions(s, run_id)
             s.refresh(item)
@@ -125,6 +157,11 @@ def test_retained_abstention_normalizes_without_provider_or_source_changes(
                 item.status == "completed" and item.labels == [] and item.error is None
             )
             assert run.failed_chunks == 0
+            if pending is not None:
+                assert (
+                    pending.background_label_status == "pending"
+                    and pending.background_label_source_sha256 == "a" * 64
+                )
             assert complete_retained_abstentions(s, run_id) == 0
             from onyx.regulatory.labeling.abstention import ProviderAbstentionReceipt
 

@@ -126,7 +126,7 @@ def test_only_due_unclaimed_scoped_intents_are_reserved(
 
 
 @pytest.mark.parametrize("kind", ["initial", "reprepare"])
-def test_late_deliveries_never_reclaim_expired_paid_work(
+def test_late_deliveries_require_mutex_fenced_recovery_before_new_source_claim(
     intake_session: Session,
     intake_owner: tuple[User, DocumentSet, ModelConfiguration],
     kind: str,
@@ -154,13 +154,16 @@ def test_late_deliveries_never_reclaim_expired_paid_work(
     ) is None
     assert batch.lease_token == old_token
     intake.refresh_intake(intake_session, batch)
-    assert batch.status == "failed"
+    assert batch.status == "preparing" and batch.lease_token == old_token
     assert (
         reprepare.claim_reprepare(intake_session, batch.id, request.id)
         if request
         else intake.claim_intake(intake_session, batch.id)
     ) is None
-    intake.retry_intake(intake_session, batch)
+    deliveries = queue.reserve_intake_preparation_deliveries(
+        intake_session, environment=_ENVIRONMENT
+    )
+    assert [delivery.batch_id for delivery in deliveries] == [batch.id]
     assert (
         reprepare.claim_reprepare(intake_session, batch.id, request.id)
         if request
@@ -488,3 +491,22 @@ def test_background_renewal_defers_to_batch_locked_canonical_transaction(
             renewal.get_one(RegulatoryDocumentIntake, ids[0]).lease_expires_at
             != deadline
         )
+
+
+def test_snapshot_poll_preserves_expired_claim_for_durable_recovery(
+    intake_session: Session,
+    intake_owner: tuple[User, DocumentSet, ModelConfiguration],
+) -> None:
+    user, target, model = intake_owner
+    batch, _members = _admitted(intake_session, user, target, model)
+    token = uuid4()
+    batch.lease_token = token
+    batch.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    intake_session.flush()
+    intake.refresh_intake(intake_session, batch)
+    assert batch.status == "preparing" and batch.lease_token == token
+    deliveries = queue.reserve_intake_preparation_deliveries(
+        intake_session, environment=_ENVIRONMENT
+    )
+    assert [row.batch_id for row in deliveries] == [batch.id]
+    assert batch.lease_token is None

@@ -38,6 +38,15 @@ def complete_retained_abstentions(
 ) -> int:
     if not 1 <= limit <= 128:
         raise ValueError("Retained abstention correction requires a bounded page")
+    owners = list(
+        session.scalars(
+            select(RegulatoryDocumentIntake)
+            .where(RegulatoryDocumentIntake.labeling_run_id == run_id)
+            .order_by(RegulatoryDocumentIntake.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
     run = session.get_one(
         RegulatoryLabelingRun, run_id, with_for_update=True, populate_existing=True
     )
@@ -167,15 +176,22 @@ def complete_retained_abstentions(
             finished=True,
         )
         session.refresh(run)
-        for batch in session.scalars(
-            select(RegulatoryDocumentIntake).where(
-                RegulatoryDocumentIntake.labeling_run_id == run_id,
-                RegulatoryDocumentIntake.background_labeling_enabled.is_(True),
-            )
-        ):
+        for batch in owners:
+            from onyx.db.document_intake import review_digest
             from onyx.db.document_intake_background_labels import (
                 reconcile_background_labels,
             )
+
+            if (
+                not batch.background_labeling_enabled
+                or batch.background_label_status
+                not in {"running", "completed", "failed"}
+                or batch.created_by != run.requested_by_id
+                or batch.document_set_id != run.document_set_id
+                or batch.labeling_model_configuration_id != run.model_configuration_id
+                or batch.background_label_source_sha256 != review_digest(session, batch)
+            ):
+                continue
 
             batch.background_label_status = "running"
             reconcile_background_labels(session, batch)

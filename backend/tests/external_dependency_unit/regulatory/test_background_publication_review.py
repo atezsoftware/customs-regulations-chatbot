@@ -119,6 +119,22 @@ def test_publication_scope_can_change_without_reintroducing_label_gate(
     assert members["alias"].status == "source_evidence"
     if state == "running":
         assert previous.cancel_requested
+    assert (
+        _decision(
+            s,
+            batch,
+            members["alias"],
+            intake_owner[0],
+            disposition="source_evidence",
+            duplicate=members["annex"].id,
+        )
+        is None
+    )
+    assert (
+        batch.background_label_source_sha256
+        == batch.review_sha256
+        == intake.review_digest(s, batch)
+    )
     assert _decision(s, batch, members["alias"], intake_owner[0]) is None
     assert members["alias"].status == "ready"
     assert (batch.status, batch.stage, batch.background_label_status) == (
@@ -132,3 +148,33 @@ def test_publication_scope_can_change_without_reintroducing_label_gate(
         )
         == original
     )
+
+    from uuid import UUID
+
+    from onyx.db import document_intake_background_labels as background
+    from onyx.db import document_intake_review as review
+    from onyx.db import regulatory_labeling as labeling
+    from onyx.db.models import RegulatoryDocumentIntake
+
+    if previous.status == "running":
+        previous.status = "cancelled"
+
+    def create(session: Session, current: RegulatoryDocumentIntake) -> UUID:
+        run, _ = labeling.create_labeling_run(
+            session,
+            document_set_id=current.document_set_id,
+            taxonomy=previous.taxonomy,
+            model_configuration_id=current.labeling_model_configuration_id,
+            model=previous.model,
+            provider_binding=previous.provider_binding,
+            requested_by_id=current.created_by,
+            idempotency_key=uuid4(),
+            target_file_ids=[
+                m.user_file_id for m in review.effective_intake_files(session, current)
+            ],
+        )
+        return run.id
+
+    monkeypatch.setattr(background, "_create_run", create)
+    assert background.start_background_labels(s, batch) is not None
+    assert (batch.status, batch.stage) == ("ready", "review")
