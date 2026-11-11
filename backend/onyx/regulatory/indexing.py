@@ -44,6 +44,9 @@ from onyx.regulatory.document_intake.chunking_profile import (
 from onyx.regulatory.document_intake.embedding_policy import (
     embedding_token_limit_for_metadata,
 )
+from onyx.regulatory.document_intake.markdown_image_preparation import (
+    bound_markdown_images,
+)
 from onyx.regulatory.document_intake.models import IntakePreparationPolicy
 from onyx.utils.logger import setup_logger
 from shared_configs.configs import DOC_EMBEDDING_CONTEXT_SIZE
@@ -180,6 +183,7 @@ class RegulatoryIndexingChunker:
         user_file_id = UUID(document.id)
 
         text = document_text_for_regulatory_indexing(document)
+        markdown_images = bound_markdown_images(document, text)
         source_file = document.semantic_identifier or document.id
         intake_version = intake_chunking_version(document)
         policy = intake_preparation_policy(document)
@@ -220,6 +224,12 @@ class RegulatoryIndexingChunker:
                 and item[1] > chunk.metadata.source_start_char
             ]
             image_ids = {item[2] for item in overlapping if item[2]}
+            image_ids.update(
+                image.image_file_id
+                for image in markdown_images
+                if image.start < chunk.metadata.source_end_char
+                and image.end > chunk.metadata.source_start_char
+            )
             links = {
                 max(0, start - chunk.metadata.source_start_char): link
                 for start, _end, _image, link in overlapping

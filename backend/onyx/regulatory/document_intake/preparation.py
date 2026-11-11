@@ -14,6 +14,13 @@ from onyx.file_processing.original_ingestion import (
 from onyx.file_store.file_store import FileStore, get_default_file_store
 from onyx.regulatory.amendments.annexes.models import SourceLink
 from onyx.regulatory.amendments.annexes.sources import MAX_ASSET_BYTES, MAX_TEXT_CHARS
+from onyx.regulatory.document_intake.markdown_image_preparation import (
+    MARKDOWN_IMAGES_KEY,
+    MarkdownImageEvidence,
+    MarkdownImageSpan,
+    canonical_image_spans,
+    prepare_markdown_images,
+)
 from onyx.regulatory.document_intake.models import (
     IntakeChunkingVersion,
     IntakeFilePreparation,
@@ -46,6 +53,7 @@ def build_intake_document(
     formatter_version: IntakeFormatterVersion = 4,
     chunking_version: IntakeChunkingVersion = "3",
     preparation_policy: IntakePreparationPolicy | None = None,
+    markdown_image_spans: Sequence[MarkdownImageSpan] = (),
 ) -> Document:
     if asset.package_id != package_id:
         raise ValueError("Source asset belongs to another intake package")
@@ -54,6 +62,7 @@ def build_intake_document(
     if len(text) > MAX_TEXT_CHARS:
         raise ValueError("Prepared source text exceeds the intake limit")
     require_resolved_attachment_references(text, asset_sha256=asset.sha256, links=links)
+    unformatted_text = text
     text = prepare_intake_text(
         text,
         asset_sha256=asset.sha256,
@@ -105,6 +114,17 @@ def build_intake_document(
     )
     source_url = asset.final_url or asset.original_url
     title = asset.display_name or "source"
+    metadata = {"regulatory_document_intake": context.model_dump(mode="json")}
+    if markdown_image_spans:
+        text = text.strip()
+        evidence = MarkdownImageEvidence(
+            user_file_id=user_file_id,
+            source_asset_id=asset.id,
+            source_sha256=asset.sha256,
+            plaintext_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            spans=canonical_image_spans(unformatted_text, text, markdown_image_spans),
+        )
+        metadata[MARKDOWN_IMAGES_KEY] = evidence.model_dump(mode="json")
     return Document(
         id=str(user_file_id),
         source=DocumentSource.USER_FILE,
@@ -112,7 +132,7 @@ def build_intake_document(
         title=title,
         sections=[TextSection(text=text, link=source_url)],
         metadata={},
-        doc_metadata={"regulatory_document_intake": context.model_dump(mode="json")},
+        doc_metadata=metadata,
         file_id=original_file_id or asset.file_id,
     )
 
@@ -191,6 +211,7 @@ def load_verified_intake_documents(
     formatter_version: IntakeFormatterVersion = 4,
     chunking_version: IntakeChunkingVersion = "3",
     preparation_policy: IntakePreparationPolicy | None = None,
+    allow_image_transcription: bool = False,
 ) -> LoadedUserFileDocuments:
     """Rebuild canonical input exclusively from hash-verified retained sources."""
     if asset.package_id != package_id:
@@ -210,6 +231,18 @@ def load_verified_intake_documents(
     text = _canonical_source_text(
         asset, raw, prepared_text, formatter_version=formatter_version
     )
+    image_spans: tuple[MarkdownImageSpan, ...] = ()
+    if asset.mime_type == "text/markdown":
+        images = prepare_markdown_images(
+            text,
+            asset=asset,
+            user_file_id=user_file_id,
+            store=file_store,
+            allow_transcription=allow_image_transcription,
+            links=links,
+            package_assets=package_assets,
+        )
+        text, image_spans = images.text, images.spans
     document = build_intake_document(
         package_id=package_id,
         asset=asset,
@@ -222,6 +255,7 @@ def load_verified_intake_documents(
         formatter_version=formatter_version,
         chunking_version=chunking_version,
         preparation_policy=preparation_policy,
+        markdown_image_spans=image_spans,
     )
     return LoadedUserFileDocuments(
         [document], file_id=owned_file_id, raw_sha256=asset.sha256
@@ -258,6 +292,7 @@ def prepare_intake_file(
         formatter_version=formatter_version,
         chunking_version=chunking_version,
         preparation_policy=preparation_policy,
+        allow_image_transcription=True,
     )
     if chunk_file is None:
         from onyx.regulatory.writer_publication import chunk_owned_file
