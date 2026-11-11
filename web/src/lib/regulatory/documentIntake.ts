@@ -153,6 +153,8 @@ export interface DocumentIntakeBatch {
       | "cancelled";
     total_chunks: number;
     completed_chunks: number;
+    classified_chunks?: number;
+    unlabelled_chunks?: number;
     failed_chunks: number;
     error: string | null;
   } | null;

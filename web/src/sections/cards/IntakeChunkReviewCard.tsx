@@ -280,7 +280,7 @@ export default function IntakeChunkReviewCard({
           >{`Labeling: ${chunk.labeling_status ?? "unresolved"}`}</Text>
           <Text as="p" font="secondary-body">
             {chunk.labeling_error ||
-              "This chunk has no valid labeling result. Retry labeling before approval."}
+              "This chunk has no valid classification result. Legal metadata review remains available."}
           </Text>
         </div>
       )}

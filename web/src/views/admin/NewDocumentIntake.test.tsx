@@ -2004,7 +2004,7 @@ test.each(["pending", "waiting", "running"] as const)(
     });
     expect(within(progress).getByText(`Labeling: ${status}`)).toBeVisible();
     expect(
-      within(progress).getByText("3 of 8 chunks labeled · 1 failed")
+      within(progress).getByText("3 of 8 chunks processed · 1 failed")
     ).toBeVisible();
     const root = screen.getByRole("region", { name: "Main regulation.html" });
     expect(await within(root).findByLabelText("After text")).toHaveAttribute(
@@ -2021,6 +2021,90 @@ test.each(["pending", "waiting", "running"] as const)(
     ).toBe(false);
   }
 );
+
+test("separates processed chunks from classified and successfully unlabelled chunks", async () => {
+  const batch = {
+    ...readyBatch,
+    background_labeling: {
+      status: "completed" as const,
+      total_chunks: 358,
+      completed_chunks: 358,
+      classified_chunks: 356,
+      unlabelled_chunks: 2,
+      failed_chunks: 0,
+      error: null,
+    },
+  };
+  mockApi({ history: [batch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", { name: "Main regulation.html (ready)" })
+  );
+  const progress = screen.getByRole("region", { name: "Background labeling" });
+  expect(
+    within(progress).getByText(
+      "358 of 358 chunks processed · 356 classified · 2 no applicable label · 0 failed"
+    )
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Approve all new documents" })
+  ).toBeEnabled();
+});
+
+test("identifies unresolved legal titles by their source filename without changing legal metadata", async () => {
+  const batch = {
+    ...readyBatch,
+    publication_review_sha256: "a".repeat(64),
+    documents: readyBatch.documents.map((document) =>
+      document.id === "root"
+        ? {
+            ...document,
+            display_name: "Başlık belirlenemedi",
+            source_display_name: "Imported regulation.md",
+          }
+        : document
+    ),
+  };
+  const fetchMock = mockApi({ history: [batch] });
+  const user = setupUser();
+  render(<NewDocumentIntake />);
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Imported regulation.md (ready)",
+    })
+  );
+  const root = screen.getByRole("region", { name: "Imported regulation.md" });
+  expect(
+    within(root).getByRole("heading", { name: "Imported regulation.md" })
+  ).toBeVisible();
+  expect(within(root).getByText("Legal title unresolved.")).toBeVisible();
+  expect(
+    screen.getByRole("region", {
+      name: "Document identity for Imported regulation.md",
+    })
+  ).toBeVisible();
+  expect(
+    screen.getByRole("region", {
+      name: "Previous legislation for Imported regulation.md",
+    })
+  ).toBeVisible();
+  const annex = screen.getByRole("region", { name: "EK-1.pdf" });
+  expect(
+    within(annex).getByText("Attachment to Imported regulation.md")
+  ).toBeVisible();
+  await user.click(
+    within(annex).getByRole("link", { name: "Back to Imported regulation.md" })
+  );
+  expect(
+    await within(root).findByText("File: Imported regulation.md")
+  ).toBeVisible();
+  expect(
+    fetchMock.mock.calls.filter(
+      ([, init]) => init?.method && init.method !== "GET"
+    )
+  ).toHaveLength(0);
+});
 
 test("shows canonical chunks read-only while legal metadata prepares and background labels wait", async () => {
   const batch = {
