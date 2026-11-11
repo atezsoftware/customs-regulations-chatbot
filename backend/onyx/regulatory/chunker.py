@@ -167,6 +167,9 @@ _REPEATED_PARAGRAPH_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CLAUSE_RE = re.compile(r"^\(?(?P<label>[a-zçğıöşü])\)\s+", flags=re.IGNORECASE)
+_ORDERED_CLAUSE_PREFIX_RE = re.compile(
+    r"^\d{1,3}[.)]\s+(?=[a-zçğıöşü]\)\s+\S)", flags=re.IGNORECASE
+)
 _SUBCLAUSE_RE = re.compile(r"^\((?P<label>[ivxlcdm]+|\d+)\)\s+", flags=re.IGNORECASE)
 _MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$")
 _DASHED_PAGE_NUMBER_RE = re.compile(r"^[-\u2013\u2014]\s*\d{1,6}\s*[-\u2013\u2014]$")
@@ -1730,6 +1733,9 @@ def _classify_block(block: SourceBlock) -> dict[str, Any]:
             "label": _dotted_section_label(number, rest),
         }
 
+    if _ordered_clause_text(clean) is not None:
+        return {"kind": "paragraph"}
+
     numbered = _NUMBERED_SECTION_RE.match(clean)
     if numbered and _is_numbered_section_title(clean):
         return {"kind": "numbered_section"}
@@ -2019,6 +2025,8 @@ def _preamble_context_label(draft: _ChunkDraft) -> tuple[str, int | None] | None
 
 
 def _paragraph_no(text: str) -> str | None:
+    if _ordered_clause_text(text) is not None:
+        return None
     match = _PARAGRAPH_RE.match(text)
     return match.group("num") if match else None
 
@@ -2033,7 +2041,14 @@ def _subclause_label(text: str) -> str | None:
     return match.group("label") if match else None
 
 
+def _ordered_clause_text(text: str) -> str | None:
+    """Interpret an OCR ordered-list wrapper without rewriting its source."""
+    prefix = _ORDERED_CLAUSE_PREFIX_RE.match(text)
+    return text[prefix.end() :] if prefix is not None else None
+
+
 def _article_unit(clean_text: str, raw_text: str) -> dict[str, str] | None:
+    clean_text = _ordered_clause_text(clean_text) or clean_text
     paragraph = _PARAGRAPH_RE.match(clean_text)
     if paragraph:
         body = clean_text[paragraph.end() :].strip()

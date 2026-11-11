@@ -81,7 +81,10 @@ def temporal(
     )
 
 
-@pytest.mark.parametrize("link", ["none", "canonical", "historical"])
+@pytest.mark.parametrize(
+    "link",
+    ["none", "canonical", "canonical_secondary", "canonical_plural", "historical"],
+)
 @pytest.mark.parametrize("public", [False, True])
 def test_actual_link_required_before_private_or_public_parent_acl(
     labeling_data: LabelingData, link: str, public: bool
@@ -104,12 +107,22 @@ def test_actual_link_required_before_private_or_public_parent_acl(
         session.add(outsider)
         image = image_record(str(parent.id))
         session.add(image)
-        if link == "canonical":
+        if link in {"canonical", "canonical_secondary", "canonical_plural"}:
             chunk = session.get_one(RegulatoryChunk, labeling_data.first_id)
             chunk.chunk_metadata = {
                 **chunk.chunk_metadata,
                 "image_file_id": image.file_id,
             }
+            if link == "canonical_secondary":
+                primary = image_record(str(parent.id))
+                session.add(primary)
+                chunk.chunk_metadata = {
+                    **chunk.chunk_metadata,
+                    "image_file_id": primary.file_id,
+                    "image_file_ids": [primary.file_id, image.file_id],
+                }
+            elif link == "canonical_plural":
+                chunk.chunk_metadata = {"image_file_ids": [image.file_id]}
         elif link == "historical":
             session.add(temporal(parent, image.file_id))
         session.flush()
@@ -139,7 +152,10 @@ def test_actual_link_required_before_private_or_public_parent_acl(
         "wrong_mime",
         "foreign_temporal_source",
         "foreign_canonical",
-        "plural_only",
+        "foreign_secondary_canonical",
+        "secondary_scalar",
+        "secondary_object",
+        "secondary_nested_array",
     ],
 )
 def test_metadata_and_foreign_links_never_authorize(
@@ -174,7 +190,7 @@ def test_metadata_and_foreign_links_never_authorize(
             image.file_type = "application/pdf"
         elif malformation == "foreign_temporal_source":
             session.add(temporal(parent, image.file_id, source_parent=str(uuid4())))
-        elif malformation == "foreign_canonical":
+        elif malformation in {"foreign_canonical", "foreign_secondary_canonical"}:
             foreign = UserFile(
                 id=uuid4(),
                 user_id=owner.id,
@@ -185,12 +201,31 @@ def test_metadata_and_foreign_links_never_authorize(
             session.add(foreign)
             session.flush()
             chunk.user_file_id = foreign.id
-        elif malformation == "plural_only":
+        if malformation == "foreign_secondary_canonical":
+            primary = image_record(str(chunk.user_file_id))
+            session.add(primary)
             chunk.chunk_metadata = {
-                **chunk.chunk_metadata,
-                "image_file_ids": [image.file_id],
+                "image_file_id": primary.file_id,
+                "image_file_ids": [primary.file_id, image.file_id],
             }
-        if malformation not in {"foreign_temporal_source", "plural_only"}:
+        elif malformation.startswith("secondary_"):
+            primary = image_record(str(parent.id))
+            session.add(primary)
+            chunk.chunk_metadata = {
+                "image_file_id": primary.file_id,
+                "image_file_ids": image.file_id
+                if malformation == "secondary_scalar"
+                else {image.file_id: True}
+                if malformation == "secondary_object"
+                else [[image.file_id]],
+            }
+        if malformation not in {
+            "foreign_temporal_source",
+            "foreign_secondary_canonical",
+            "secondary_scalar",
+            "secondary_object",
+            "secondary_nested_array",
+        }:
             chunk.chunk_metadata = {
                 **chunk.chunk_metadata,
                 "image_file_id": image.file_id,

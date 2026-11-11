@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from onyx.regulatory.chunker import _ordered_clause_text
 from onyx.regulatory.document_intake import metadata
 
 CORE_LOCATORS = frozenset({"article_no", "paragraph_no", "clause_label"})
@@ -40,6 +41,8 @@ def positive_locator_evidence(
         )
     if field == "paragraph_no":
         if not isinstance(value, str):
+            return False
+        if _ordered_clause_text(entry.text) is not None:
             return False
         markers = metadata._paragraph_markers(entry.text)
         if not markers and entry.scope == "heading":
