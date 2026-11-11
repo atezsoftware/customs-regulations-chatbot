@@ -8,9 +8,12 @@ from onyx.db.reranking import RerankerRuntimeConfig
 from onyx.reranking.models import RerankOutcome, RerankResult
 from onyx.reranking.payload import payload_limits_for_reranker
 from onyx.reranking.staged import RerankCall, rerank_regulatory_candidates_in_batches
+from shared_configs.enums import RerankerProvider
 
-MAX_LIBRARY_COOLDOWN_SECONDS = 60
-LIBRARY_RETRY_BUDGET_SECONDS = 65
+LIBRARY_RERANK_MODEL = "cohere/rerank-5-pro"
+MAX_LIBRARY_RERANK_CANDIDATES = 100
+MAX_LIBRARY_COOLDOWN_SECONDS = 2
+LIBRARY_RETRY_BUDGET_SECONDS = 3
 
 
 def rerank_library_candidates(
@@ -20,6 +23,10 @@ def rerank_library_candidates(
     config: RerankerRuntimeConfig,
     rerank: RerankCall,
 ) -> RerankResult:
+    if len(chunks) > MAX_LIBRARY_RERANK_CANDIDATES:
+        raise ValueError("Library reranking accepts at most 100 candidates")
+    if config.enabled and config.provider_type is RerankerProvider.OPENROUTER:
+        config = config.model_copy(update={"model_name": LIBRARY_RERANK_MODEL})
     started = time.monotonic()
     retried = False
 
