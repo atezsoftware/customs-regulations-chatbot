@@ -23,9 +23,12 @@ def rerank_regulatory_candidates_in_batches(
     chunks: Sequence[InferenceChunk],
     config: RerankerRuntimeConfig,
     rerank: RerankCall,
+    batch_size: int = STAGED_BATCH_SIZE,
 ) -> RerankResult:
     """Merge all pointwise scores without a per-batch finalist quota."""
     original = list(chunks)
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if not original or not config.enabled:
         return rerank(query=query, chunks=original, config=config)
     limits = payload_limits_for_reranker(config.model_name)
@@ -36,11 +39,11 @@ def rerank_regulatory_candidates_in_batches(
     start = 0
     with graph_step(
         "rerank.batched",
-        {"candidate_count": len(original), "batch_size": STAGED_BATCH_SIZE},
+        {"candidate_count": len(original), "batch_size": batch_size},
     ) as batch_step:
         while start < len(original):
             payload = serialize_rerank_candidates(
-                original[start : start + STAGED_BATCH_SIZE], limits=limits
+                original[start : start + batch_size], limits=limits
             )
             batch = payload.submitted_chunks
             if not batch:

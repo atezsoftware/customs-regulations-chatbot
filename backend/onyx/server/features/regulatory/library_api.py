@@ -41,6 +41,7 @@ from onyx.server.features.regulatory.library_models import (
     LibrarySearchResults,
 )
 from onyx.server.features.regulatory.library_repeals import verified_repeals
+from onyx.server.features.regulatory.library_rerank import rerank_library_candidates
 from onyx.server.features.regulatory.library_search_memory import (
     answer_library_small_talk,
     contextual_library_query,
@@ -173,6 +174,7 @@ def search(
         db_session,
         scope_filters=scope,
         overview_language=request.language,
+        rerank_candidates=rerank_library_candidates,
     )
     return LibrarySearchResponse(
         search=LibrarySearchResults(

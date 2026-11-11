@@ -74,6 +74,7 @@ class RerankingService:
         result_count: int = 0,
         outcome: RerankOutcome,
         fallback_used: bool,
+        retry_after_seconds: float | None = None,
     ) -> RerankResult:
         latency_seconds = time.monotonic() - started_at
         observe_rerank(
@@ -101,6 +102,7 @@ class RerankingService:
             result_count=result_count,
             outcome=outcome,
             fallback_used=fallback_used,
+            retry_after_seconds=retry_after_seconds,
         )
 
     def rerank_chunks(
@@ -159,6 +161,9 @@ class RerankingService:
                 chunks=chunks,
                 outcome=RerankOutcome.CIRCUIT_OPEN,
                 fallback_used=True,
+                retry_after_seconds=self._circuit_breaker.remaining_cooldown_seconds(
+                    circuit_key
+                ),
             )
 
         payload_limits = payload_limits_for_reranker(config.model_name)
@@ -172,6 +177,7 @@ class RerankingService:
                 fallback_used=True,
             )
 
+        retry_after_seconds = None
         try:
             from onyx.tracing.answer_graph import graph_step
 
@@ -212,6 +218,9 @@ class RerankingService:
                 immediate=True,
             )
             outcome = RerankOutcome.RATE_LIMITED
+            retry_after_seconds = self._circuit_breaker.remaining_cooldown_seconds(
+                circuit_key
+            )
         except RerankProviderError as error:
             logger.warning(
                 "Rerank provider error model=%s status_code=%s",
@@ -265,6 +274,7 @@ class RerankingService:
             submitted_count=len(payload.documents),
             outcome=outcome,
             fallback_used=True,
+            retry_after_seconds=retry_after_seconds,
         )
 
 

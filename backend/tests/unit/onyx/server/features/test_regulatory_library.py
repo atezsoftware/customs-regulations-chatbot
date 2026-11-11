@@ -199,7 +199,7 @@ def test_greeting_with_legal_question_still_runs_search() -> None:
     require_index.assert_called_once_with()
 
 
-def test_library_search_file_snapshot_skips_admin_only_lookups() -> None:
+def test_library_search_keeps_existing_file_metadata_lookups() -> None:
     file = MagicMock(
         id=uuid4(),
         created_at=datetime.now(UTC),
@@ -216,14 +216,24 @@ def test_library_search_file_snapshot_skips_admin_only_lookups() -> None:
             return_value={file.id: "Gümrük Kanunu"},
         ),
         patch.object(catalog_api, "catalog_chunk_counts", return_value={file.id: 52}),
-        patch.object(catalog_api, "catalog_index_requests") as index_requests,
-        patch.object(catalog_api, "load_intake_source_lineages") as source_lineages,
+        patch.object(
+            catalog_api, "catalog_index_requests", return_value={}
+        ) as index_requests,
+        patch.object(
+            catalog_api, "load_intake_source_lineages", return_value={}
+        ) as source_lineages,
+        patch.object(
+            catalog_api,
+            "fetch_latest_regulatory_indexing_progress_for_user_files",
+            return_value={},
+        ),
+        patch.object(catalog_api, "pending_intake_file_ids", return_value=set()),
+        patch.object(catalog_api, "load_reviewed_file_relations", return_value={}),
     ):
-        result = catalog_api._file_snapshots(
-            MagicMock(), [file], include_admin_details=False
-        )[file.id]
+        file.document_sets = []
+        result = catalog_api._file_snapshots(MagicMock(), [file])[file.id]
     assert result.display_name == "Gümrük Kanunu"
     assert result.chunk_count == 52
     assert not result.document_sets
-    index_requests.assert_not_called()
-    source_lineages.assert_not_called()
+    index_requests.assert_called_once()
+    source_lineages.assert_called_once()

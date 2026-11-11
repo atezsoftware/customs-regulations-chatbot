@@ -29,6 +29,7 @@ class RerankResult(BaseModel):
     result_count: int
     outcome: RerankOutcome
     fallback_used: bool
+    retry_after_seconds: float | None = None
 
     @property
     def used_external(self) -> bool:
