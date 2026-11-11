@@ -64,6 +64,9 @@ def test_actual_false_selected_evidence_fails_construction_and_stored_receipt(
                     RegulatoryChunk,
                     SimpleNamespace(
                         id=case["target"]["id"],
+                        position=1,
+                        text=case["target"]["text"],
+                        heading_path=case["target"]["heading_path"],
                         chunk_type=case["target"]["chunk_type"],
                         chunk_metadata={
                             "clause_label": case["value"],
