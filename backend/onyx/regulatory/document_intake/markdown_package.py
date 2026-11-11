@@ -286,8 +286,14 @@ def _token_text(token: _Token) -> str:
 
 
 def _markdown_references(text: str, path: str) -> tuple[list[_Reference], str | None]:
+    from onyx.regulatory.document_intake.markdown_images import (
+        EmbeddedMarkdownImageError,
+        embedded_markdown_images,
+    )
+
     markdown = Markdown(block=_LiteralBlockParser(), inline=_LiteralInlineParser())
     try:
+        embedded_markdown_images(text, path=path)
         tokens = cast(list[_Token], markdown(text))
         references: list[_Reference] = []
         html = _HtmlReferences(references)
@@ -297,7 +303,7 @@ def _markdown_references(text: str, path: str) -> tuple[list[_Reference], str | 
             nonlocal title
             kind = token.get("type")
             if kind == "image":
-                raise MarkdownPackageError("images_require_transcription", path)
+                return
             if (
                 kind == "heading"
                 and token.get("attrs", {}).get("level") == 1
@@ -329,6 +335,8 @@ def _markdown_references(text: str, path: str) -> tuple[list[_Reference], str | 
         if html.anchor is not None:
             raise MarkdownPackageError("unclosed_html_link", path)
         return references, title
+    except EmbeddedMarkdownImageError as error:
+        raise MarkdownPackageError(error.code, path) from None
     except MarkdownPackageError as error:
         if error.path is None:
             raise MarkdownPackageError(error.code, path) from None
