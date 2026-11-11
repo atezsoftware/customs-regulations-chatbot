@@ -6,7 +6,7 @@ on:
       operation:
         description: Explicit unpublished two-file reprepare only
         type: choice
-        options: [rerun_two_files]
+        options: [rerun_two_files, measure_scoped_metadata]
         required: true
         default: rerun_two_files
       expected_backend_commit:
@@ -33,7 +33,7 @@ jobs:
           EXPECTED_BACKEND_COMMIT: ${{ inputs.expected_backend_commit }}
         run: |
           set -euo pipefail
-          [[ "$OPERATION" == "rerun_two_files" ]]
+          [[ "$OPERATION" == "rerun_two_files" || "$OPERATION" == "measure_scoped_metadata" ]]
           [[ "$EXPECTED_BACKEND_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           aws eks update-kubeconfig --name atez-dev-cluster --region eu-central-1
           kubectl get pods -n customs-regulations-dev -l app=dev-customs-regulations-api -o json > /tmp/legal-review-pods.json
@@ -68,6 +68,7 @@ jobs:
           Path('/tmp/legal-review-target').write_text(pod['metadata']['name'] + '\t' + container['name'] + '\n')
           PY
       - name: Reprepare the verified unpublished Yunus source and enqueue the normal worker
+        if: inputs.operation == 'rerun_two_files'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,6 +76,15 @@ jobs:
           kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
             sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
             backend/onyx/db/yunus_intake_timing_20261111.py
+      - name: Measure fresh scoped metadata on the two exact sources without applying it
+        if: inputs.operation == 'measure_scoped_metadata'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r pod container < /tmp/legal-review-target
+          kubectl exec -i "$pod" -n customs-regulations-dev -c "$container" -- \
+            sh -ec '. /vault/secrets/config; export PYTHONPATH=/app; exec python -' < \
+            backend/onyx/db/yunus_scoped_metadata_timing_20261111.py
       - name: Verify the public frontend API reports the requested backend SHA
         if: always() && steps.target.outcome == 'success'
         shell: bash
