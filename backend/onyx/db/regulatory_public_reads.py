@@ -319,7 +319,10 @@ def regulatory_source_image_owners(
         select(RegulatoryChunk.id)
         .where(
             RegulatoryChunk.user_file_id == parent,
-            RegulatoryChunk.chunk_metadata["image_file_id"].astext == file_id,
+            or_(
+                RegulatoryChunk.chunk_metadata["image_file_id"].astext == file_id,
+                RegulatoryChunk.chunk_metadata["image_file_ids"].contains([file_id]),
+            ),
         )
         .limit(1)
     )
