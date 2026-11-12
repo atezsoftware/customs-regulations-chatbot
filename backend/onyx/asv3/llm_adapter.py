@@ -866,7 +866,6 @@ class ResearchModel:
         research_llm: LLM | None = None,
         answer_llm: LLM | None = None,
         composition_role: CompositionRole | None = None,
-        initial_llm: LLM | None = None,
     ) -> None:
         if answer_llm is not None and (
             context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
@@ -878,7 +877,6 @@ class ResearchModel:
                 "A source answer model requires the isolated root experiment"
             )
         self.llm = llm
-        self.initial_llm = initial_llm
         self.answer_llm = answer_llm
         self._writing_answer = False
         self._cropped_source_writer_started = False
@@ -1104,13 +1102,6 @@ class ResearchModel:
             self._native_first_decision_completed = True
 
     def _native_decision_llm(self, view: HarnessView) -> LLM:
-        if (
-            self.initial_llm is not None
-            and not self._native_first_decision_completed
-            and not self.context.depth
-        ):
-            self._native_first_decision_started = True
-            return self.initial_llm
         settings = self.native_sampling_snapshot()["settings"]
         if (
             not isinstance(settings, dict)
@@ -1235,8 +1226,6 @@ class ResearchModel:
         )
         assert selected is not None
         limit = selected.config.max_input_tokens
-        if self.initial_llm is not None and not self._native_first_decision_completed:
-            limit = min(limit, self.initial_llm.config.max_input_tokens)
         if not self._writing_answer and self.research_llm is not None:
             limit = min(limit, self.research_llm.config.max_input_tokens)
         output = max(1, min(max_tokens, limit // 4))
@@ -1927,15 +1916,6 @@ class ResearchModel:
                                     allows_cropped_composition_implicit_cache(
                                         self.context
                                     )
-                                ),
-                                allow_session_attachment_flash_lite=(
-                                    self.initial_llm is not None
-                                    and not self._native_first_decision_completed
-                                    and selected_llm.config.model_name
-                                    == self.initial_llm.config.model_name
-                                    and selected_llm.config.model_provider
-                                    == self.initial_llm.config.model_provider
-                                    and bool(self._session_attachments())
                                 ),
                             )
                         ),

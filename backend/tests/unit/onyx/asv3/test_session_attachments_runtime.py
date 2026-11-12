@@ -78,7 +78,6 @@ def test_original_pdf_reaches_first_question_request_without_pre_reading(
 
     from onyx.chat import session_attachments
     from onyx.llm.models import FileContentPart
-    from onyx.llm.multi_llm import LitellmLLM
     from tests.unit.onyx.file_processing.test_chat_attachments import _pdf
 
     kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
@@ -98,13 +97,6 @@ def test_original_pdf_reaches_first_question_request_without_pre_reading(
     )
     kwargs["attachment_context"] = context
     kwargs["native_attachments"] = native_files
-    initial_llm = LitellmLLM(
-        api_key=None,
-        model_provider="vertex_ai",
-        model_name="gemini-3.5-flash-lite",
-        max_input_tokens=500_000,
-    )
-    kwargs["initial_attachment_llm"] = initial_llm
     requests = []
 
     def answer(**arguments: Any) -> Any:
@@ -128,8 +120,7 @@ def test_original_pdf_reaches_first_question_request_without_pre_reading(
         )
         return response(calls=[("ask_user", {"question": "Hangi belge alanı?"})])
 
-    monkeypatch.setattr(initial_llm, "invoke", answer)
-    llm.invoke.side_effect = AssertionError("Initial PDF request must use Flash Lite")
+    llm.invoke.side_effect = answer
     runtime.run_asv3_loop(**kwargs)
     assert len(requests) == 1
     assert (

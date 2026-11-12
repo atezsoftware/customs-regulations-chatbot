@@ -58,7 +58,6 @@ from onyx.llm.models import (
     ANTHROPIC_REASONING_EFFORT_BUDGET,
     OPENAI_REASONING_EFFORT,
     ChatCompletionMessage,
-    FileContentPart,
 )
 from onyx.llm.override_models import LLMSeed
 from onyx.llm.request_context import get_llm_mock_response
@@ -1443,7 +1442,6 @@ class LitellmLLM(LLM):
         tools: Sequence[Mapping[str, object]],
         *,
         allow_fast_composition_flash: bool = False,
-        allow_session_attachment_flash_lite: bool = False,
     ) -> bool:
         """Allowlisted native implicit writes are covered by ordinary input billing."""
         # Native implicit cache creation is billed at the ordinary input rate:
@@ -1456,21 +1454,6 @@ class LitellmLLM(LLM):
                     allow_fast_composition_flash is True
                     and self._model_version
                     in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}
-                )
-                or (
-                    allow_session_attachment_flash_lite is True
-                    and self._model_version == "gemini-3.5-flash-lite"
-                    and any(
-                        isinstance(message.content, list)
-                        and any(
-                            isinstance(part, FileContentPart)
-                            and part.file.file_data.startswith(
-                                "data:application/pdf;base64,"
-                            )
-                            for part in message.content
-                        )
-                        for message in prompt
-                    )
                 )
             )
             or self._api_base is not None

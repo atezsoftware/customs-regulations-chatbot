@@ -8,9 +8,10 @@ Diğer formatlardan yerel parser metin çıkarır. Yükleme LLM çağrısı veya
 importer/Celery işi başlatmaz.
 
 Soru sorulduğunda orijinal PDF, soru ve araştırma talimatlarıyla birlikte ilk
-normal ASv3 karar isteğine native dosya olarak eklenir. PDF içeren bir sorunun
-ilk karar modeli `gemini-3.5-flash-lite` olur; ayrı bir belge okuma/özetleme
-çağrısı yapılmaz. Sonraki kararlar mevcut model politikasını kullanır ve
+normal ASv3 karar isteğine native dosya olarak eklenir. İlk istek, dosya olmasa
+hangi modele gidecekse yine o modele gider; dosya için model değiştirilmez ve
+ayrı bir belge okuma/özetleme çağrısı yapılmaz. Sonraki kararlar mevcut model
+politikasını kullanır ve
 orijinallere aynı istek içinden erişir. Dosya içeriği talimat kabul edilmez.
 
 Web'de varsayılan sohbet ekranındaki **Dosya ekle** düğmesi doğrudan cihazın

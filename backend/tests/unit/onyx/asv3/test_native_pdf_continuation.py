@@ -88,16 +88,15 @@ def test_selected_claude_continuation_accepts_pdf_with_native_sampling_defaults(
 
 
 @pytest.mark.usefixtures("empty_source_inventory")
-def test_first_flash_lite_decision_then_selected_claude_get_same_original(
+def test_selected_model_receives_pdf_on_first_and_continuation_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import base64
-    from typing import Any
+    import json
 
     from onyx.asv3 import runtime
     from onyx.asv3.workflow_variant import ASV3_STANDARD_VARIANT
-    from onyx.llm.models import FileContentPart
-    from tests.unit.onyx.asv3.test_runtime import response, setup_run
+    from tests.unit.onyx.asv3.test_runtime import setup_run
 
     kwargs, broker, _, _, _ = setup_run(monkeypatch)
     kwargs.pop("test_language")
@@ -116,91 +115,81 @@ def test_first_flash_lite_decision_then_selected_claude_get_same_original(
         len,
         500_000,
     )
-    initial = LitellmLLM(
-        api_key="test",
-        model_provider="vertex_ai",
-        model_name="gemini-3.5-flash-lite",
-        max_input_tokens=500_000,
-    )
-    continuation = LitellmLLM(
+    selected = LitellmLLM(
         api_key="test",
         model_provider="anthropic",
         model_name="claude-opus-4-7",
         max_input_tokens=500_000,
         temperature=0,
     )
-    first_calls = []
-
-    def first(**arguments: Any) -> Any:
-        first_calls.append(arguments)
-        parts = [
-            part
-            for message in arguments["prompt"]
-            if isinstance(message.content, list)
-            for part in message.content
-            if isinstance(part, FileContentPart)
-        ]
-        assert base64.b64decode(parts[0].file.file_data.split(",", 1)[1]) == original
-        return response(
-            calls=[
-                (
-                    "read_source_range",
-                    {
-                        "source_id": str(broker.sources[0].id),
-                        "_language": "tr",
-                        "_public_update": [
-                            "Belge incelemesi",
-                            "Belgeye ilişkin kaynak koşullarını inceliyorum.",
-                        ],
-                    },
-                )
-            ]
-        )
-
-    monkeypatch.setattr(initial, "invoke", first)
     kwargs.update(
         research_profile="normal",
         workflow_variant=ASV3_STANDARD_VARIANT,
-        llm=continuation,
+        llm=selected,
         attachment_context=context,
         native_attachments=files,
-        initial_attachment_llm=initial,
     )
-    chunk = ModelResponseStream.model_validate(
-        {
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "ask-1",
-                                "type": "function",
-                                "function": {
-                                    "name": "ask_user",
-                                    "arguments": '{"question":"Hangi belge alanı incelenecek?"}',
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ]
-        }
-    )
-    with patch("litellm.completion", return_value=iter([chunk])) as completion:
-        runtime.run_asv3_loop(**kwargs)
-    assert len(first_calls) == 1
-    assert completion.call_count == 1
-    sent = completion.call_args.kwargs
-    assert sent["model"] == "anthropic/claude-opus-4-7"
-    native = [
-        part
-        for message in sent["messages"]
-        if isinstance(message.get("content"), list)
-        for part in message["content"]
-        if part.get("type") == "file"
+
+    def chunk(
+        name: str, arguments: dict[str, object], index: int
+    ) -> ModelResponseStream:
+        return ModelResponseStream.model_validate(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call-{index}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        )
+
+    chunks = [
+        chunk(
+            "read_source_range",
+            {
+                "source_id": str(broker.sources[0].id),
+                "_language": "tr",
+                "_public_update": [
+                    "Belge incelemesi",
+                    "Belgeye ilişkin kaynak koşullarını inceliyorum.",
+                ],
+            },
+            1,
+        ),
+        chunk("ask_user", {"question": "Hangi belge alanı incelenecek?"}, 2),
     ]
-    assert base64.b64decode(native[0]["file"]["file_data"].split(",", 1)[1]) == original
+    with patch(
+        "litellm.completion", side_effect=[iter([item]) for item in chunks]
+    ) as completion:
+        runtime.run_asv3_loop(**kwargs)
+    assert completion.call_count == 2
+    for call in completion.call_args_list:
+        sent = call.kwargs
+        assert sent["model"] == "anthropic/claude-opus-4-7"
+        native = [
+            part
+            for message in sent["messages"]
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "file"
+        ]
+        assert len(native) == 1
+        assert (
+            base64.b64decode(native[0]["file"]["file_data"].split(",", 1)[1])
+            == original
+        )

@@ -403,7 +403,6 @@ def run_asv3_loop(
     inject_memories_in_prompt: bool = True,
     attachment_context: str = "",
     native_attachments: list[NativeSessionAttachment] | None = None,
-    initial_attachment_llm: LLM | None = None,
 ) -> None:
     start = time.monotonic()
     composition_identity: dict[str, JsonValue] | None = None
@@ -501,13 +500,6 @@ def run_asv3_loop(
     if custom_agent_prompt:
         context.services["assistant_instructions"] = custom_agent_prompt
     if native_attachments:
-        if (
-            initial_attachment_llm is None
-            or initial_attachment_llm.config.model_name != "gemini-3.5-flash-lite"
-        ):
-            raise ValueError(
-                "Native session PDFs require the Flash Lite 3.5 initial decision model"
-            )
         context.services[NATIVE_SESSION_ATTACHMENTS] = native_attachments
     scope = IndexFilters(
         **(filters.model_dump() if filters else {}),
@@ -992,7 +984,6 @@ def run_asv3_loop(
         lean_native_mode=True,
         research_llm=None if guarded_experimental else research_llm,
         answer_llm=answer_llm,
-        initial_llm=initial_attachment_llm,
     )
     if previous is not None:
         model.restore_native_sampling(previous)
