@@ -3,15 +3,15 @@
 import json
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from onyx.db import document_intake as intake
+from onyx.db import document_intake_metadata as metadata
 from onyx.db import markdown_drafts as drafts
 from onyx.db.amendment_sources import list_source_assets
 from onyx.db.models import (
@@ -42,6 +42,68 @@ from tests.external_dependency_unit.regulatory.test_document_intake_markdown imp
 from tests.external_dependency_unit.regulatory.test_labeling_jobs import (
     LabelingDatabase,
 )
+
+
+def _verified_metadata_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Storage tests retain real receipt validation without a provider dependency."""
+    from onyx.db.document_intake_structure_metadata import (
+        record_structural_verification,
+    )
+    from onyx.regulatory.document_intake.metadata import (
+        TARGETS_PER_REQUEST,
+        ChunkLegalMetadata,
+        LegalMetadataResult,
+        metadata_input_hash,
+    )
+    from onyx.regulatory.document_intake.metadata_structure import (
+        verified_structural_metadata,
+    )
+
+    def complete(*, intake_id: UUID, lease_token: UUID, tenant_id: str) -> None:
+        assert tenant_id == get_current_tenant_id()
+        with intake_job.get_session_with_current_tenant() as session:
+            batch, work = metadata.load_metadata_work(session, intake_id, lease_token)
+            members = {m.id: m for m in intake.intake_files(session, batch)}
+            for document_id, chunks in work:
+                structural = verified_structural_metadata(chunks)
+                results = [
+                    (
+                        sha256(
+                            "|".join(c.chunk_id for c in window).encode()
+                        ).hexdigest(),
+                        LegalMetadataResult(
+                            chunks=[
+                                ChunkLegalMetadata(
+                                    chunk_id=c.chunk_id,
+                                    fields=list(structural[c.chunk_id].values()),
+                                )
+                                for c in window
+                            ]
+                        ),
+                    )
+                    for offset in range(0, len(chunks), TARGETS_PER_REQUEST)
+                    if (window := chunks[offset : offset + TARGETS_PER_REQUEST])
+                ]
+                input_hash = metadata_input_hash(chunks)
+                metadata.apply_metadata_results(
+                    session,
+                    intake_id=intake_id,
+                    lease_token=lease_token,
+                    document_id=document_id,
+                    expected_input_sha256=input_hash,
+                    results=results,
+                )
+                record_structural_verification(
+                    session,
+                    user_file_id=members[document_id].user_file_id,
+                    results=results,
+                    input_sha256=input_hash,
+                )
+            session.commit()
+
+    monkeypatch.setattr(
+        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata", complete
+    )
 
 
 def test_actual_main_and_numeric_annex_use_lossless_native_chunking(
@@ -89,28 +151,23 @@ def test_actual_main_and_numeric_annex_use_lossless_native_chunking(
         user=owner,
         environment=_ENVIRONMENT,
     )
-    batch_id, model_id = batch.id, model.id
+    batch_id = batch.id
     session.commit()
-    monkeypatch.setattr(
-        intake,
-        "resolve_intake_labeling_provider_binding",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            model="gemini-3.5-flash",
-            model_dump=lambda **_options: {"model_configuration_id": model_id},
-        ),
-    )
-    monkeypatch.setattr(
-        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
-        lambda **_kwargs: None,
-    )
+    _verified_metadata_runtime(monkeypatch)
     assert (
         intake_job.run_document_intake(
             intake_id=batch_id, tenant_id=get_current_tenant_id()
         )
-        is not None
+        is None
     )
     session.expire_all()
     batch = session.get_one(RegulatoryDocumentIntake, batch_id)
+    assert (batch.status, batch.stage, batch.background_label_status) == (
+        "ready",
+        "review",
+        "pending",
+    )
+    assert batch.labeling_run_id is None
     members = intake.intake_files(session, batch)
     assert len(members) == 2 and all(
         member.status in {"chunked", "labeling", "ready"} for member in members
@@ -236,27 +293,23 @@ def test_draft_storage_freeze_and_native_preparation(
         user=owner,
         environment=_ENVIRONMENT,
     )
-    batch_id, model_id = batch.id, model.id
+    batch_id = batch.id
     session.commit()
-    monkeypatch.setattr(
-        intake,
-        "resolve_intake_labeling_provider_binding",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            model="gemini-3.5-flash",
-            model_dump=lambda **_options: {"model_configuration_id": model_id},
-        ),
-    )
-    monkeypatch.setattr(
-        "onyx.regulatory.document_intake.metadata_job.run_intake_metadata",
-        lambda **_kwargs: None,
-    )
+    _verified_metadata_runtime(monkeypatch)
     assert (
         intake_job.run_document_intake(
             intake_id=batch_id, tenant_id=get_current_tenant_id()
         )
-        is not None
+        is None
     )
     session.expire_all()
+    session.refresh(batch)
+    assert (batch.status, batch.stage, batch.background_label_status) == (
+        "ready",
+        "review",
+        "pending",
+    )
+    assert batch.labeling_run_id is None
     members = intake.intake_files(session, batch)
     assert len(members) == 3
     assert sum(member.role == "root" for member in members) == 2
@@ -1107,6 +1160,7 @@ def test_staged_explicit_attachment_survives_metadata_labeling_review_and_approv
     native_markdown_runtime: PostgresBackedFileStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from onyx.db.document_intake_background_labels import start_background_labels
     from onyx.db.enums import UserFileStatus
     from onyx.db.models import (
         RegulatoryFilePublication,
@@ -1176,12 +1230,19 @@ def test_staged_explicit_attachment_survives_metadata_labeling_review_and_approv
         intake_job.run_document_intake(
             intake_id=batch_id, tenant_id=get_current_tenant_id()
         )
-        is not None
+        is None
     )
     session.expire_all()
     batch = session.get_one(RegulatoryDocumentIntake, batch_id)
-    assert batch.labeling_run_id is not None
-    run_id = batch.labeling_run_id
+    assert (batch.status, batch.stage, batch.background_label_status) == (
+        "ready",
+        "review",
+        "pending",
+    )
+    assert batch.labeling_run_id is None
+    run_id = start_background_labels(session, batch)
+    assert run_id is not None
+    session.commit()
     for _step in range(20):
         session.expire_all()
         run = session.get_one(RegulatoryLabelingRun, run_id)
@@ -1237,7 +1298,7 @@ def test_staged_explicit_attachment_survives_metadata_labeling_review_and_approv
         json.loads(call.kwargs["contents"][0].parts[0].text)
         for call in sdk.models.generate_content.call_args_list
     ]
-    assert any("target_chunk_ids" in request for request in requests)
+    assert any("target_indices" in request for request in requests)
     assert any("target" in request for request in requests)
     assert not list(
         session.scalars(
