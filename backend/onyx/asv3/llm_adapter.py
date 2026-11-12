@@ -94,6 +94,11 @@ from onyx.asv3.retained_answer import (
     resolve_retained_answer,
     retained_answer_enabled,
 )
+from onyx.asv3.session_attachments import (
+    NATIVE_SESSION_ATTACHMENTS,
+    NativeSessionAttachment,
+    session_attachment_prompt,
+)
 from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
@@ -150,6 +155,7 @@ from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
     ContentPart,
+    FileContentPart,
     ImageContentPart,
     ImageUrlDetail,
     ReasoningEffort,
@@ -860,6 +866,7 @@ class ResearchModel:
         research_llm: LLM | None = None,
         answer_llm: LLM | None = None,
         composition_role: CompositionRole | None = None,
+        initial_llm: LLM | None = None,
     ) -> None:
         if answer_llm is not None and (
             context.services.get("asv3_workflow_variant") != ASV3_TUNED_VARIANT
@@ -871,6 +878,7 @@ class ResearchModel:
                 "A source answer model requires the isolated root experiment"
             )
         self.llm = llm
+        self.initial_llm = initial_llm
         self.answer_llm = answer_llm
         self._writing_answer = False
         self._cropped_source_writer_started = False
@@ -1096,6 +1104,13 @@ class ResearchModel:
             self._native_first_decision_completed = True
 
     def _native_decision_llm(self, view: HarnessView) -> LLM:
+        if (
+            self.initial_llm is not None
+            and not self._native_first_decision_completed
+            and not self.context.depth
+        ):
+            self._native_first_decision_started = True
+            return self.initial_llm
         settings = self.native_sampling_snapshot()["settings"]
         if (
             not isinstance(settings, dict)
@@ -1165,7 +1180,15 @@ class ResearchModel:
                 self.llm.config.model_provider,
                 self.llm.config.model_name,
             )
-        total = 128 + len(prompt) * 16 + len(tools) * 16
+        native = self._session_attachments()
+        prompt = session_attachment_prompt(prompt, native)
+        native_data = {item.part.file.file_data for item in native}
+        total = (
+            128
+            + len(prompt) * 16
+            + len(tools) * 16
+            + sum(item.input_token_reserve for item in native)
+        )
         for message in prompt:
             if isinstance(message, AssistantMessage) and message.tool_calls:
                 total += self._tokens(
@@ -1182,11 +1205,24 @@ class ResearchModel:
                         total += self._tokens(part.text)
                     elif isinstance(part, ImageContentPart):
                         total += max(4096, len(part.image_url.url))
+                    elif (
+                        isinstance(part, FileContentPart)
+                        and part.file.file_data in native_data
+                    ):
+                        pass
                     else:
                         total += len(part.model_dump_json().encode("utf-8"))
         if tools:
             total += self._tokens(json.dumps(tools, ensure_ascii=False))
         return total
+
+    def _session_attachments(self) -> list[NativeSessionAttachment]:
+        value = self.context.services.get(NATIVE_SESSION_ATTACHMENTS)
+        return (
+            [item for item in value if isinstance(item, NativeSessionAttachment)]
+            if isinstance(value, list)
+            else []
+        )
 
     def _limits(self, max_tokens: int) -> tuple[int, int]:
         selected = (
@@ -1199,6 +1235,8 @@ class ResearchModel:
         )
         assert selected is not None
         limit = selected.config.max_input_tokens
+        if self.initial_llm is not None and not self._native_first_decision_completed:
+            limit = min(limit, self.initial_llm.config.max_input_tokens)
         if not self._writing_answer and self.research_llm is not None:
             limit = min(limit, self.research_llm.config.max_input_tokens)
         output = max(1, min(max_tokens, limit // 4))
@@ -1642,6 +1680,11 @@ class ResearchModel:
         from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 
         selected_llm = call_llm if call_llm is not None else self.llm
+        if self._session_attachments():
+            from onyx.llm.multi_llm import LitellmLLM
+
+            if isinstance(selected_llm, LitellmLLM):
+                selected_llm = selected_llm.with_native_pdf_chat_input()
         response_model = (
             (response_model or structured_model(flow)) if structured else None
         )
@@ -1775,6 +1818,7 @@ class ResearchModel:
             else None
         )
         cropped_input_budget: dict[str, int] | None = None
+        prompt = session_attachment_prompt(prompt, self._session_attachments())
         if self.context.services.get("asv3_exp_cropped") is True:
             from onyx.asv3.cropped_transport import enforce_cropped_input_budget
 
@@ -1883,6 +1927,15 @@ class ResearchModel:
                                     allows_cropped_composition_implicit_cache(
                                         self.context
                                     )
+                                ),
+                                allow_session_attachment_flash_lite=(
+                                    self.initial_llm is not None
+                                    and not self._native_first_decision_completed
+                                    and selected_llm.config.model_name
+                                    == self.initial_llm.config.model_name
+                                    and selected_llm.config.model_provider
+                                    == self.initial_llm.config.model_provider
+                                    and bool(self._session_attachments())
                                 ),
                             )
                         ),

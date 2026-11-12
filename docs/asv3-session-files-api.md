@@ -2,8 +2,16 @@
 
 PDF, DOCX, XLSX, CSV, TXT ve MD dosyaları özel sohbet eki olarak yüklenir.
 Document set, mevzuat kataloğu, Elasticsearch veya embedding indeksine eklenmez.
-Yerel parser dosyadan metin çıkarır; yükleme LLM çağrısı veya importer/Celery işi
-başlatmaz. Yükleme başarılı döndüğünde metin kullanıma hazırdır.
+PDF orijinali saklanır; yükleme sırasında yalnızca dosya boyutu, şifre ve sayfa
+sınırları doğrulanır. PDF için metin katmanı, OCR veya ön okuma gerekmez.
+Diğer formatlardan yerel parser metin çıkarır. Yükleme LLM çağrısı veya
+importer/Celery işi başlatmaz.
+
+Soru sorulduğunda orijinal PDF, soru ve araştırma talimatlarıyla birlikte ilk
+normal ASv3 karar isteğine native dosya olarak eklenir. PDF içeren bir sorunun
+ilk karar modeli `gemini-3.5-flash-lite` olur; ayrı bir belge okuma/özetleme
+çağrısı yapılmaz. Sonraki kararlar mevcut model politikasını kullanır ve
+orijinallere aynı istek içinden erişir. Dosya içeriği talimat kabul edilmez.
 
 Web'de varsayılan sohbet ekranındaki **Dosya ekle** düğmesi doğrudan cihazın
 dosya seçicisini açar; Recent Files listesi gösterilmez. Dosya seçildiğinde ASv3
@@ -69,7 +77,7 @@ Birden fazla dosya için aynı `files` alanı tekrarlanır.
     }
   ],
   "rejected_files": [
-    {"name": "tarama.pdf", "reason": "PDF has no extractable text. Run OCR on scanned pages before uploading."}
+    {"name": "sifreli.pdf", "reason": "Password-protected PDF files are not supported."}
   ]
 }
 ```
@@ -148,9 +156,13 @@ reddedilir; güncel dosyalarla yeni soru gönderilmelidir.
 - Bir yükleme isteği en fazla 10 dosya içerir. Session/taslak kapasitesi ayrıca denetlenir.
 - Model bağlamı için bütün session eklerinin toplamı seçilen modelin giriş
   kapasitesinin yarısını ve 64.000 token'ı aşamaz. Aşımda 413 döner; metin kesilmez.
-- PDF/DOCX'ten metin çıkarılır; taranmış görseller için OCR yapılmaz. Tamamen
-  görüntüden oluşan PDF reddedilir. Kısmen taranmış belgelerde görsel içeriği
-  incelemek gerekiyorsa önceden OCR uygulanmalıdır.
+  PDF sayfası başına 4.096 token bağlam rezervi ayrılır; base64 taşıma verisi
+  metin token'ı sayılmaz. PDF `token_count` değeri bu rezervdir, faturalandırılmış
+  veya sağlayıcıdan ölçülmüş tüketim değildir.
+- PDF'ler metin katmanı bulunmasa da kabul edilir; taranmış sayfalar, tablolar ve
+  görseller orijinal PDF içinden model tarafından okunur. Şifreli, bozuk, boş
+  veya sayfa sınırını aşan PDF reddedilir. DOCX'ten yerel metin çıkarılır;
+  DOCX içindeki gömülü görseller bu native PDF akışına dahil değildir.
 - XLSX formülleri formül olarak korunur; çalıştırılmaz veya hesaplanmaz.
   CSV/TXT/MD UTF-8 ya da BOM içeren UTF-16 olmalıdır. XLS, DOC ve arşiv yükleme
   desteklenmez.

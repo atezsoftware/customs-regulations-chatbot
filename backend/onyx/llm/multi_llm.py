@@ -58,6 +58,7 @@ from onyx.llm.models import (
     ANTHROPIC_REASONING_EFFORT_BUDGET,
     OPENAI_REASONING_EFFORT,
     ChatCompletionMessage,
+    FileContentPart,
 )
 from onyx.llm.override_models import LLMSeed
 from onyx.llm.request_context import get_llm_mock_response
@@ -576,6 +577,7 @@ class LitellmLLM(LLM):
 
         self._temperature = GEN_AI_TEMPERATURE if temperature is None else temperature
         self._explicit_sampling_temperature: float | None = None
+        self._native_pdf_chat_input = False
         self._seed = (
             TypeAdapter(LLMSeed).validate_python(seed) if seed is not None else None
         )
@@ -897,7 +899,11 @@ class LitellmLLM(LLM):
             elif is_reasoning and not native_pdf_input:
                 temperature = 1
             optional_kwargs["temperature"] = temperature
-        elif native_pdf_input and self._temperature == 0:
+        elif (
+            native_pdf_input
+            and self._temperature == 0
+            and not self._native_pdf_chat_input
+        ):
             raise ValueError("pdf_model_does_not_support_temperature_zero")
 
         if stream and not is_vertex_model_rejecting_output_config:
@@ -1392,6 +1398,12 @@ class LitellmLLM(LLM):
         bound._tool_argument_stream_guard = True
         return bound
 
+    def with_native_pdf_chat_input(self) -> "LitellmLLM":
+        """Use normal model sampling defaults for case-file chat, not transcription."""
+        bound = copy.copy(self)
+        bound._native_pdf_chat_input = True
+        return bound
+
     def with_asv3_response_terminal_capture(self) -> "LitellmLLM":
         """Preserve first-party native terminal status without changing the request."""
         bound = copy.copy(self)
@@ -1431,6 +1443,7 @@ class LitellmLLM(LLM):
         tools: Sequence[Mapping[str, object]],
         *,
         allow_fast_composition_flash: bool = False,
+        allow_session_attachment_flash_lite: bool = False,
     ) -> bool:
         """Allowlisted native implicit writes are covered by ordinary input billing."""
         # Native implicit cache creation is billed at the ordinary input rate:
@@ -1443,6 +1456,21 @@ class LitellmLLM(LLM):
                     allow_fast_composition_flash is True
                     and self._model_version
                     in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}
+                )
+                or (
+                    allow_session_attachment_flash_lite is True
+                    and self._model_version == "gemini-3.5-flash-lite"
+                    and any(
+                        isinstance(message.content, list)
+                        and any(
+                            isinstance(part, FileContentPart)
+                            and part.file.file_data.startswith(
+                                "data:application/pdf;base64,"
+                            )
+                            for part in message.content
+                        )
+                        for message in prompt
+                    )
                 )
             )
             or self._api_base is not None

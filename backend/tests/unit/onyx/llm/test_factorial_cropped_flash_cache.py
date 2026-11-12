@@ -245,3 +245,35 @@ def test_adapter_call_sites_limit_permission_to_factorial_fast_cropped(
             structured=False,
         )
     assert invoked.call_count == int(allowed)
+
+
+@pytest.mark.parametrize("name", ["gemini-3.5-flash-lite", "gemini-3.8-flash"])
+def test_native_session_pdf_cache_permission_is_limited_to_flash_lite(
+    name: str,
+) -> None:
+    from onyx.llm.models import FileContentPart, FileDetail
+
+    llm = selected(name)
+    prompt = [
+        UserMessage(
+            content=[
+                FileContentPart(
+                    file=FileDetail(
+                        filename="scan.pdf",
+                        file_data="data:application/pdf;base64,JVBERg==",
+                    )
+                )
+            ]
+        )
+    ]
+    assert not llm.cropped_has_free_implicit_cache_writes(prompt, [])
+    assert llm.cropped_has_free_implicit_cache_writes(
+        prompt, [], allow_session_attachment_flash_lite=True
+    ) is (name == "gemini-3.5-flash-lite")
+    assert not llm.cropped_has_free_implicit_cache_writes(
+        [UserMessage(content="question")], [], allow_session_attachment_flash_lite=True
+    )
+    routed = selected(name, api_base="https://proxy.example")
+    assert not routed.cropped_has_free_implicit_cache_writes(
+        prompt, [], allow_session_attachment_flash_lite=True
+    )

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from onyx.asv3.session_attachments import PDF_PAGE_INPUT_TOKEN_RESERVE
 from onyx.auth.permissions import require_permission
 from onyx.configs.constants import PUBLIC_API_TAGS, FileOrigin
 from onyx.db.chat_attachments import (
@@ -32,6 +33,7 @@ from onyx.error_handling.exceptions import OnyxError
 from onyx.file_processing.chat_attachments import (
     MAX_CHAT_ATTACHMENT_BYTES,
     extract_chat_attachment_text,
+    validate_chat_attachment_pdf,
 )
 from onyx.file_store.file_store import get_default_file_store
 from onyx.file_store.models import ChatAttachmentMetadata, ChatFileType
@@ -79,15 +81,24 @@ def upload_chat_attachments(
     tokenizer = get_tokenizer(model_name=None, provider_type=None)
     for upload in files:
         filename = PurePosixPath((upload.filename or "").replace("\\", "/")).name
+        extension = PurePosixPath(filename).suffix.lower()
+        pdf_token_reserve = 0
         try:
             content = upload.file.read(MAX_CHAT_ATTACHMENT_BYTES + 1)
-            text = extract_chat_attachment_text(filename, content)
+            if extension == ".pdf":
+                pages = validate_chat_attachment_pdf(content)
+                pdf_token_reserve = pages * PDF_PAGE_INPUT_TOKEN_RESERVE
+                text = (
+                    f"[Original PDF attached directly to the model: {pages} page(s). "
+                    "No text extraction or preliminary model reading was performed.]"
+                )
+            else:
+                text = extract_chat_attachment_text(filename, content)
         except ValueError as error:
             response.rejected_files.append(
                 RejectedChatAttachment(name=filename, reason=str(error))
             )
             continue
-        extension = PurePosixPath(filename).suffix.lower()
         file_type = (
             ChatFileType.TABULAR
             if extension in {".csv", ".xlsx"}
@@ -102,7 +113,7 @@ def upload_chat_attachments(
             chat_session_id=chat_session_id,
             plaintext_file_id=plaintext_file_id,
             chat_file_type=file_type,
-            token_count=len(tokenizer.encode(text)),
+            token_count=pdf_token_reserve or len(tokenizer.encode(text)),
             size=len(content),
             text_chars=len(text),
             sha256=hashlib.sha256(content).hexdigest(),
