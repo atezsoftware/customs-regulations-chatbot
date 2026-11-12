@@ -94,6 +94,11 @@ from onyx.asv3.retained_answer import (
     resolve_retained_answer,
     retained_answer_enabled,
 )
+from onyx.asv3.session_attachments import (
+    NATIVE_SESSION_ATTACHMENTS,
+    NativeSessionAttachment,
+    session_attachment_prompt,
+)
 from onyx.asv3.shared_originals import (
     delivered_provision_navigation,
     related_provision_originals,
@@ -150,6 +155,7 @@ from onyx.llm.models import (
     AssistantMessage,
     ChatCompletionMessage,
     ContentPart,
+    FileContentPart,
     ImageContentPart,
     ImageUrlDetail,
     ReasoningEffort,
@@ -1165,7 +1171,15 @@ class ResearchModel:
                 self.llm.config.model_provider,
                 self.llm.config.model_name,
             )
-        total = 128 + len(prompt) * 16 + len(tools) * 16
+        native = self._session_attachments()
+        prompt = session_attachment_prompt(prompt, native)
+        native_data = {item.part.file.file_data for item in native}
+        total = (
+            128
+            + len(prompt) * 16
+            + len(tools) * 16
+            + sum(item.input_token_reserve for item in native)
+        )
         for message in prompt:
             if isinstance(message, AssistantMessage) and message.tool_calls:
                 total += self._tokens(
@@ -1182,11 +1196,24 @@ class ResearchModel:
                         total += self._tokens(part.text)
                     elif isinstance(part, ImageContentPart):
                         total += max(4096, len(part.image_url.url))
+                    elif (
+                        isinstance(part, FileContentPart)
+                        and part.file.file_data in native_data
+                    ):
+                        pass
                     else:
                         total += len(part.model_dump_json().encode("utf-8"))
         if tools:
             total += self._tokens(json.dumps(tools, ensure_ascii=False))
         return total
+
+    def _session_attachments(self) -> list[NativeSessionAttachment]:
+        value = self.context.services.get(NATIVE_SESSION_ATTACHMENTS)
+        return (
+            [item for item in value if isinstance(item, NativeSessionAttachment)]
+            if isinstance(value, list)
+            else []
+        )
 
     def _limits(self, max_tokens: int) -> tuple[int, int]:
         selected = (
@@ -1642,6 +1669,11 @@ class ResearchModel:
         from onyx.asv3.cropped_research_limit import CroppedResearchLimit
 
         selected_llm = call_llm if call_llm is not None else self.llm
+        if self._session_attachments():
+            from onyx.llm.multi_llm import LitellmLLM
+
+            if isinstance(selected_llm, LitellmLLM):
+                selected_llm = selected_llm.with_native_pdf_chat_input()
         response_model = (
             (response_model or structured_model(flow)) if structured else None
         )
@@ -1775,6 +1807,7 @@ class ResearchModel:
             else None
         )
         cropped_input_budget: dict[str, int] | None = None
+        prompt = session_attachment_prompt(prompt, self._session_attachments())
         if self.context.services.get("asv3_exp_cropped") is True:
             from onyx.asv3.cropped_transport import enforce_cropped_input_budget
 

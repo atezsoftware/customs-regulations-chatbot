@@ -1,10 +1,11 @@
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 from pydantic import BaseModel
 
+from onyx.asv3.session_attachments import NativeSessionAttachment
 from onyx.cache.interface import CacheBackend
 from onyx.chat.citation_processor import CitationMapping
 from onyx.chat.models import (
@@ -222,3 +223,6 @@ class ChatTurnSetup:
     custom_tool_additional_headers: dict[str, str] | None
     mcp_headers: dict[str, str] | None
     session_attachment_context: str = ""
+    session_native_attachments: list[NativeSessionAttachment] = field(
+        default_factory=list, repr=False
+    )
