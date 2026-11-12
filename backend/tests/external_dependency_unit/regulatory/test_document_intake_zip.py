@@ -86,19 +86,31 @@ def _inference_runtime(
         payload = json.loads(kwargs["contents"][0].parts[0].text)
         result = (
             {
-                "chunks": [
-                    {"chunk_id": identifier, "fields": []}
-                    for identifier in payload["target_chunk_ids"]
-                ],
+                "covered_targets": payload["target_indices"],
+                "shared_fields": [],
+                "assignments": [],
                 "warnings": [],
             }
-            if "target_chunk_ids" in payload
-            else {
-                "labels": [
-                    {"label_id": "customs", "evidence_quote": payload["target"]["text"]}
-                ],
-                "abstained": False,
-            }
+            if "target_indices" in payload
+            else (
+                {
+                    "chunks": [
+                        {"chunk_id": identifier, "fields": []}
+                        for identifier in payload["target_chunk_ids"]
+                    ],
+                    "warnings": [],
+                }
+                if "target_chunk_ids" in payload
+                else {
+                    "labels": [
+                        {
+                            "label_id": "customs",
+                            "evidence_quote": payload["target"]["text"],
+                        }
+                    ],
+                    "abstained": False,
+                }
+            )
         )
         return genai_types.GenerateContentResponse.model_validate(
             {
@@ -146,7 +158,9 @@ def _inference_runtime(
     def traced(**_kwargs: Any) -> Iterator[Any]:
         yield SimpleNamespace(span_data=SimpleNamespace(usage=None))
 
-    for module in (repository, metadata_job):
+    from onyx.db import document_intake_background_labels
+
+    for module in (repository, metadata_job, document_intake_background_labels):
         monkeypatch.setattr(
             module,
             "resolve_intake_labeling_provider_binding",
@@ -253,7 +267,7 @@ def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
         intake_job.run_document_intake(
             intake_id=batch_id, tenant_id=get_current_tenant_id()
         )
-        is not None
+        is None
     )
     intake_session.expire_all()
     batch = intake_session.get_one(type(batch), batch_id)
@@ -290,7 +304,16 @@ def test_mixed_zip_source_worker_and_admission_preserve_real_members_and_roots(
             METADATA_AUDIT_KEY in chunk.chunk_metadata for chunk in chunks
         )
 
-    assert batch.labeling_run_id is not None
+    assert (batch.status, batch.stage, batch.background_label_status) == (
+        "ready",
+        "review",
+        "pending",
+    )
+    assert batch.labeling_run_id is None
+    from onyx.db.document_intake_background_labels import start_background_labels
+
+    assert start_background_labels(intake_session, batch) is not None
+    intake_session.commit()
     run = intake_session.get_one(RegulatoryLabelingRun, batch.labeling_run_id)
     for _step in range(20):
         intake_session.expire_all()
