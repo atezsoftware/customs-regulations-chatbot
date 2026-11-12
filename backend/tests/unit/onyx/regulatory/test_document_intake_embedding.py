@@ -36,14 +36,14 @@ def _vector(text: str) -> list[float]:
     return [value, value / 2, value / 3]
 
 
-def test_two_requests_run_concurrently_with_unchanged_groups_and_context() -> None:
+def test_eight_requests_run_concurrently_with_unchanged_groups_and_context() -> None:
     groups = [
         FrozenEmbeddingGroup(str(index), (f"content {index}", "exact duplicate title"))
-        for index in range(6)
+        for index in range(24)
     ]
     tenant = ContextVar("embedding_test_tenant", default="wrong")
     tenant.set("owned-tenant")
-    rendezvous = Barrier(2)
+    rendezvous = Barrier(8)
     lock = Lock()
     calls: list[list[str]] = []
     active = 0
@@ -65,7 +65,7 @@ def test_two_requests_run_concurrently_with_unchanged_groups_and_context() -> No
     result = encode_intake_embedding_groups(
         groups, encode=encode, expected_dimension=3, check_owner=lambda: None
     )
-    assert maximum == 2
+    assert maximum == 8
     assert sorted(calls) == sorted([list(group.texts) for group in groups])
     assert list(result) == [group.key for group in groups]
     assert result == {
@@ -141,7 +141,7 @@ def test_invalid_vectors_stop_dispatch_and_never_return_partial_results(
         encode_intake_embedding_groups(
             groups, encode=provider, expected_dimension=3, check_owner=lambda: None
         )
-    assert 1 <= provider.call_count <= 2
+    assert 1 <= provider.call_count <= 8
 
 
 @pytest.mark.parametrize("lost_check", [1, 2, 3, 4, 5])
@@ -173,18 +173,18 @@ def test_lost_ownership_stops_dispatch_and_discards_acknowledged_results(
 
 
 def test_first_failure_drains_in_flight_request_without_launching_more() -> None:
-    both_started = Barrier(3)
+    all_started = Barrier(9)
     fail_first = Event()
-    finish_second = Event()
+    finish_remaining = Event()
     calls = []
 
     def encode(texts: list[str]) -> list[list[float]]:
         calls.append(texts)
-        both_started.wait(timeout=3)
+        all_started.wait(timeout=3)
         if texts == ["first"]:
             assert fail_first.wait(timeout=3)
             raise RuntimeError("provider failed")
-        assert finish_second.wait(timeout=3)
+        assert finish_remaining.wait(timeout=3)
         return [_vector(text) for text in texts]
 
     with ThreadPoolExecutor(max_workers=1) as caller:
@@ -192,19 +192,21 @@ def test_first_failure_drains_in_flight_request_without_launching_more() -> None
             encode_intake_embedding_groups,
             [
                 FrozenEmbeddingGroup(text, (text,))
-                for text in ["first", "second", "third"]
+                for text in ["first", *[str(index) for index in range(1, 9)]]
             ],
             encode=encode,
             expected_dimension=3,
             check_owner=lambda: None,
         )
-        both_started.wait(timeout=3)
+        all_started.wait(timeout=3)
         fail_first.set()
         assert not result.done()
-        finish_second.set()
+        finish_remaining.set()
         with pytest.raises(RuntimeError, match="provider failed"):
             result.result(timeout=3)
-    assert sorted(calls) == [["first"], ["second"]]
+    assert sorted(calls) == sorted(
+        [["first"], *[[str(index)] for index in range(1, 8)]]
+    )
 
 
 @pytest.mark.parametrize("concurrent", [False, True])

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from onyx.regulatory.indexing_jobs.embedding import _validate_response_vectors
 
-MAX_CONCURRENT_REQUESTS = 2
+MAX_CONCURRENT_REQUESTS = 8
 MAX_REQUEST_BYTES = 256 * 1024
 _REQUEST_ENVELOPE_RESERVE = 1024
 
