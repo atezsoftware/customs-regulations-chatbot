@@ -68,3 +68,79 @@ def test_full_session_files_reach_native_model_and_checkpoint(
     with pytest.raises(ValueError, match="same session attachments"):
         runtime.run_asv3_loop(**kwargs)
     assert llm.invoke.call_count == calls_before
+
+
+@pytest.mark.parametrize("variant", [ASV3_STANDARD_VARIANT, ASV3_EXP_CROPPED_VARIANT])
+def test_original_pdf_reaches_first_question_request_without_pre_reading(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    import base64
+
+    from onyx.chat import session_attachments
+    from onyx.llm.models import FileContentPart
+    from tests.unit.onyx.file_processing.test_chat_attachments import _pdf
+
+    kwargs, _broker, llm, checkpoints, _queue = setup_run(monkeypatch)
+    kwargs.pop("test_language")
+    kwargs.update(research_profile="normal", workflow_variant=variant)
+    original = _pdf("")
+    file = ChatLoadedFile(
+        file_id="private-pdf",
+        file_type=ChatFileType.DOC,
+        filename="scan.pdf",
+        content=original,
+        content_text=None,
+        token_count=0,
+    )
+    context, native_files = session_attachments.build_asv3_attachment_inputs(
+        [file], len, 100_000
+    )
+    kwargs["attachment_context"] = context
+    kwargs["native_attachments"] = native_files
+    requests = []
+
+    def answer(**arguments: Any) -> Any:
+        requests.append(arguments)
+        prompt = arguments["prompt"]
+        parts = [
+            part
+            for message in prompt
+            if isinstance(message.content, list)
+            for part in message.content
+            if isinstance(part, FileContentPart)
+        ]
+        assert len(parts) == 1
+        assert parts[0].file.filename == "scan.pdf"
+        assert base64.b64decode(parts[0].file.file_data.split(",", 1)[1]) == original
+        payload = user_payload(prompt[-1])
+        assert kwargs["simple_chat_history"][0].message == payload["request"]
+        assert (
+            hashlib.sha256(original).hexdigest()
+            in user_payload(prompt[1])["conversation"]
+        )
+        return response(calls=[("ask_user", {"question": "Hangi belge alanı?"})])
+
+    llm.invoke.side_effect = answer
+    runtime.run_asv3_loop(**kwargs)
+    assert len(requests) == 1
+    assert (
+        checkpoints[-1]["session_attachment_sha256"]
+        == hashlib.sha256(context.encode()).hexdigest()
+    )
+    assert "data:application/pdf" not in json.dumps(checkpoints[-1])
+
+    # Changing the actual original must invalidate a resume, even without text.
+    previous = copy.deepcopy(checkpoints[-1])
+    monkeypatch.setattr(runtime, "load_asv3_checkpoint", lambda **_: previous)
+    changed = file.model_copy(update={"content": _pdf("replacement")})
+    changed_context, changed_native = session_attachments.build_asv3_attachment_inputs(
+        [changed], len, 100_000
+    )
+    kwargs.update(
+        attachment_context=changed_context,
+        native_attachments=changed_native,
+        resume_message_id=kwargs["assistant_message_id"],
+    )
+    with pytest.raises(ValueError, match="same session attachments"):
+        runtime.run_asv3_loop(**kwargs)
+    assert len(requests) == 1

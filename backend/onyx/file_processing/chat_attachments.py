@@ -112,6 +112,31 @@ def _pdf_text(content: bytes) -> str:
     return builder.render()
 
 
+def validate_chat_attachment_pdf(content: bytes) -> int:
+    """Validate the original PDF without extracting text or calling a model."""
+    from pypdf import PdfReader
+    from pypdf.errors import PyPdfError
+
+    if not content:
+        raise ValueError("The attachment is empty.")
+    if len(content) > MAX_CHAT_ATTACHMENT_BYTES:
+        raise ValueError("The attachment exceeds the 20 MiB file size limit.")
+    try:
+        reader = PdfReader(BytesIO(content), strict=True)
+        if reader.is_encrypted:
+            raise ValueError("Password-protected PDF files are not supported.")
+        count = len(reader.pages)
+        if count < 1:
+            raise ValueError("The PDF contains no pages.")
+        if count > MAX_CHAT_ATTACHMENT_PAGES:
+            raise ValueError(f"PDF exceeds the {MAX_CHAT_ATTACHMENT_PAGES}-page limit.")
+        return count
+    except (PyPdfError, RecursionError, KeyError, NotImplementedError) as exc:
+        raise ValueError(
+            "The attachment is malformed or cannot be read safely."
+        ) from exc
+
+
 def _paragraph_text(element: ElementTree.Element) -> str:
     return "".join(
         node.text or ""

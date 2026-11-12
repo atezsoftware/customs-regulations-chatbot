@@ -599,3 +599,44 @@ def test_deleting_copied_session_preserves_source_private_files(
     assert "customs" in env.blobs[plaintext_id].decode()
     chat_db.delete_messages_and_files_from_chat_session(env.chat.id, env.session)
     assert env.blobs == {}
+
+
+def test_scanned_pdf_upload_keeps_original_without_text_extraction(
+    environment: AttachmentEnvironment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.unit.onyx.file_processing.test_chat_attachments import _pdf
+
+    def reject_text_extraction(*_args: object) -> str:
+        raise AssertionError("PDF upload must not extract or pre-read the document")
+
+    monkeypatch.setattr(api, "extract_chat_attachment_text", reject_text_extraction)
+    content = _pdf("")
+    result = _upload(environment, filename="scan.pdf", content=content)
+    assert result["rejected_files"] == []
+    uploaded = result["files"][0]
+    assert environment.blobs[uploaded["id"]] == content
+    assert len(environment.blobs) == 2
+    downloaded = environment.client.get(f"/chat/files/{uploaded['id']}")
+    assert downloaded.content == content
+
+
+@pytest.mark.parametrize("kind", ["malformed", "encrypted", "page_limit"])
+def test_native_pdf_upload_still_rejects_unsafe_documents(
+    environment: AttachmentEnvironment, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    from onyx.file_processing import chat_attachments as parser
+    from tests.unit.onyx.file_processing.test_chat_attachments import _pdf
+
+    if kind == "page_limit":
+        monkeypatch.setattr(parser, "MAX_CHAT_ATTACHMENT_PAGES", 1)
+    original = (
+        b"not a pdf"
+        if kind == "malformed"
+        else _pdf("", password="secret")
+        if kind == "encrypted"
+        else _pdf("", "")
+    )
+    result = _upload(environment, filename="unsafe.pdf", content=original)
+    assert result["files"] == []
+    assert len(result["rejected_files"]) == 1
+    assert environment.blobs == {}

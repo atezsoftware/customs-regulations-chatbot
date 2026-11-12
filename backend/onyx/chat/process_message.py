@@ -63,7 +63,7 @@ from onyx.chat.prompt_utils import calculate_reserved_tokens
 from onyx.chat.response_workflow import response_workflow
 from onyx.chat.save_chat import save_chat_turn
 from onyx.chat.session_attachments import (
-    build_asv3_attachment_context,
+    build_asv3_attachment_inputs,
     supports_asv3_session_attachments,
 )
 from onyx.chat.stop_signal_checker import TurnCancellationProbe, reset_cancel_status
@@ -1006,17 +1006,20 @@ def build_chat_turn(
         )
 
     session_attachment_context = ""
+    session_native_attachments = []
     if session_attachments_enabled and chat_session.user_id == user_id:
         from onyx.db.chat_attachments import load_chat_session_attachments
 
-        session_attachment_context = build_asv3_attachment_context(
-            load_chat_session_attachments(
-                db_session=db_session,
-                chat_session_id=chat_session.id,
-                user_id=user_id,
-            ),
-            token_counter,
-            llms[0].config.max_input_tokens,
+        session_attachment_context, session_native_attachments = (
+            build_asv3_attachment_inputs(
+                load_chat_session_attachments(
+                    db_session=db_session,
+                    chat_session_id=chat_session.id,
+                    user_id=user_id,
+                ),
+                token_counter,
+                llms[0].config.max_input_tokens,
+            )
         )
 
     from onyx.chat.chat_utils import load_chat_history_for_turn
@@ -1375,6 +1378,7 @@ def build_chat_turn(
         custom_tool_additional_headers=custom_tool_additional_headers,
         mcp_headers=mcp_headers,
         session_attachment_context=session_attachment_context,
+        session_native_attachments=session_native_attachments,
     )
 
 
@@ -2122,6 +2126,7 @@ def _run_models(
                         user_memory_context=setup.user_memory_context,
                         inject_memories_in_prompt=user.use_memories,
                         attachment_context=setup.session_attachment_context,
+                        native_attachments=setup.session_native_attachments,
                     )
                 elif n_models == 1 and setup.new_msg_req.deep_research:
                     _validate_deep_research_scope(setup.persona, model_tools)
