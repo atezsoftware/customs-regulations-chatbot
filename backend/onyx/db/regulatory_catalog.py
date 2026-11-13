@@ -4,7 +4,7 @@ import re
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, exists, func, select
+from sqlalchemy import Select, exists, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -107,10 +107,32 @@ def _normalized_name() -> ColumnElement[str]:
     )
 
 
+def _completed_intake_condition() -> ColumnElement[bool]:
+    """Keep new-document preparation in Updates until its publication completes."""
+    unfinished = (
+        select(RegulatoryDocumentIntakeFile.id)
+        .join(
+            RegulatoryDocumentIntake,
+            RegulatoryDocumentIntake.id == RegulatoryDocumentIntakeFile.intake_id,
+        )
+        .where(
+            RegulatoryDocumentIntakeFile.user_file_id == UserFile.id,
+            or_(
+                RegulatoryDocumentIntake.status != "completed",
+                RegulatoryDocumentIntakeFile.status != "completed",
+                UserFile.status != UserFileStatus.COMPLETED,
+            ),
+        )
+        .correlate(UserFile)
+        .exists()
+    )
+    return ~unfinished
+
+
 def catalog_file_query(
     *, q: str, folder: str | None, recursive: bool, document_set_id: int | None = None
 ) -> Select[tuple[UserFile]]:
-    query = select(UserFile)
+    query = select(UserFile).where(_completed_intake_condition())
     if document_set_id is not None:
         # The Tariff proxy authenticates via a shared service key. A public set
         # grants the same read ACL to each authenticated caller.
@@ -132,18 +154,6 @@ def catalog_file_query(
                 RegulatoryFilePublication.gate_closed.is_(True),
             ),
         )
-        pending = (
-            select(RegulatoryDocumentIntakeFile.user_file_id)
-            .join(
-                RegulatoryDocumentIntake,
-                RegulatoryDocumentIntake.id == RegulatoryDocumentIntakeFile.intake_id,
-            )
-            .where(
-                RegulatoryDocumentIntake.status != "completed",
-                RegulatoryDocumentIntakeFile.user_file_id.is_not(None),
-            )
-        )
-        query = query.where(~UserFile.id.in_(pending))
     if q:
         query = query.where(_name_matches(q))
     if folder is not None:
@@ -238,11 +248,10 @@ def list_catalog_folders(
         .where(func.strpos(remainder, "/") > 0)
         .group_by(child)
     )
-    if document_set_id is not None:
-        visible = catalog_file_query(
-            q="", folder=None, recursive=True, document_set_id=document_set_id
-        ).with_only_columns(UserFile.id)
-        query = query.where(UserFile.id.in_(visible))
+    visible = catalog_file_query(
+        q="", folder=None, recursive=True, document_set_id=document_set_id
+    ).with_only_columns(UserFile.id)
+    query = query.where(UserFile.id.in_(visible))
     if prefix:
         query = query.where(path.startswith(prefix, autoescape=True))
     if q:
@@ -262,7 +271,7 @@ def catalog_search_rows(
     rows = db_session.execute(
         select(RegulatoryChunk, UserFile)
         .join(UserFile, UserFile.id == RegulatoryChunk.user_file_id)
-        .where(RegulatoryChunk.id.in_(chunk_ids))
+        .where(RegulatoryChunk.id.in_(chunk_ids), _completed_intake_condition())
         .options(selectinload(UserFile.document_sets))
         .execution_options(populate_existing=True)
     ).all()
