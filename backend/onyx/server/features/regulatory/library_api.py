@@ -26,6 +26,7 @@ from onyx.regulatory.publication_reads import (
     require_publication_files,
 )
 from onyx.regulatory.read_document import read_document_markdown
+from onyx.regulatory.reading_navigation import remove_reading_navigation
 from onyx.server.features.regulatory.catalog_models import (
     CatalogFolder,
     CatalogFolderPage,
@@ -143,13 +144,16 @@ def get_content(
     name = catalog_display_names(db_session, [file])[file_id]
     markdown = read_document_markdown(db_session, file)
     require_publication_files(observation, (file_id,))
+    source_sha256 = hashlib.sha256(markdown.encode()).hexdigest()
+    repeals = verified_repeals(file_id, source_sha256)
+    markdown = remove_reading_navigation(markdown)
     content_sha256 = hashlib.sha256(markdown.encode()).hexdigest()
     return LibraryContent(
         file_id=file_id,
         name=name,
         markdown=markdown,
         content_sha256=content_sha256,
-        verified_repeals=verified_repeals(file_id, content_sha256),
+        verified_repeals=repeals,
     )
 
 
