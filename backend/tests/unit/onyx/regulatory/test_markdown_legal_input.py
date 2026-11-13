@@ -255,3 +255,39 @@ def test_inline_literal_examples_are_not_new_legal_clauses(literal: str) -> None
         if chunk.metadata.chunk_variant == "atomic"
     ] == ["cc"]
     assert literal in result.chunks[0].text
+
+
+@pytest.mark.parametrize("marker", ["iv)", "ix)", "ab)", "- iv)", "+ ab)", "4. iv)"])
+def test_distinct_letter_markers_keep_existing_paragraph_interpretation(
+    marker: str,
+) -> None:
+    source = f"MADDE 4-\n\n(1) Genel kural.\n\n{marker} Önceki alt ayrım."
+    result = _intake(source)
+    atomic = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_variant == "atomic"
+    ]
+    assert not any(chunk.metadata.chunk_type == "clause" for chunk in atomic)
+    assert not any(chunk.metadata.clause_label for chunk in atomic)
+    assert "Önceki alt ayrım." in " ".join(chunk.text for chunk in atomic)
+
+
+@pytest.mark.parametrize("marker", ["ii", "II", "xx", "XX"])
+def test_roman_subclause_keeps_existing_identity_without_a_parent_paragraph(
+    marker: str,
+) -> None:
+    result = RegulatoryChunker().chunk_text(f"MADDE 4-\n\n({marker}) Önceki alt ayrım.")
+    atomic = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_variant == "atomic"
+    ]
+    assert len(atomic) == 1
+    assert atomic[0].metadata.clause_label is None
+    assert atomic[0].metadata.subclause_label == marker
+
+
+def test_explicit_bold_double_letter_clause_still_keeps_its_identity() -> None:
+    result = RegulatoryChunker().chunk_text("MADDE 4-\n\n**(ii)** Tanım açıklaması.")
+    clauses = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_type == "clause"
+    ]
+    assert len(clauses) == 1
+    assert clauses[0].metadata.clause_label == "ii"

@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import replace
 from hashlib import sha256
 from threading import Barrier, Event, Lock
+from time import sleep
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -169,7 +170,9 @@ def test_lost_ownership_stops_dispatch_and_discards_acknowledged_results(
             expected_dimension=3,
             check_owner=guard,
         )
-    assert calls <= 2 and (calls == 0 if lost_check == 1 else True)
+    assert calls <= embedding.MAX_CONCURRENT_REQUESTS
+    if lost_check == 1:
+        assert calls == 0
 
 
 def test_first_failure_drains_in_flight_request_without_launching_more() -> None:
@@ -278,7 +281,10 @@ def test_actual_writer_preserves_encoder_configuration_vectors_and_legacy_reques
     assert [len(call.kwargs["texts"]) for call in calls] == expected_sizes
     for call in calls:
         assert call.kwargs["tenant_id"] == authority.owner.scope.tenant_id
-    assert checks.call_count >= (2 * len(expected_sizes) if concurrent else 0)
+    waves = (
+        len(expected_sizes) + embedding.MAX_CONCURRENT_REQUESTS - 1
+    ) // embedding.MAX_CONCURRENT_REQUESTS
+    assert checks.call_count >= (2 * waves if concurrent else 0)
     if not concurrent:
         checks.assert_not_called()
     assert len(prepared.bindings) == 18
@@ -363,3 +369,28 @@ def test_reused_and_duplicate_frozen_groups_do_not_add_provider_calls() -> None:
         )
     assert encode.call_count == 1 and len(encode.call_args.kwargs["texts"]) == 2
     assert len(prepared.bindings) == 3
+
+
+def test_slow_full_authority_checks_do_not_serialize_fast_provider_requests() -> None:
+    lock = Lock()
+    active = 0
+    maximum = 0
+
+    def encode(texts: list[str]) -> list[list[float]]:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        sleep(0.04)
+        with lock:
+            active -= 1
+        return [_vector(text) for text in texts]
+
+    result = encode_intake_embedding_groups(
+        [FrozenEmbeddingGroup(str(index), (str(index),)) for index in range(16)],
+        encode=encode,
+        expected_dimension=3,
+        check_owner=lambda: sleep(0.08),
+    )
+    assert maximum == 8
+    assert list(result) == [str(index) for index in range(16)]

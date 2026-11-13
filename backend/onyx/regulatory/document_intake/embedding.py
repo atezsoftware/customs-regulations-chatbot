@@ -2,9 +2,10 @@
 
 import json
 from collections.abc import Callable, Sequence
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextvars import Context, copy_context
 from dataclasses import dataclass
+from itertools import islice
 
 from onyx.regulatory.indexing_jobs.embedding import _validate_response_vectors
 
@@ -68,28 +69,24 @@ def encode_intake_embedding_groups(
     pending = iter(groups)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
         try:
-            while True:
-                while len(futures) < MAX_CONCURRENT_REQUESTS:
-                    # Observe already acknowledged failures before dispatching more.
-                    if any(future.done() for future in futures):
-                        break
-                    group = next(pending, None)
-                    if group is None:
-                        break
-                    check_owner()
+            while wave := list(islice(pending, MAX_CONCURRENT_REQUESTS)):
+                # Full source/review checks authorize one bounded wave together.
+                check_owner()
+                for group in wave:
+                    # Observe acknowledged failures without letting fast successes
+                    # prevent the rest of the authorized wave from starting.
+                    for future in futures:
+                        if future.done():
+                            future.result()
                     future = executor.submit(encode_in_context, group, copy_context())
                     futures[future] = group
-                    check_owner()
-                if not futures:
-                    break
-                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
                 check_owner()
-                for future in completed:
-                    group = futures[future]
+                wait(futures)
+                check_owner()
+                for future, group in futures.items():
                     vectors[group.key] = future.result()
                 check_owner()
-                for future in completed:
-                    del futures[future]
+                futures.clear()
         except BaseException:
             for future in futures:
                 future.cancel()
