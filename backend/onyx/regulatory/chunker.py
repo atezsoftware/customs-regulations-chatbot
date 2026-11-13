@@ -27,7 +27,7 @@ from onyx.regulatory.provision_identity import canonical_clause_label
 # Bump whenever parser or structural chunk-boundary semantics change. Durable
 # jobs persist this identity so a process restart cannot silently reinterpret
 # an immutable input revision with different chunk-generation semantics.
-REGULATORY_CHUNKER_CODE_VERSION = "5"
+REGULATORY_CHUNKER_CODE_VERSION = "6"
 
 ATOMIC_CHUNK_VARIANT = "atomic"
 HIERARCHICAL_AGGREGATE_CHUNK_VARIANT = "hierarchical_aggregate"
@@ -170,12 +170,17 @@ _REPEATED_PARAGRAPH_RE = re.compile(
     r"\s*[,.:;-]?\s*",
     flags=re.IGNORECASE,
 )
-_CLAUSE_RE = re.compile(r"^\(?(?P<label>[a-zçğıöşü]{1,2})\)\s+", flags=re.IGNORECASE)
+_CLAUSE_RE = re.compile(
+    r"^\(?(?P<label>(?P<letter>[a-zçğıöşü])(?-i:(?P=letter))?)\)\s+",
+    flags=re.IGNORECASE,
+)
 _ORDERED_CLAUSE_PREFIX_RE = re.compile(
-    r"^\d{1,3}[.)]\s+(?=[a-zçğıöşü]{1,2}\)\s+\S)", flags=re.IGNORECASE
+    r"^\d{1,3}[.)]\s+(?=(?P<letter>[a-zçğıöşü])(?-i:(?P=letter))?\)\s+\S)",
+    flags=re.IGNORECASE,
 )
 _LEGAL_BULLET_RE = re.compile(
-    r"^[-+]\s+(?=(?:\(?\d{1,3}[.)]|\(?[a-zçğıöşü]{1,2}\))\s)", re.I
+    r"^[-+]\s+(?=(?:\(?\d{1,3}[.)]|\(?(?P<letter>[a-zçğıöşü])(?-i:(?P=letter))?\))\s)",
+    re.I,
 )
 _SUBCLAUSE_RE = re.compile(r"^\((?P<label>[ivxlcdm]+|\d+)\)\s+", flags=re.IGNORECASE)
 _MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$")

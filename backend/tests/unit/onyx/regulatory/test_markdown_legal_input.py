@@ -255,3 +255,17 @@ def test_inline_literal_examples_are_not_new_legal_clauses(literal: str) -> None
         if chunk.metadata.chunk_variant == "atomic"
     ] == ["cc"]
     assert literal in result.chunks[0].text
+
+
+@pytest.mark.parametrize("marker", ["iv)", "ix)", "ab)", "- iv)", "+ ab)", "4. iv)"])
+def test_distinct_letter_markers_keep_existing_paragraph_interpretation(
+    marker: str,
+) -> None:
+    source = f"MADDE 4-\n\n(1) Genel kural.\n\n{marker} Önceki alt ayrım."
+    result = _intake(source)
+    atomic = [
+        chunk for chunk in result.chunks if chunk.metadata.chunk_variant == "atomic"
+    ]
+    assert not any(chunk.metadata.chunk_type == "clause" for chunk in atomic)
+    assert not any(chunk.metadata.clause_label for chunk in atomic)
+    assert "Önceki alt ayrım." in " ".join(chunk.text for chunk in atomic)
