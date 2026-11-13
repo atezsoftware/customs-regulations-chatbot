@@ -277,6 +277,93 @@ def test_two_recovered_source_versions_still_block_an_ambiguous_addition(
     search.assert_not_called()
 
 
+@pytest.mark.parametrize("main_named", [False, True])
+def test_standalone_annex_title_cannot_shadow_a_published_intake_main(
+    source_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    main_named: bool,
+) -> None:
+    from tests.external_dependency_unit.regulatory.test_amendment_published_source_identity import (
+        _intake,
+    )
+
+    session = source_session
+    group, main = _source(session)
+    main.name = _TITLE if main_named else "Başlık belirlenemedi"
+    _intake(session, group, main, "completed")
+    _title_descendant(session, main, 1, "2")
+    target = _title_descendant(session, main, 2, "3")
+    annex = _file(session, group)
+    annex.name = f"{_TITLE} — Ekler (EK-1–EK-5)"
+    _chunk(session, annex, 0, "EK 1: Ek hükümleri.")
+    session.flush()
+    retriever, _fallback, search = _retriever(
+        session, monkeypatch, group, [main, annex]
+    )
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 1- Aynı Yönetmeliğin 3 üncü maddesinin birinci fıkrası değiştirilmiştir.",
+        target_source=_TARGET,
+        article_reference="Madde 3 fıkra 1",
+    )
+    assert retriever._source_file_loader is not None
+    assert retriever._source_file_loader(instruction) == [str(main.id)]
+    candidates = retriever.search(instruction)
+    assert candidates and candidates[0].chunk_id == target.id
+    assert {candidate.user_file_id for candidate in candidates} == {str(main.id)}
+    assert candidates[0].source_verified
+    search.assert_not_called()
+
+
+def test_named_source_does_not_hide_another_published_structural_version(
+    source_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = source_session
+    group, named = _source(session)
+    named.name = _TITLE
+    generic = _file(session, group)
+    generic.name = "Başlık belirlenemedi"
+    for file in (named, generic):
+        _title_descendant(session, file, 1, "2")
+        _title_descendant(session, file, 2, "3")
+    session.flush()
+    retriever, _fallback, search = _retriever(
+        session, monkeypatch, group, [named, generic]
+    )
+    result = retriever.search(
+        AmendmentInstruction(
+            instruction_text="MADDE 1- Aynı Yönetmeliğe aşağıdaki madde eklenmiştir: “MADDE 46- (1) Yeni kural.”",
+            target_source=_TARGET,
+        )
+    )
+    assert result == []
+    assert "Multiple target source files" in (retriever.last_attention or "")
+    search.assert_not_called()
+
+
+def test_explicit_appendix_update_keeps_a_standalone_published_annex_eligible(
+    source_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = source_session
+    group = DocumentSet(name=str(uuid4()), description="", is_up_to_date=True)
+    session.add(group)
+    session.flush()
+    annex = _file(session, group)
+    annex.name = f"{_TITLE} — Ekler (EK-1–EK-5)"
+    row = _chunk(session, annex, 0, "EK-1: Eski ek metni.")
+    session.flush()
+    retriever, _fallback, search = _retriever(session, monkeypatch, group, [annex])
+    instruction = AmendmentInstruction(
+        instruction_text="MADDE 1- Aynı Yönetmeliğin Ek-1'inde yer alan “Eski” ibaresi “Yeni” şeklinde değiştirilmiştir.",
+        target_source=_TARGET,
+    )
+    assert retriever._source_file_loader is not None
+    assert retriever._source_file_loader(instruction) == [str(annex.id)]
+    assert retriever._structural_candidate_loader is not None
+    candidates = retriever._structural_candidate_loader(instruction)
+    assert candidates and candidates[0].chunk_id == row.id
+    search.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "filename, root, title, target",
     [

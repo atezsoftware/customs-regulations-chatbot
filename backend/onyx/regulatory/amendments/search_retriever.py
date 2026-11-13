@@ -513,19 +513,26 @@ def build_amendment_search_retriever(
         files = [
             str(source.user_file_id)
             for source in source_identities
-            if source_file_identity_matches(target, source.name, source.root_heading)
+            if (not source.is_attachment or appendix is not None)
+            and source_file_identity_matches(target, source.name, source.root_heading)
         ]
         titles = {
             str(source.user_file_id): source.root_heading or source.name
             for source in source_identities
             if str(source.user_file_id) in files
         }
-        if not files:
+        unresolved_ids = [
+            source.user_file_id
+            for source in source_identities
+            if (not source.is_attachment or appendix is not None)
+            and str(source.user_file_id) not in files
+        ]
+        if unresolved_ids:
             with get_session_with_current_tenant() as identity_session:
                 structural_titles = load_amendment_structural_source_titles(
-                    identity_session, user_file_ids, target
+                    identity_session, unresolved_ids, target
                 )
-            files = [
+            recovered_files = [
                 str(source.user_file_id)
                 for source in source_identities
                 if (title := structural_titles.get(source.user_file_id)) is not None
@@ -535,11 +542,14 @@ def build_amendment_search_retriever(
                 and source_file_identity_matches(target, source.name, title)
                 and source_file_identity_matches(target, source.root_heading, title)
             ]
-            titles = {
-                str(file_id): title
-                for file_id, title in structural_titles.items()
-                if str(file_id) in files
-            }
+            files.extend(recovered_files)
+            titles.update(
+                {
+                    str(file_id): title
+                    for file_id, title in structural_titles.items()
+                    if str(file_id) in recovered_files
+                }
+            )
         if files:
             with get_session_with_current_tenant() as identity_session:
                 family = resolve_amendment_source_family(

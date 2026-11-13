@@ -44,6 +44,12 @@ _INSTRUMENT_TITLE_END_RE = re.compile(
     r"andlasma(?:si)?|protokol(?:u)?)"
     r"(?:\s*\([^\n)]{1,80}\))?\s*$"
 )
+_APPENDIX_ROOT_RE = re.compile(
+    r"^(?:ek(?:ler)?|annex(?:es)?|appendi(?:x|ces))"
+    r"(?:\s*[-–—:.]?\s*(?:\d+[a-z]?|[ivxlcdm]+|[a-z]))?"
+    r"(?:\s*[:–—-]\s*.+)?$",
+    re.IGNORECASE,
+)
 
 
 _STRUCTURAL_SOURCE_TITLES_SQL = text(
@@ -154,6 +160,7 @@ class AmendmentSourceIdentity:
     user_file_id: UUID
     name: str
     root_heading: str
+    is_attachment: bool = False
 
 
 def published_amendment_source_conditions() -> tuple[ColumnElement[bool], ...]:
@@ -278,6 +285,7 @@ def load_amendment_source_identities(
         select(
             UserFile.id,
             UserFile.name,
+            RegulatoryDocumentIntakeFile.role.label("intake_role"),
             roots.c.heading_path,
             RegulatoryChunk.position,
             RegulatoryChunk.chunk_type,
@@ -296,6 +304,10 @@ def load_amendment_source_identities(
             RegulatoryFilePublication.user_file_id == UserFile.id,
         )
         .outerjoin(roots, roots.c.user_file_id == UserFile.id)
+        .outerjoin(
+            RegulatoryDocumentIntakeFile,
+            RegulatoryDocumentIntakeFile.user_file_id == UserFile.id,
+        )
         .outerjoin(RegulatoryChunk, RegulatoryChunk.id == roots.c.chunk_id)
         .where(UserFile.id.in_(user_file_ids), *published_amendment_source_conditions())
         .where(
@@ -320,7 +332,15 @@ def load_amendment_source_identities(
             and row.bound_to is None
         ):
             root = _own_communique_header_title(root, row.opening, row.document_number)
-        result.append(AmendmentSourceIdentity(row.id, row.name, root))
+        result.append(
+            AmendmentSourceIdentity(
+                row.id,
+                row.name,
+                root,
+                is_attachment=row.intake_role == "annex"
+                or _APPENDIX_ROOT_RE.fullmatch(root.strip()) is not None,
+            )
+        )
     return result
 
 
