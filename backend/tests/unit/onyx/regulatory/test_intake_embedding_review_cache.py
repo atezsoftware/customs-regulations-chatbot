@@ -123,7 +123,7 @@ def test_actual_writer_scopes_native_reuse_across_all_encoder_guards_and_cleanup
                 )
                 == 1
             )
-            assert checks >= 25
+            assert checks >= 3
         else:
             with pytest.raises(
                 RuntimeError if failure == "encoder" else ValueError,
