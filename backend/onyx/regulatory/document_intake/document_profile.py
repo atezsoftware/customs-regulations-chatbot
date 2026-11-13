@@ -14,6 +14,7 @@ from onyx.regulatory.chunker import (
     _fold_text,
     _infer_document_metadata,
 )
+from onyx.regulatory.markdown_legal_input import source_document_header
 
 _MONTH = (
     r"(?:ocak|subat|mart|nisan|mayis|haziran|temmuz|agustos|eylul|ekim|kasim|aralik)"
@@ -60,6 +61,7 @@ def intake_document_profile(
     *, blocks: list[SourceBlock], metadata: DocumentMetadata
 ) -> tuple[DocumentMetadata, frozenset[int]]:
     """Inspect a bounded header view; original text and offsets never change."""
+    source_header = source_document_header(blocks)
     ignored = frozenset(block.block_id for block in blocks if _print_chrome(block))
     header: list[str] = []
     for block in blocks:
@@ -141,7 +143,13 @@ def intake_document_profile(
     )
     return replace(
         metadata,
-        title=title if title is not None else None if unsafe_root else metadata.title,
+        title=source_header.title
+        if source_header
+        else title
+        if title is not None
+        else None
+        if unsafe_root
+        else metadata.title,
         document_number=number,
         document_date=inspected.document_date,
         file_date=None,
