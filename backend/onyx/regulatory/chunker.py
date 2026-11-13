@@ -18,12 +18,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from onyx.regulatory.heading_path import parse_regulatory_article_heading
+from onyx.regulatory.markdown_legal_input import (
+    legal_markdown_blocks,
+    source_document_header,
+)
 from onyx.regulatory.provision_identity import canonical_clause_label
 
 # Bump whenever parser or structural chunk-boundary semantics change. Durable
 # jobs persist this identity so a process restart cannot silently reinterpret
 # an immutable input revision with different chunk-generation semantics.
-REGULATORY_CHUNKER_CODE_VERSION = "4"
+REGULATORY_CHUNKER_CODE_VERSION = "5"
 
 ATOMIC_CHUNK_VARIANT = "atomic"
 HIERARCHICAL_AGGREGATE_CHUNK_VARIANT = "hierarchical_aggregate"
@@ -166,9 +170,12 @@ _REPEATED_PARAGRAPH_RE = re.compile(
     r"\s*[,.:;-]?\s*",
     flags=re.IGNORECASE,
 )
-_CLAUSE_RE = re.compile(r"^\(?(?P<label>[a-zçğıöşü])\)\s+", flags=re.IGNORECASE)
+_CLAUSE_RE = re.compile(r"^\(?(?P<label>[a-zçğıöşü]{1,2})\)\s+", flags=re.IGNORECASE)
 _ORDERED_CLAUSE_PREFIX_RE = re.compile(
-    r"^\d{1,3}[.)]\s+(?=[a-zçğıöşü]\)\s+\S)", flags=re.IGNORECASE
+    r"^\d{1,3}[.)]\s+(?=[a-zçğıöşü]{1,2}\)\s+\S)", flags=re.IGNORECASE
+)
+_LEGAL_BULLET_RE = re.compile(
+    r"^[-+]\s+(?=(?:\(?\d{1,3}[.)]|\(?[a-zçğıöşü]{1,2}\))\s)", re.I
 )
 _SUBCLAUSE_RE = re.compile(r"^\((?P<label>[ivxlcdm]+|\d+)\)\s+", flags=re.IGNORECASE)
 _MARKDOWN_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$")
@@ -423,6 +430,9 @@ class RegulatoryChunker:
             source_path_override=source_path,
         )
         blocks = _markdown_to_blocks(content)
+        header = source_document_header(blocks)
+        if header is not None:
+            metadata = replace(metadata, title=header.title)
         chunks, structure = self.chunk_blocks_with_structure(blocks, metadata=metadata)
         return ChunkedDocument(
             metadata=metadata,
@@ -552,7 +562,10 @@ class RegulatoryChunker:
         current_appendix_node: StructureNode | None = None
         table_index = 0
 
-        document_label = metadata.title or metadata.source_file
+        header = source_document_header(blocks)
+        document_label = (
+            header.title if header else metadata.title or metadata.source_file
+        )
         document_node = _make_structure_node(
             metadata=metadata,
             node_type="document",
@@ -560,7 +573,7 @@ class RegulatoryChunker:
             parent_id=None,
             level=0,
             order=len(structure),
-            source_block=None,
+            source_block=header.source_block if header else None,
         )
         structure.append(document_node)
         stack: list[StructureNode] = [document_node]
@@ -649,7 +662,14 @@ class RegulatoryChunker:
                 source_block=source_block,
             )
 
+        if header is not None:
+            push_node(
+                "section", header.chapter, level=1, source_block=header.source_block
+            )
+
         for block in blocks:
+            if block.kind == "document_header":
+                continue
             classification = _classify_block(block)
             clean_text = _clean_inline_markdown(block.text)
 
@@ -1237,7 +1257,7 @@ def _markdown_to_blocks(content: str) -> list[SourceBlock]:
         )
 
     flush_table()
-    return blocks
+    return legal_markdown_blocks(blocks, text)
 
 
 def _pdf_page_number_line_indexes(content: str) -> set[int]:
@@ -2025,6 +2045,7 @@ def _preamble_context_label(draft: _ChunkDraft) -> tuple[str, int | None] | None
 
 
 def _paragraph_no(text: str) -> str | None:
+    text = _LEGAL_BULLET_RE.sub("", text, count=1)
     if _ordered_clause_text(text) is not None:
         return None
     match = _PARAGRAPH_RE.match(text)
@@ -2032,6 +2053,8 @@ def _paragraph_no(text: str) -> str | None:
 
 
 def _clause_label(text: str) -> str | None:
+    text = _LEGAL_BULLET_RE.sub("", text, count=1)
+    text = _ordered_clause_text(text) or text
     match = _CLAUSE_RE.match(text)
     return match.group("label") if match else None
 
@@ -2048,6 +2071,7 @@ def _ordered_clause_text(text: str) -> str | None:
 
 
 def _article_unit(clean_text: str, raw_text: str) -> dict[str, str] | None:
+    clean_text = _LEGAL_BULLET_RE.sub("", clean_text, count=1)
     clean_text = _ordered_clause_text(clean_text) or clean_text
     paragraph = _PARAGRAPH_RE.match(clean_text)
     if paragraph:
