@@ -2061,7 +2061,12 @@ def _clause_label(text: str) -> str | None:
     text = _LEGAL_BULLET_RE.sub("", text, count=1)
     text = _ordered_clause_text(text) or text
     match = _CLAUSE_RE.match(text)
-    return match.group("label") if match else None
+    if match is None:
+        return None
+    label = match.group("label")
+    if len(label) > 1 and text.startswith("(") and _is_roman_label(label):
+        return None
+    return label
 
 
 def _subclause_label(text: str) -> str | None:
